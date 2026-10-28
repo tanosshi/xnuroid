@@ -75,6 +75,7 @@ if ($fw) {
         }
     } else { Write-Host "llvm-objdump not found: skipped disassembly dumps" }
     if (Test-Path xref_targets.txt) { python macho_xref.py $fw.FullName xref_targets.txt | Out-File -Encoding utf8 (Join-Path $logs "xref.txt") }
+    if (Test-Path funcs_targets.txt) { python macho_objc.py $fw.FullName --funcs funcs_targets.txt 2 | Out-File -Encoding utf8 (Join-Path $logs "funcs.txt") }
     if (-not $Quick) { python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt") }
     if (Test-Path (Join-Path $logs 'exports_Unity.txt')) { Write-Host "exports: $((Get-Content (Join-Path $logs 'exports_Unity.txt')).Count) _Unity* symbols" }
 }

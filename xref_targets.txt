@@ -7,3 +7,5 @@ call:0x31eabc   # writer of the singleton (str at 31eb1c)
 call:0x31e290
 call:0x31eae8   # the real singleton constructor (allocs 0x58, stores image+0x2b59340)
 ptr:0x31eae8    # or referenced as a function pointer (init tables / vtables)
+call:0x4ae81c
+call:0x4ae968

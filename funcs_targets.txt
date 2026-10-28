@@ -1,0 +1,6 @@
+# Functions summarised (strings, selectors, callees) in funcs.txt by run_phases.ps1
+0x4ae81c   # calls the singleton constructor 31eae8
+0x4ae968   # calls the singleton destroyer 31eb28
+0x7cc5c4
+0x7cc6f0
+0x40ac9c

@@ -262,7 +262,28 @@ def describe(img, imp, depth, seen, indent="    "):
     return lines
 
 
+def funcs_mode():
+    """macho_objc.py <macho> --funcs <file-or-0xaddr,...> [depth]: summarise arbitrary functions (image offsets)."""
+    img = Image(sys.argv[1])
+    spec = sys.argv[3]
+    depth = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    addrs = []
+    try:
+        for line in open(spec):
+            t = line.split("#")[0].strip()
+            if t:
+                addrs.append(int(t.split()[0], 16))
+    except OSError:
+        addrs = [int(x, 16) for x in spec.split(",")]
+    for a in addrs:
+        print(f"\n=== function image+{a:#x}")
+        for ln in describe(img, img.base + a, depth, set()):
+            print(ln)
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[2] == "--funcs":
+        return funcs_mode()
     img = Image(sys.argv[1])
     rx = re.compile(sys.argv[2] if len(sys.argv) > 2 else r"^Unity(?!PLCrash)")
     depth = int(sys.argv[3]) if len(sys.argv) > 3 else 2
@@ -291,4 +312,5 @@ def main():
                     print(f"    [scan error: {e}]")
 
 
-main()
+if __name__ == "__main__":
+    main()
