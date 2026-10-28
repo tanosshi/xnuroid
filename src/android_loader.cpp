@@ -2326,6 +2326,25 @@ void* native_ns_search_paths(uint64_t, uint64_t, int) { return nullptr; }
 void* native_ns_uncaught_handler_get() { return nullptr; }
 void native_ns_uncaught_handler_set(void*) {}
 void native_chkstk_darwin() {}
+// CFLocale: libc++'s locale initialisation asks CoreFoundation for the current locale; answer en_US.
+void* native_cflocale_copy_current() { static uint64_t loc = fake_make(5, "CFLocale"); return reinterpret_cast<void*>(loc); }
+void* native_cflocale_get_identifier(void*) { return reinterpret_cast<void*>(fake_make(2, "en_US")); }
+void* native_cflocale_get_value(void*, const void* key) {
+    if (key == g_kCFLocaleLanguageCode) return reinterpret_cast<void*>(fake_make(2, "en"));
+    if (key == g_kCFLocaleCountryCode) return reinterpret_cast<void*>(fake_make(2, "US"));
+    return reinterpret_cast<void*>(fake_make(2, ""));
+}
+// CFStringGetBytes(str, CFRange{loc,len}, enc, lossByte, isExternal, buf, maxBuf, CFIndex* used)
+int64_t native_cfstring_get_bytes(void* s, int64_t loc, int64_t len, uint32_t, uint8_t, uint8_t, uint8_t* buf, int64_t max_buf, int64_t* used) {
+    std::string v;
+    if (!objc_string_value(reinterpret_cast<uint64_t>(s), v)) { if (used) *used = 0; return 0; }
+    if (loc < 0 || loc > static_cast<int64_t>(v.size())) loc = 0;
+    if (len < 0 || loc + len > static_cast<int64_t>(v.size())) len = static_cast<int64_t>(v.size()) - loc;
+    int64_t n = buf ? std::min<int64_t>(len, max_buf) : len;
+    if (buf && n > 0) std::memcpy(buf, v.data() + loc, static_cast<size_t>(n));
+    if (used) *used = n;
+    return n;
+}
 // CoreGraphics math (CGAffineTransform = 6 doubles, returned via x8; CGRect = HFA of 4 doubles)
 struct CGAT { double a, b, c, d, tx, ty; };
 struct CGR { double x, y, w, h; };
@@ -2595,9 +2614,9 @@ static void register_darwin_framework_stubs() {
     for (const char* n : {"_CFArrayAppendValue", "_CFWriteStreamOpen", "_CFStreamCreateBoundPair", "_CGColorRelease",
                           "_CGColorSpaceRelease", "_CVBufferRelease"})
         reg(n, reinterpret_cast<void*>(&native_cf_release));
-    for (const char* n : {"_CFDataCreateWithBytesNoCopy", "_CFDataGetBytePtr", "_CFDictionaryGetValue", "_CFLocaleCopyCurrent",
-                          "_CFLocaleGetIdentifier", "_CFLocaleGetValue", "_CFURLGetFileSystemRepresentation", "_CFUUIDCreate",
-                          "_CFUUIDCreateFromUUIDBytes", "_CFUUIDCreateString", "_CFStringGetBytes", "_CFNumberGetValue",
+    for (const char* n : {"_CFDataCreateWithBytesNoCopy", "_CFDataGetBytePtr", "_CFDictionaryGetValue",
+                          "_CFURLGetFileSystemRepresentation", "_CFUUIDCreate",
+                          "_CFUUIDCreateFromUUIDBytes", "_CFUUIDCreateString", "_CFNumberGetValue",
                           "_CTFontCopyFontDescriptor", "_CTFontCreateUIFontForLanguage", "_CTFontDescriptorCopyAttribute",
                           "_CTFontDescriptorCreateMatchingFontDescriptor", "_CTFontDescriptorCreateWithAttributes",
                           "_CTFontDescriptorCreateWithNameAndSize", "_CMFormatDescriptionGetExtension",
@@ -2625,6 +2644,10 @@ static void register_darwin_framework_stubs() {
     reg("_CMTimeMake", reinterpret_cast<void*>(&native_cmtime_make));
     reg("_CMTimeMakeWithSeconds", reinterpret_cast<void*>(&native_cmtime_make_seconds));
     reg("_CMTimeCompare", reinterpret_cast<void*>(&native_cmtime_compare));
+    reg("_CFLocaleCopyCurrent", reinterpret_cast<void*>(&native_cflocale_copy_current));
+    reg("_CFLocaleGetIdentifier", reinterpret_cast<void*>(&native_cflocale_get_identifier));
+    reg("_CFLocaleGetValue", reinterpret_cast<void*>(&native_cflocale_get_value));
+    reg("_CFStringGetBytes", reinterpret_cast<void*>(&native_cfstring_get_bytes));
     reg("_NSClassFromString", reinterpret_cast<void*>(&native_nsclass_from_string));
     reg("_NSTemporaryDirectory", reinterpret_cast<void*>(&native_ns_temp_dir));
     reg("_NSSearchPathForDirectoriesInDomains", reinterpret_cast<void*>(&native_ns_search_paths));
