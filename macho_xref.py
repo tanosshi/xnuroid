@@ -17,8 +17,12 @@ def main():
     targets, calls = set(), set()
 
     ptrs = set()
+    strpats = []
 
     def add(tok):
+        if tok.startswith("str:"):
+            strpats.append(tok[4:].encode())
+            return
         if tok.startswith("ptr:"):
             ptrs.add(int(tok[4:], 16))
         elif tok.startswith("call:"):
@@ -26,7 +30,7 @@ def main():
         else:
             targets.add(int(tok, 16))
     for a in sys.argv[2:]:
-        if a.startswith(("0x", "call:", "ptr:")):
+        if a.startswith(("0x", "call:", "ptr:", "str:")):
             add(a)
         else:
             for line in open(a):
@@ -53,6 +57,32 @@ def main():
                 if (flags & 0x80000000) and nm in ("__text", "il2cpp"):
                     code.append((a, ssz, soff, nm))
         pos += size
+    if strpats:
+        # find literal strings in __cstring (and neighbours); a reference may point at a merged suffix, so
+        # register the match address and the start of the enclosing C string.
+        ncm = struct.unpack_from("<I", data, 16)[0]
+        p3 = 32
+        while ncm:
+            cmd, size = struct.unpack_from("<II", data, p3)
+            if cmd == 0x19:
+                n = struct.unpack_from("<I", data, p3 + 64)[0]
+                for s_i in range(n):
+                    o = p3 + 72 + 80 * s_i
+                    nm = data[o:o + 16].rstrip(b"\0").decode()
+                    if nm in ("__cstring", "__objc_methname", "__ustring"):
+                        a_, sz_, off_ = struct.unpack_from("<QQI", data, o + 32)
+                        blob = data[off_:off_ + sz_]
+                        for pat in strpats:
+                            i = blob.find(pat)
+                            while i >= 0:
+                                start = blob.rfind(b"\0", 0, i) + 1
+                                print(f"string {pat!r} at image+{a_ + i:#x} (c-string starts image+{a_ + start:#x}): {blob[start:blob.find(b'\0', i)][:100]!r}")
+                                targets.add(a_ + i)
+                                targets.add(a_ + start)
+                                i = blob.find(pat, i + 1)
+            p3 += size
+            ncm -= 1
+    hits = {}
     pages = {}
     for t in targets:
         pages.setdefault(t & ~0xFFF, []).append(t)

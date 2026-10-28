@@ -1,3 +1,5 @@
-call:0x7cc5c4
-call:0x7cc6f0
-call:0x7cca88
+str:creating device client
+str:nographics
+str:gfx device intialization failed
+str:GPU not supported
+0x2b42908
