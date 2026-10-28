@@ -19,7 +19,12 @@ def main():
     ptrs = set()
     strpats = []
 
+    cstrs = []
+
     def add(tok):
+        if tok.startswith("cstr:"):
+            cstrs.append(int(tok[5:], 16))
+            return
         if tok.startswith("str:"):
             strpats.append(tok[4:].encode())
             return
@@ -30,7 +35,7 @@ def main():
         else:
             targets.add(int(tok, 16))
     for a in sys.argv[2:]:
-        if a.startswith(("0x", "call:", "ptr:", "str:")):
+        if a.startswith(("0x", "call:", "ptr:", "str:", "cstr:")):
             add(a)
         else:
             for line in open(a):
@@ -82,6 +87,17 @@ def main():
                                 i = blob.find(pat, i + 1)
             p3 += size
             ncm -= 1
+    for ca in cstrs:   # print the C string at an image offset (vmaddr)
+        ncm2 = struct.unpack_from("<I", data, 16)[0]
+        p4 = 32
+        for _ in range(ncm2):
+            cmd, size = struct.unpack_from("<II", data, p4)
+            if cmd == 0x19:
+                vm, vmsz, fo, fsz = struct.unpack_from("<QQQQ", data, p4 + 24)
+                if vm <= ca < vm + fsz:
+                    e = data.index(b"\0", fo + ca - vm)
+                    print(f"cstr image+{ca:#x}: {data[fo + ca - vm:e][:200]!r}")
+            p4 += size
     hits = {}
     pages = {}
     for t in targets:
