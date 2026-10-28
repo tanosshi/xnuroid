@@ -53,8 +53,10 @@ if (-not $SkipBuild) {
 }
 
 # ---- static inspection of the guest (no device needed): Unity entry points ----
+$localDataForScan = $null
 $fw = Get-ChildItem -Recurse -Filter UnityFramework -File -Path (Join-Path $PSScriptRoot "MyGame-v1-7-2") -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($fw) {
+    $localDataForScan = Join-Path (Split-Path (Split-Path $fw.DirectoryName)) "Data"
     if (-not $Quick) {
     python il2cpp_exports.py $fw.FullName "_Unity" | Out-File -Encoding utf8 (Join-Path $logs "exports_Unity.txt")
     python il2cpp_exports.py $fw.FullName "_" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
@@ -74,6 +76,7 @@ if ($fw) {
             & $objdump -d --no-show-raw-insn ("--start-address=0x{0:x}" -f $r[1]) ("--stop-address=0x{0:x}" -f $r[2]) $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs ("disasm_" + $r[0] + ".txt"))
         }
     } else { Write-Host "llvm-objdump not found: skipped disassembly dumps" }
+    if ($localDataForScan -and (Test-Path $localDataForScan)) { python scan_data.py $localDataForScan | Out-File -Encoding utf8 (Join-Path $logs "data_scan.txt") }
     if (Test-Path xref_targets.txt) { python macho_xref.py $fw.FullName xref_targets.txt | Out-File -Encoding utf8 (Join-Path $logs "xref.txt") }
     if (Test-Path funcs_targets.txt) { python macho_objc.py $fw.FullName --funcs funcs_targets.txt 2 | Out-File -Encoding utf8 (Join-Path $logs "funcs.txt") }
     if (-not $Quick) { python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt") }
