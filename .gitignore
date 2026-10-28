@@ -29,3 +29,5 @@ crash_bisect.out
 # Local scratch
 sys_libcxx.so
 throw_run.err
+device_logs/
+xnuroid_loader

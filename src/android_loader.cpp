@@ -2794,6 +2794,20 @@ int main(int argc, char** argv) {
         int zero = 0;
         void* copy_args[3] = {nullptr, nullptr, &zero};
         run_throw_test("7B Array.Copy(null,null,0)", copy_m, copy_args, "System.ArgumentNullException");
+
+        // LOADER_EXCEPTION_BENCH=1: 100 throw+catch round trips through runtime_invoke (7A), timed.
+        if (getenv("LOADER_EXCEPTION_BENCH") && abs_m) {
+            const int n = 100;
+            int got = 0;
+            double t0 = guest_fde::now_ms();
+            for (int i = 0; i < n; ++i) {
+                void* e = nullptr;
+                runtime_invoke(abs_m, nullptr, abs_args, &e);
+                if (e) ++got;
+            }
+            double ms = guest_fde::now_ms() - t0;
+            printf("[BENCH] %d/%d throws returned an exception object; total %.2f ms, %.3f ms per throw+catch\n", got, n, ms, ms / n);
+        }
     }
     if (exc_test && std::strcmp(exc_test, "parse") == 0 && mscorlib) {
         printf("\n[7/5] Invoking System.Int32.Parse(\"abc\") (expected: managed FormatException; needs CF locale)...\n");
