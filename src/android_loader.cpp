@@ -2802,6 +2802,60 @@ static void il2cpp_log_callback(const char* log) {
 
 #include <ucontext.h>
 
+// ---- watchdog: LOADER_WATCHDOG=<seconds> dumps every thread's stack (SIGUSR2 to each tid), then exits 124 ----
+#include <sys/syscall.h>
+#include <thread>
+static volatile int g_wd_done = 0;
+static void thread_dump_handler(int, siginfo_t*, void* ctx) {
+    ucontext_t* uc = reinterpret_cast<ucontext_t*>(ctx);
+    uint64_t pc = uc->uc_mcontext.pc, sp = uc->uc_mcontext.sp, fp = uc->uc_mcontext.regs[29], lr = uc->uc_mcontext.regs[30];
+    char comm[32] = {0};
+    int cf = open("/proc/thread-self/comm", O_RDONLY);
+    if (cf >= 0) { ssize_t n = read(cf, comm, sizeof comm - 1); if (n > 0 && comm[n - 1] == '\n') comm[n - 1] = 0; close(cf); }
+    wr_str(2, "\n[THREAD] tid="); wr_hex(2, static_cast<uint64_t>(syscall(SYS_gettid)));
+    wr_str(2, " comm="); wr_str(2, comm);
+    wr_str(2, " syscall(x8)="); wr_hex(2, uc->uc_mcontext.regs[8]);
+    wr_str(2, " x0="); wr_hex(2, uc->uc_mcontext.regs[0]);
+    wr_str(2, " x1="); wr_hex(2, uc->uc_mcontext.regs[1]);
+    wr_str(2, " x2="); wr_hex(2, uc->uc_mcontext.regs[2]);
+    wr_str(2, "\n[THREAD]   pc -> "); describe_addr(2, pc);
+    wr_str(2, "\n[THREAD]   lr -> "); describe_addr(2, lr);
+    wr_str(2, "\n");
+    uint64_t prev = sp;
+    for (int i = 0; i < 28 && fp > prev && fp - sp < (8u << 20) && (fp & 7) == 0; ++i) {
+        uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
+        wr_str(2, "[THREAD]   #"); wr_hex(2, i); wr_str(2, " "); describe_addr(2, ret & 0x0000007fffffffffull); wr_str(2, "\n");
+        prev = fp;
+        fp = reinterpret_cast<uint64_t*>(fp)[0];
+    }
+    g_wd_done = 1;
+}
+static void start_watchdog(unsigned seconds) {
+    struct sigaction sa{};
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = thread_dump_handler;
+    sigaction(SIGUSR2, &sa, nullptr);
+    std::thread([seconds] {
+        sleep(seconds);
+        fprintf(stderr, "\n[WATCHDOG] %u s elapsed: dumping all threads\n", seconds);
+        fflush(stderr);
+        pid_t pid = getpid();
+        if (DIR* d = opendir("/proc/self/task")) {
+            std::vector<int> tids;
+            while (dirent* e = readdir(d)) if (e->d_name[0] != '.') tids.push_back(atoi(e->d_name));
+            closedir(d);
+            for (int tid : tids) {
+                g_wd_done = 0;
+                syscall(SYS_tgkill, pid, tid, SIGUSR2);
+                for (int i = 0; i < 50 && !g_wd_done; ++i) usleep(10000);
+            }
+        }
+        fprintf(stderr, "[WATCHDOG] done\n");
+        fflush(stderr);
+        _exit(124);
+    }).detach();
+}
+
 static void segv_handler(int sig, siginfo_t* info, void* ctx) {
     ucontext_t* uc = reinterpret_cast<ucontext_t*>(ctx);
     uint64_t pc = uc->uc_mcontext.pc;
@@ -2966,6 +3020,7 @@ int main(int argc, char** argv) {
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);  // std::terminate / abort() -> full dump
     sigaction(SIGILL, &sa, nullptr);
+    if (const char* wd = getenv("LOADER_WATCHDOG")) start_watchdog(static_cast<unsigned>(atoi(wd)));
 
     printf("=== Native ARM64 Mach-O Android Loader ===\n");
 
