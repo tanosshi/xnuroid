@@ -630,7 +630,13 @@ int native_task_threads(uint32_t, uint32_t** list, uint32_t* count) {
 }
 int native_thread_suspend(uint32_t port) {
     MachThread* m = mach_find(port);
-    if (!m || m == t_mach_self) return 4;   // KERN_INVALID_ARGUMENT
+    if (!m || m == t_mach_self) {
+        std::lock_guard<std::mutex> l(g_mt_mu);
+        fprintf(stderr, "[MACH] thread_suspend(port=%u) -> %s; registered:", port, !m ? "UNKNOWN PORT" : "self");
+        for (MachThread* t : g_mt) fprintf(stderr, " %u", t->port);
+        fprintf(stderr, " (caller tid %ld)\n", static_cast<long>(syscall(SYS_gettid)));
+        return 4;   // KERN_INVALID_ARGUMENT
+    }
     bool signal_it;
     {
         std::lock_guard<std::mutex> l(g_mt_mu);
@@ -639,6 +645,7 @@ int native_thread_suspend(uint32_t port) {
     if (!signal_it) return 0;
     syscall(SYS_tgkill, getpid(), m->tid, SIGUSR1);
     for (int i = 0; i < 40000 && !m->suspended; ++i) usleep(50);   // up to 2 s
+    if (!m->suspended) fprintf(stderr, "[MACH] thread_suspend(port=%u): thread did not acknowledge SIGUSR1 within 2 s\n", port);
     return m->suspended ? 0 : 5;
 }
 int native_thread_resume(uint32_t port) {
