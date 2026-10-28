@@ -14,15 +14,22 @@ from compact_unwind import find_section, parse_unwind_info, functions
 
 def main():
     data = open(sys.argv[1], "rb").read()
-    targets = set()
+    targets, calls = set(), set()
+
+    def add(tok):
+        if tok.startswith("call:"):
+            calls.add(int(tok[5:], 16))
+        else:
+            targets.add(int(tok, 16))
     for a in sys.argv[2:]:
-        if a.startswith("0x"):
-            targets.add(int(a, 16))
+        if a.startswith("0x") or a.startswith("call:"):
+            add(a)
         else:
             for line in open(a):
                 line = line.split("#")[0].strip()
                 if line:
-                    targets.add(int(line.split()[0], 16))
+                    add(line.split()[0])
+    call_hits = {c: [] for c in calls}
     text_vm, sec = find_section(data, "__TEXT", "__unwind_info")
     addr, sz, off = sec
     pers, entries, end, lsda = parse_unwind_info(data[off:off + sz])
@@ -60,6 +67,13 @@ def main():
                     live[w & 31] = (page, i)
                 else:
                     live.pop(w & 31, None)
+                continue
+            if calls and (w & 0x7C000000) == 0x14000000:  # b / bl
+                imm = w & 0x3FFFFFF
+                if imm & 0x2000000:
+                    imm -= 0x4000000
+                if va + imm * 4 in call_hits:
+                    call_hits[va + imm * 4].append((va, "bl" if w & 0x80000000 else "b"))
                 continue
             # PC-relative forms: ldr xN, literal  /  adr xN, label  (linker-optimised adrp pairs)
             if (w & 0xBB000000) == 0x18000000:
@@ -105,6 +119,11 @@ def main():
                 continue
             if tgt in hits:
                 hits[tgt].append((va, kind))
+    for c in sorted(calls):
+        print(f"\n=== calls to image+{c:#x}: {len(call_hits[c])}")
+        for va, kind in call_hits[c][:60]:
+            k = bisect.bisect_right(starts, va) - 1
+            print(f"  {kind:2s} at image+{va:#x}   in function image+{starts[k] if k >= 0 else 0:#x}")
     for t in sorted(targets):
         print(f"\n=== image+{t:#x}: {len(hits[t])} references")
         for va, kind in hits[t][:60]:

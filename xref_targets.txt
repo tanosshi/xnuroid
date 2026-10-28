@@ -2,3 +2,6 @@
 0x2b59340   # null singleton returned by image+0x31d488, dereferenced at +0x40 -> crash
 0x2c0c198   # object allocated at 7cc460 and stored by UnityInitApplicationNoGraphics
 0x2b428c8   # bundle path cache
+call:0x31eb28   # writer of the singleton (str at 31eb58)
+call:0x31eabc   # writer of the singleton (str at 31eb1c)
+call:0x31e290
