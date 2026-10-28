@@ -2579,7 +2579,13 @@ static void* resolve_symbol(const std::string& name) {
         static std::unordered_map<std::string, void*> s_dummy_classes;
         auto cit = s_dummy_classes.find(name);
         if (cit != s_dummy_classes.end()) return cit->second;
-        void* cls = calloc(1, 128);
+        void* cls;
+        if (getenv("LOADER_ENGINE")) {   // engine mode: a named fake class object that messages can be answered for
+            size_t skip = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? 14 : 18;
+            cls = reinterpret_cast<void*>(fake_make(7, name.substr(skip)));
+        } else {
+            cls = calloc(1, 128);
+        }
         s_dummy_classes[name] = cls;
         g_resolved_cache[name] = cls;
         return cls;
