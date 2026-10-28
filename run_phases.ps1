@@ -55,7 +55,8 @@ if (-not $SkipBuild) {
 $fw = Get-ChildItem -Recurse -Filter UnityFramework -File -Path (Join-Path $PSScriptRoot "MyGame-v1-7-2") -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($fw) {
     python il2cpp_exports.py $fw.FullName "_Unity" | Out-File -Encoding utf8 (Join-Path $logs "exports_Unity.txt")
-    python il2cpp_exports.py $fw.FullName "" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
+    python il2cpp_exports.py $fw.FullName "_" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
+    python macho_symbols.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "symbols_unity.txt")
     python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt")
     Write-Host "exports: $((Get-Content (Join-Path $logs 'exports_Unity.txt')).Count) _Unity* symbols"
 }
