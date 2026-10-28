@@ -2603,6 +2603,21 @@ int main(int argc, char** argv) {
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
             printf("[E1] returned\n"); fflush(stdout);
         }
+        if (std::strcmp(eng, "5") == 0) {
+            // Replay -[UnityFramework frameworkWarmup:argv:] (image+0x16850) minus the UIKit swizzling at image+0x12b90:
+            // UnityInitRuntime(argc, argv) at image+0x7cc27c, then image+0x1b304 (mono/feature registration).
+            static char arg0[] = "UnityFramework";
+            static char* fake_argv[] = {arg0, nullptr};
+            typedef void (*runtime_init_fn)(int, char**);
+            printf("[E1a] UnityInitRuntime(1, argv) image+0x7cc27c...\n"); fflush(stdout);
+            reinterpret_cast<runtime_init_fn>(get_fn(0x7cc27c))(1, fake_argv);
+            printf("[E1a] returned\n"); fflush(stdout);
+            if (!getenv("LOADER_ENGINE_SKIP_1B304")) {
+                printf("[E1b] image+0x1b304()...\n"); fflush(stdout);
+                reinterpret_cast<engine_pre_fn>(get_fn(0x1b304))();
+                printf("[E1b] returned\n"); fflush(stdout);
+            }
+        }
         if (std::strcmp(eng, "3") == 0 || std::strcmp(eng, "4") == 0) {
             // image+0x31eae8 allocates the 0x58-byte registry that image+0x2b59340 should point to (xref.txt);
             // its only static caller is on the scene-loading path, so create it up front.
