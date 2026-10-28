@@ -60,6 +60,7 @@ struct BindEvent {
     uint64_t target;
     const char* symbol;
     bool unresolved;
+    int64_t addend;
 };
 static std::vector<BindEvent> g_binds;
 static std::vector<std::string> g_unresolved_imports;
@@ -2285,6 +2286,7 @@ int main(int argc, char** argv) {
         uint64_t s_offset = 0;
         std::string symbol = "";
         size_t b_count = 0;
+        int64_t addend = 0; // BIND_OPCODE_SET_ADDEND_SLEB; sticks until the next SET_ADDEND_SLEB, as in dyld
 
         auto do_bind = [&](uint8_t* loc) {
             if (collect_only) {
@@ -2292,11 +2294,12 @@ int main(int argc, char** argv) {
                 return;
             }
             void* target = resolve_symbol(symbol);
-            *reinterpret_cast<uint64_t*>(loc) = reinterpret_cast<uint64_t>(target);
+            *reinterpret_cast<uint64_t*>(loc) = reinterpret_cast<uint64_t>(target) + static_cast<uint64_t>(addend);
             g_binds.push_back({reinterpret_cast<uint64_t>(loc),
                                reinterpret_cast<uint64_t>(target),
                                strdup(symbol.c_str()),
-                               g_unresolved_set.count(symbol) != 0});
+                               g_unresolved_set.count(symbol) != 0,
+                               addend});
         };
 
         while (ptr < end) {
@@ -2315,9 +2318,17 @@ int main(int argc, char** argv) {
                 symbol = std::string(str_start, ptr - reinterpret_cast<const uint8_t*>(str_start));
                 ptr++; // skip null
             } else if (op == 0x50) {} // TYPE
-            else if (op == 0x60) { // SLEB
-                // read sleb
-                while (*ptr++ & 0x80);
+            else if (op == 0x60) { // SET_ADDEND_SLEB
+                int64_t v = 0;
+                unsigned shift = 0;
+                uint8_t b;
+                do {
+                    b = *ptr++;
+                    v |= static_cast<int64_t>(b & 0x7f) << shift;
+                    shift += 7;
+                } while (b & 0x80);
+                if (shift < 64 && (b & 0x40)) v |= -(static_cast<int64_t>(1) << shift);
+                addend = v;
             } else if (op == 0x70) {
                 s_idx = imm;
                 s_offset = read_uleb(ptr);
@@ -2357,6 +2368,35 @@ int main(int argc, char** argv) {
     printf("[*] %zu unique symbols in lazy (function) stream\n", g_lazy_names.size());
     apply_bind_stream(bind_off, bind_size, "regular");
     apply_bind_stream(lazy_off, lazy_size, "lazy");
+
+    // Addend self-check: every bind with an addend must satisfy slot == resolved symbol + addend.
+    {
+        size_t n_addend = 0, n_ok = 0, n_nonzero_bad = 0, n_name_hi = 0, n_name_noncanon = 0;
+        const char* hi_example = nullptr;
+        uint64_t hi_example_val = 0;
+        for (const auto& b : g_binds) {
+            if (b.addend == 0) continue;
+            n_addend++;
+            uint64_t slot = *reinterpret_cast<uint64_t*>(b.loc);
+            if (slot == b.target + static_cast<uint64_t>(b.addend)) n_ok++; else n_nonzero_bad++;
+            // typeinfo object: word[0] = vptr (this slot), word[1] = name pointer.
+            // Apple arm64 libc++ uses bit 63 of the name pointer as a non-unique-RTTI flag.
+            uint64_t name = reinterpret_cast<uint64_t*>(b.loc)[1];
+            if (name >> 63) {
+                n_name_hi++;
+                if (!hi_example) { hi_example = b.symbol; hi_example_val = name; }
+            } else if ((name >> 48) != 0) {
+                n_name_noncanon++;
+            }
+        }
+        printf("[*] Bind addends: %zu addended binds, %zu slot==sym+addend OK, %zu mismatched\n",
+               n_addend, n_ok, n_nonzero_bad);
+        printf("[*] Addended-bind name pointers (word[1]): %zu with bit 63 set, %zu other non-canonical\n",
+               n_name_hi, n_name_noncanon);
+        if (hi_example)
+            printf("[*]   bit-63 example: vptr symbol %s, name word=0x%llx\n",
+                   hi_example, static_cast<unsigned long long>(hi_example_val));
+    }
     printf("[*] Unresolved imports: %zu unique (%zu function -> shim_unresolved, %zu data -> poison)\n",
            g_unresolved_imports.size(), g_unresolved_fn_names.size(), g_poison_names.size());
     for (const auto& n : g_unresolved_imports) {

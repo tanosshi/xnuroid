@@ -25,3 +25,7 @@ test_tsd_diff
 mmap_run.log
 crash_bisect.err
 crash_bisect.out
+
+# Local scratch
+sys_libcxx.so
+throw_run.err
