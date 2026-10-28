@@ -1537,6 +1537,27 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
 // Returns true if the message was answered.
 static bool fake_foundation(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
+    // --- foreign class objects (kind 7: _OBJC_CLASS_$_UIDevice, ...) ---
+    if (self && self->kind == 7) {
+        const std::string& cls = self->s;
+        if (sel == "alloc" || sel == "allocWithZone:" || sel == "new") { frame.ret_x0 = fake_make(5, cls); return true; }
+        if (sel == "class" || sel == "self" || sel == "retain") { frame.ret_x0 = frame.x[0]; return true; }
+        if (sel == "instancesRespondToSelector:" || sel == "respondsToSelector:") {
+            std::string q;
+            const char* qs = reinterpret_cast<const char*>(frame.x[2]);
+            if (qs) q = qs;
+            // Only claim the selectors this loader actually emulates.
+            static const char* const yes[] = {"systemVersion", "currentDevice", "mainScreen", "sharedApplication", "processInfo",
+                                              "nativeScale", "maximumFramesPerSecond", "nativeBounds", nullptr};
+            bool ok = false;
+            for (const char* const* y = yes; *y; ++y) if (q == *y) ok = true;
+            frame.ret_x0 = ok;
+            return true;
+        }
+        if (sel == "isSubclassOfClass:" || sel == "isKindOfClass:") { frame.ret_x0 = 0; return true; }
+        if (sel == "name" || sel == "description") { frame.ret_x0 = fake_make(2, cls); return true; }
+        // fall through: class-level singletons such as +currentDevice are handled below
+    }
     // --- UIKit / Foundation singletons (kind 6, name in s) ---
     if (sel == "currentDevice" || sel == "mainScreen" || sel == "sharedApplication" || sel == "processInfo" ||
         sel == "currentLocale" || sel == "preferredLanguages") {
@@ -2610,6 +2631,15 @@ static void* resolve_symbol(const std::string& name) {
         fprintf(stderr, "[UNRESOLVED IMPORT] %s %s\n", is_fn ? "FUNCTION" : "DATA    ", name.c_str());
         g_unresolved_imports.push_back(name);
         if (is_fn) g_unresolved_fn_names.push_back(name);
+    }
+    if (!is_fn && getenv("LOADER_ENGINE") &&
+        (name.rfind("_OBJC_CLASS_$_", 0) == 0 || name.rfind("_OBJC_METACLASS_$_", 0) == 0)) {
+        // Engine mode: Objective-C class references to frameworks we do not have become fake class objects
+        // (kind 7) instead of poison pages, so +class messages are answered rather than faulting.
+        size_t skip = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? 14 : 18;
+        void* obj = reinterpret_cast<void*>(fake_make(7, name.substr(skip)));
+        g_resolved_cache[name] = obj;
+        return obj;
     }
     if (!is_fn) {
         // DATA import: PROT_NONE poison slot, so the first touch names the symbol.
