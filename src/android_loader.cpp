@@ -2799,7 +2799,7 @@ int main(int argc, char** argv) {
                 std::string all = ea;
                 size_t i = 0;
                 while (i < all.size()) {
-                    size_t j = all.find(' ', i);
+                    size_t j = all.find_first_of(" ,", i);
                     if (j == std::string::npos) j = all.size();
                     if (j > i) extra.push_back(all.substr(i, j - i));
                     i = j + 1;
