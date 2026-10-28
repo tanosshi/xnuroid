@@ -16,3 +16,12 @@ gate1_wx_test
 probe_bionic_tls
 test_tls_registers
 test_tsd_diff
+
+# Run logs captured from the device
+*_run.err
+*_run.out
+*_run2.log
+*_run2.out
+mmap_run.log
+crash_bisect.err
+crash_bisect.out

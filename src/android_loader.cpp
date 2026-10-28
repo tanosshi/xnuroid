@@ -1325,6 +1325,254 @@ static std::unordered_map<std::string, void*> g_custom_shims;
 static std::unordered_map<std::string, void*> g_resolved_cache;
 static void* g_libcxx_handle = nullptr;
 
+// ---------------------------------------------------------------------------
+// Import classification.
+// Names bound through the LAZY stream are call targets (stubs in __la_symbol_ptr),
+// i.e. functions. Names that only appear in the regular stream are treated as DATA
+// (constants, globals, class refs) unless listed as known functions below.
+// ---------------------------------------------------------------------------
+static std::unordered_set<std::string> g_lazy_names;
+static const char* const kKnownFunctionsInRegularStream[] = {
+    "___objc_personality_v0", "___gxx_personality_v0", "___chkstk_darwin", nullptr};
+
+static bool is_function_import(const std::string& name) {
+    if (g_lazy_names.count(name)) return true;
+    for (const char* const* k = kKnownFunctionsInRegularStream; *k; ++k)
+        if (name == *k) return true;
+    return false;
+}
+
+// Poison region: unresolved DATA imports resolve to distinct slots in a PROT_NONE
+// mapping, so any read/write through them faults and the SEGV handler can name the symbol.
+// One page per symbol so a touch of one never unprotects another.
+#define POISON_SLOT_SIZE 4096
+#define POISON_SLOTS 512
+// Default: log the first touch of each poisoned symbol, unprotect its page (reads return zeros) and
+// resume. LOADER_POISON_STRICT=1 restores fault-and-dump on the first touch.
+static bool g_poison_continue = true;
+static size_t g_poison_touch_count = 0;
+static uint8_t* g_poison_base = nullptr;
+static std::vector<std::string> g_poison_names;
+static std::vector<std::string> g_unresolved_fn_names;
+
+static void* poison_slot_for(const std::string& name) {
+    if (!g_poison_base) {
+        void* p = mmap(nullptr, POISON_SLOT_SIZE * POISON_SLOTS, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return nullptr;
+        g_poison_base = static_cast<uint8_t*>(p);
+    }
+    if (g_poison_names.size() >= POISON_SLOTS) return nullptr;
+    size_t idx = g_poison_names.size();
+    g_poison_names.push_back(name);
+    return g_poison_base + idx * POISON_SLOT_SIZE;
+}
+
+// ---------------------------------------------------------------------------
+// Debug mode: LOADER_TRACE_DIRECT=1 (log first 8 calls per symbol), =all (every call),
+// =list (just print the startup list). Imports resolved straight to bionic via the
+// lazy stream are routed through direct_trace_forward, which logs and tail-jumps.
+// ---------------------------------------------------------------------------
+struct DirectEntry {
+    void* target;
+    const char* name;
+    uint64_t calls;
+};
+static DirectEntry g_direct_entries[MAX_TRAMPOLINES];
+static int g_trace_mode = 0;  // 0 off, 1 capped, 2 all, 3 list only
+static const uint64_t kTraceCap = 8;
+extern "C" void direct_trace_forward();
+
+extern "C" void direct_trace_log(DirectEntry* e, uint64_t lr, const uint64_t* x) {
+    uint64_t n = __atomic_add_fetch(&e->calls, 1, __ATOMIC_RELAXED);
+    shim_ring_record(e->name, x, lr, 0);
+    if (g_trace_mode == 2 || n <= kTraceCap) {
+        wr_str(2, "[DIRECT] "); wr_str(2, e->name);
+        wr_str(2, " #"); wr_hex(2, n);
+        wr_str(2, " lr="); wr_hex(2, lr);
+        if (in_image(lr)) { wr_str(2, " image+"); wr_hex(2, lr - reinterpret_cast<uint64_t>(g_loaded_image_base)); }
+        wr_str(2, " x0="); wr_hex(2, x[0]);
+        wr_str(2, " x1="); wr_hex(2, x[1]);
+        wr_str(2, " x2="); wr_hex(2, x[2]);
+        wr_str(2, "\n");
+    }
+}
+
+static void* make_direct_trace_stub(void* target, const char* name) {
+    if (g_trampoline_count >= MAX_TRAMPOLINES) return target;
+    size_t idx = g_trampoline_count++;
+    g_trampoline_entries[idx] = {nullptr, name};
+    g_direct_entries[idx] = {target, name, 0};
+    uint32_t* stub = g_trampoline_code + (idx * TRAMPOLINE_STUB_WORDS);
+    stub[0] = 0xd503245f;  // bti c
+    stub[1] = 0x58000071;  // ldr x17, [pc, #12]
+    stub[2] = 0x58000090;  // ldr x16, [pc, #16]
+    stub[3] = 0xd61f0200;  // br x16
+    *reinterpret_cast<uint64_t*>(&stub[4]) = reinterpret_cast<uint64_t>(&g_direct_entries[idx]);
+    *reinterpret_cast<uint64_t*>(&stub[6]) = reinterpret_cast<uint64_t>(&direct_trace_forward);
+    return stub;
+}
+
+struct DirectBound {
+    std::string name;
+    bool libcxx;
+    bool lazy;
+    std::string module;
+};
+static std::vector<DirectBound> g_direct_bound;
+
+// Known Darwin/bionic differences for names that currently bind straight to bionic.
+// Informational only: nothing here is fixed yet.
+struct DiffNote {
+    const char* name;  // exact (leading '_' stripped) or prefix when it ends with '*'
+    const char* cat;
+    const char* note;
+};
+static const DiffNote kDiffNotes[] = {
+    // errno / error-number constants
+    {"strerror", "ERRNO", "message table indexed by errno; Darwin and Linux numbers differ (EAGAIN 35/11, ETIMEDOUT 60/110, ...)"},
+    {"strerror_r", "ERRNO", "errno numbering differs"},
+    {"perror", "ERRNO", "errno numbering differs"},
+    {"pthread_cond_timedwait", "ERRNO", "returns ETIMEDOUT: Darwin 60, bionic 110"},
+    {"pthread_mutex_timedlock", "ERRNO", "returns ETIMEDOUT: Darwin 60, bionic 110"},
+    {"sem_timedwait", "ERRNO", "errno ETIMEDOUT 60 vs 110"},
+    {"getaddrinfo", "ERRNO", "EAI_* values differ (Darwin EAI_NONAME 8, Linux -2); addrinfo field order differs"},
+    {"gai_strerror", "ERRNO", "EAI_* values differ"},
+    {"connect", "ERRNO", "errno EINPROGRESS 36/115, ECONNREFUSED 61/111, ..."},
+    {"accept", "ERRNO", "errno numbering differs"},
+    {"read", "ERRNO", "errno EAGAIN 35 vs 11 if guest compares"},
+    {"write", "ERRNO", "errno EAGAIN 35 vs 11 if guest compares"},
+    // signals
+    {"sigaction", "SIGNAL", "struct sigaction layout, SIG* numbers (SIGBUS 10/7, SIGUSR1 30/10, SIGCHLD 20/17), siginfo_t, ucontext differ"},
+    {"signal", "SIGNAL", "SIG* numbers differ"},
+    {"sigprocmask", "SIGNAL", "sigset_t 4 bytes on Darwin, 8 on bionic LP64; SIG_* how values differ"},
+    {"pthread_sigmask", "SIGNAL", "sigset_t size and SIG_* how values differ"},
+    {"sigaltstack", "SIGNAL", "stack_t field order differs"},
+    {"sigemptyset", "SIGNAL", "sigset_t size differs"},
+    {"sigfillset", "SIGNAL", "sigset_t size differs"},
+    {"sigaddset", "SIGNAL", "sigset_t size/signal numbers differ"},
+    {"sigdelset", "SIGNAL", "sigset_t size/signal numbers differ"},
+    {"sigismember", "SIGNAL", "sigset_t size/signal numbers differ"},
+    {"kill", "SIGNAL", "signal numbers differ"},
+    {"raise", "SIGNAL", "signal numbers differ"},
+    {"pthread_kill", "SIGNAL", "signal numbers differ"},
+    // sockets
+    {"socket", "SOCKET", "AF_INET6 30/10, SOCK_* same, protocol constants differ"},
+    {"bind", "SOCKET", "sockaddr has sa_len on Darwin; sa_family width differs"},
+    {"listen", "SOCKET", "sockaddr/constant differences"},
+    {"send", "SOCKET", "MSG_* flag values differ"},
+    {"sendto", "SOCKET", "MSG_* and sockaddr layout differ"},
+    {"sendmsg", "SOCKET", "msghdr/cmsghdr layout and MSG_* differ"},
+    {"recv", "SOCKET", "MSG_* flag values differ"},
+    {"recvfrom", "SOCKET", "MSG_* and sockaddr layout differ"},
+    {"recvmsg", "SOCKET", "msghdr/cmsghdr layout and MSG_* differ"},
+    {"setsockopt", "SOCKET", "SOL_SOCKET 0xffff/1, SO_* values differ (SO_REUSEADDR 4/2, SO_NOSIGPIPE Darwin only)"},
+    {"getsockopt", "SOCKET", "SOL_SOCKET and SO_* values differ"},
+    {"getsockname", "SOCKET", "sockaddr layout differs"},
+    {"getpeername", "SOCKET", "sockaddr layout differs"},
+    {"shutdown", "SOCKET", "SHUT_* same; errno differs"},
+    {"socketpair", "SOCKET", "AF_* values differ"},
+    {"inet_ntop", "SOCKET", "AF_INET6 30 vs 10"},
+    {"inet_pton", "SOCKET", "AF_INET6 30 vs 10"},
+    {"getnameinfo", "SOCKET", "sockaddr layout and NI_* flags differ"},
+    // time
+    {"gettimeofday", "TIME", "Darwin timeval.tv_usec is int32, bionic long (16 vs 16 bytes but different padding)"},
+    {"clock_gettime", "TIME", "clockid values differ (Darwin MONOTONIC=6, PROCESS_CPUTIME=12, UPTIME_RAW=8; Linux 1/2/-)"},
+    {"clock_getres", "TIME", "clockid values differ"},
+    {"clock_settime", "TIME", "clockid values differ"},
+    {"select", "TIME", "timeval.tv_usec width; fd_set same"},
+    {"utimes", "TIME", "timeval.tv_usec width"},
+    {"futimes", "TIME", "timeval.tv_usec width"},
+    {"setitimer", "TIME", "itimerval/timeval layout; ITIMER_* same"},
+    {"getitimer", "TIME", "itimerval/timeval layout"},
+    {"getrusage", "TIME", "rusage timeval fields and ru_maxrss units (bytes on Darwin, KB on Linux)"},
+    // dirent
+    {"readdir_r", "DIRENT", "Darwin dirent d_name at +21 (bionic +19), d_namlen field"},
+    {"scandir", "DIRENT", "passes dirent** to guest callbacks; layout differs"},
+    {"alphasort", "DIRENT", "dirent layout differs"},
+    {"seekdir", "DIRENT", "telldir cookie semantics differ"},
+    {"telldir", "DIRENT", "cookie semantics differ"},
+    {"getdirentries", "DIRENT", "Darwin-only record format"},
+    {"fts_open", "DIRENT", "FTSENT layout differs"},
+    {"fts_read", "DIRENT", "FTSENT layout differs"},
+    // ifaddrs / network interfaces
+    {"getifaddrs", "IFADDRS", "ifaddrs/sockaddr layout (sa_len, AF_LINK vs AF_PACKET) and IFF_* flags differ"},
+    {"freeifaddrs", "IFADDRS", "paired with getifaddrs layout"},
+    {"if_nametoindex", "IFADDRS", "ok but pair with getifaddrs"},
+    {"if_indextoname", "IFADDRS", "ok but pair with getifaddrs"},
+    // misc constants / structs
+    {"sysconf", "CONSTANTS", "_SC_* values differ (Darwin _SC_PAGESIZE 29, _SC_NPROCESSORS_ONLN 58; bionic 39 / 97)"},
+    {"getrlimit", "CONSTANTS", "RLIMIT_* numbers differ (NOFILE 8/7, NPROC 7/6, MEMLOCK 6/8, AS 5/9)"},
+    {"setrlimit", "CONSTANTS", "RLIMIT_* numbers differ"},
+    {"madvise", "CONSTANTS", "MADV_FREE Darwin 5, Linux 8; MADV_ZERO_WIRED_PAGES Darwin only"},
+    {"msync", "CONSTANTS", "MS_SYNC Darwin 0x10 vs Linux 4"},
+    {"setlocale", "CONSTANTS", "LC_* numbering differs (Darwin LC_ALL 0; bionic LC_ALL 6)"},
+    {"newlocale", "CONSTANTS", "LC_*_MASK values differ"},
+    {"uselocale", "CONSTANTS", "xlocale types differ"},
+    {"dlopen", "CONSTANTS", "RTLD_GLOBAL 8/0x100, RTLD_LOCAL 4/0; Darwin RTLD_DEFAULT is (void*)-2"},
+    {"dlsym", "CONSTANTS", "Darwin RTLD_DEFAULT (void*)-2, RTLD_NEXT -1, RTLD_SELF -3 are not bionic handles"},
+    {"pthread_attr_setdetachstate", "CONSTANTS", "PTHREAD_CREATE_JOINABLE Darwin 1 / bionic 0; DETACHED 2 / 1"},
+    {"pthread_attr_getdetachstate", "CONSTANTS", "PTHREAD_CREATE_* values differ"},
+    {"pthread_attr_setschedpolicy", "CONSTANTS", "SCHED_OTHER Darwin 1 / bionic 0; SCHED_FIFO 4 / 1"},
+    {"pthread_attr_setschedparam", "CONSTANTS", "sched_param layout differs (Darwin has opaque padding)"},
+    {"pthread_setschedparam", "CONSTANTS", "SCHED_* and sched_param differ"},
+    {"pthread_getschedparam", "CONSTANTS", "SCHED_* and sched_param differ"},
+    {"pthread_once", "STRUCT", "Darwin pthread_once_t {sig, opaque} with static init 0x30B1BCBA; bionic is a 4-byte int"},
+    {"pthread_mutex_*", "STRUCT", "Darwin pthread_mutex_t layout and static-initializer signature word differ"},
+    {"pthread_cond_*", "STRUCT", "Darwin pthread_cond_t layout and static-initializer signature differ"},
+    {"pthread_rwlock_*", "STRUCT", "Darwin pthread_rwlock_t layout and static-initializer signature differ"},
+    {"setjmp", "STRUCT", "jmp_buf: Darwin int[48]=192 bytes, bionic arm64 long[32]=256 bytes (overflows guest buffer)"},
+    {"_setjmp", "STRUCT", "jmp_buf size differs (see setjmp)"},
+    {"sigsetjmp", "STRUCT", "sigjmp_buf size differs"},
+    {"longjmp", "STRUCT", "jmp_buf layout differs"},
+    {"_longjmp", "STRUCT", "jmp_buf layout differs"},
+    {"siglongjmp", "STRUCT", "sigjmp_buf layout differs"},
+    {"uname", "STRUCT", "utsname field width 256 (Darwin) vs 65 (bionic)"},
+    {"statfs", "STRUCT", "struct statfs layout differs"},
+    {"fstatfs", "STRUCT", "struct statfs layout differs"},
+    {"statvfs", "STRUCT", "struct statvfs layout differs (deferred)"},
+    {"fstatvfs", "STRUCT", "struct statvfs layout differs"},
+    {"getmntinfo", "STRUCT", "Darwin-only / struct statfs"},
+    {"__swbuf", "STRUCT", "Darwin stdio internals (FILE fields accessed by guest macros)"},
+    {"__srget", "STRUCT", "Darwin stdio internals"},
+    {"fstatat", "STRUCT", "struct stat layout and AT_FDCWD (-2 vs -100)"},
+    {"fchmodat", "CONSTANTS", "AT_FDCWD -2 vs -100"},
+    {"unlinkat", "CONSTANTS", "AT_FDCWD -2 vs -100"},
+    {"mkdirat", "CONSTANTS", "AT_FDCWD -2 vs -100"},
+    {"posix_spawn", "STRUCT", "Darwin posix_spawn attr/file_actions layout"},
+    {nullptr, nullptr, nullptr}};
+
+static const DiffNote* find_diff_note(const std::string& sym) {
+    const char* s = sym.c_str();
+    if (s[0] == '_') ++s;
+    for (const DiffNote* d = kDiffNotes; d->name; ++d) {
+        size_t n = std::strlen(d->name);
+        if (n && d->name[n - 1] == '*') {
+            if (std::strncmp(s, d->name, n - 1) == 0) return d;
+        } else if (std::strcmp(s, d->name) == 0 || std::strcmp(sym.c_str(), d->name) == 0) {
+            return d;
+        }
+    }
+    return nullptr;
+}
+
+static void dump_direct_bound_list() {
+    size_t libc_n = 0, libcxx_n = 0, flagged = 0;
+    for (const auto& b : g_direct_bound) (b.libcxx ? libcxx_n : libc_n)++;
+    fprintf(stderr, "\n[DIRECT] %zu imports bound straight to bionic libc (+%zu to libc++); trace mode=%d\n",
+            libc_n, libcxx_n, g_trace_mode);
+    for (const auto& b : g_direct_bound) {
+        if (b.libcxx) continue;
+        const DiffNote* d = find_diff_note(b.name);
+        if (d) ++flagged;
+        fprintf(stderr, "[DIRECT-BOUND] %-40s %-8s %-10s%s%s%s%s\n", b.name.c_str(), b.module.c_str(), b.lazy ? "lazy" : "regular",
+                d ? "  DIFFERS[" : "", d ? d->cat : "", d ? "] " : "", d ? d->note : "");
+    }
+    fprintf(stderr, "[DIRECT] %zu libc names flagged with known Darwin/bionic differences\n", flagged);
+    for (const auto& b : g_direct_bound) {
+        if (b.libcxx) fprintf(stderr, "[DIRECT-BOUND-LIBCXX] %s\n", b.name.c_str());
+    }
+}
+
 static void init_custom_shims() {
     g_custom_shims["_open"] = allocate_trampoline(shim_open, "_open");
     g_custom_shims["_open$NOCANCEL"] = allocate_trampoline(shim_open, "_open$NOCANCEL");
@@ -1521,35 +1769,38 @@ static void* resolve_symbol(const std::string& name) {
     const char* stripped = name.c_str();
     if (stripped[0] == '_') stripped++; // Strip leading underscore
 
+    // Records a symbol bound straight to bionic; in trace mode, lazy (call) targets
+    // get a logging forwarder so every call shows up with its guest lr.
+    auto note_direct = [&](void* target, bool) -> void* {
+        bool lazy = g_lazy_names.count(name) != 0;
+        // dlsym on the libc++ handle also finds libc symbols (dependency), so classify by owner module.
+        Dl_info di{};
+        bool from_libcxx = dladdr(target, &di) && di.dli_fname && std::strstr(di.dli_fname, "libc++") != nullptr;
+        g_direct_bound.push_back({name, from_libcxx, lazy, di.dli_fname ? base_name(di.dli_fname) : "?"});
+        if ((g_trace_mode == 1 || g_trace_mode == 2) && !from_libcxx && lazy) {
+            target = make_direct_trace_stub(target, strdup(name.c_str()));
+        }
+        g_resolved_cache[name] = target;
+        return target;
+    };
+
     // Check system libc++.so first for C++ symbols
     if (g_libcxx_handle) {
         void* csym = dlsym(g_libcxx_handle, name.c_str());
-        if (csym) {
-            g_resolved_cache[name] = csym;
-            return csym;
-        }
+        if (csym) return note_direct(csym, true);
         if (stripped != name.c_str()) {
             csym = dlsym(g_libcxx_handle, stripped);
-            if (csym) {
-                g_resolved_cache[name] = csym;
-                return csym;
-            }
+            if (csym) return note_direct(csym, true);
         }
     }
 
     void* sym = dlsym(RTLD_DEFAULT, stripped);
-    if (sym) {
-        g_resolved_cache[name] = sym;
-        return sym;
-    }
+    if (sym) return note_direct(sym, false);
 
     // Try without stripping if name started with __Z
     if (name.rfind("__Z", 0) == 0) {
         sym = dlsym(RTLD_DEFAULT, name.c_str());
-        if (sym) {
-            g_resolved_cache[name] = sym;
-            return sym;
-        }
+        if (sym) return note_direct(sym, false);
     }
 
     // Objective-C runtime functions
@@ -1559,9 +1810,18 @@ static void* resolve_symbol(const std::string& name) {
         return stub;
     }
 
+    bool is_fn = is_function_import(name);
     if (g_unresolved_set.insert(name).second) {
-        fprintf(stderr, "[UNRESOLVED IMPORT] %s\n", name.c_str());
+        fprintf(stderr, "[UNRESOLVED IMPORT] %s %s\n", is_fn ? "FUNCTION" : "DATA    ", name.c_str());
         g_unresolved_imports.push_back(name);
+        if (is_fn) g_unresolved_fn_names.push_back(name);
+    }
+    if (!is_fn) {
+        // DATA import: PROT_NONE poison slot, so the first touch names the symbol.
+        if (void* slot = poison_slot_for(name)) {
+            g_resolved_cache[name] = slot;
+            return slot;
+        }
     }
     void* stub = allocate_trampoline(shim_unresolved, strdup(name.c_str()));
     g_resolved_cache[name] = stub;
@@ -1580,6 +1840,26 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx) {
     uint64_t sp = uc->uc_mcontext.sp;
     uint64_t lr = uc->uc_mcontext.regs[30];
     uint64_t fp = uc->uc_mcontext.regs[29];
+    {
+        uint64_t fa = reinterpret_cast<uint64_t>(info->si_addr);
+        uint64_t pb = reinterpret_cast<uint64_t>(g_poison_base);
+        if (pb && fa >= pb && fa < pb + static_cast<uint64_t>(POISON_SLOT_SIZE) * POISON_SLOTS) {
+            size_t slot = (fa - pb) / POISON_SLOT_SIZE;
+            wr_str(2, "[POISON] guest touched unresolved DATA import '");
+            wr_str(2, slot < g_poison_names.size() ? g_poison_names[slot].c_str() : "?");
+            wr_str(2, "' at slot+"); wr_hex(2, (fa - pb) % POISON_SLOT_SIZE);
+            wr_str(2, pc == fa ? " (EXECUTED as code: probably a function, misclassified as data)\n"
+                               : " (data read/write)\n");
+            wr_str(2, "[POISON]   pc -> "); describe_addr(2, pc); wr_str(2, "\n");
+            wr_str(2, "[POISON]   lr -> "); describe_addr(2, lr); wr_str(2, "\n");
+            if (g_poison_continue && pc != fa) {
+                ++g_poison_touch_count;
+                mprotect(g_poison_base + slot * POISON_SLOT_SIZE, POISON_SLOT_SIZE, PROT_READ | PROT_WRITE);
+                wr_str(2, "[POISON]   continue mode: page now readable (zeros); resuming\n");
+                return;
+            }
+        }
+    }
     fprintf(stderr, "\n[CRASH] Signal %d at fault_addr=%p, pc=0x%lx, lr=0x%lx, sp=0x%lx\n",
             sig, info->si_addr, (unsigned long)pc, (unsigned long)lr, (unsigned long)sp);
     log_term("sig_handler_exit", lr, 1, "loader_segv");
@@ -1654,6 +1934,10 @@ int main(int argc, char** argv) {
     setvbuf(stderr, nullptr, _IONBF, 0);
 
     init_safe_read();
+    if (const char* tm = getenv("LOADER_TRACE_DIRECT")) {
+        g_trace_mode = std::strcmp(tm, "all") == 0 ? 2 : std::strcmp(tm, "list") == 0 ? 3 : 1;
+    }
+    g_poison_continue = getenv("LOADER_POISON_STRICT") == nullptr;
     struct sigaction sa{};
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = segv_handler;
@@ -1848,7 +2132,7 @@ int main(int argc, char** argv) {
     printf("[+] Successfully applied %zu rebases!\n", rebase_count);
 
     // 6. Apply Bindings (Regular and Lazy)
-    auto apply_bind_stream = [&](uint32_t off, uint32_t size, const char* sname) {
+    auto apply_bind_stream = [&](uint32_t off, uint32_t size, const char* sname, bool collect_only = false) {
         if (size == 0) return;
         const uint8_t* ptr = file_data + off;
         const uint8_t* end = ptr + size;
@@ -1858,6 +2142,10 @@ int main(int argc, char** argv) {
         size_t b_count = 0;
 
         auto do_bind = [&](uint8_t* loc) {
+            if (collect_only) {
+                g_lazy_names.insert(symbol);
+                return;
+            }
             void* target = resolve_symbol(symbol);
             *reinterpret_cast<uint64_t*>(loc) = reinterpret_cast<uint64_t>(target);
             g_binds.push_back({reinterpret_cast<uint64_t>(loc),
@@ -1916,15 +2204,20 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        printf("[+] Applied %zu bindings in %s stream\n", b_count, sname);
+        if (!collect_only) printf("[+] Applied %zu bindings in %s stream\n", b_count, sname);
     };
 
+    // Pre-pass: learn which names are call targets (lazy stream) before resolving anything.
+    apply_bind_stream(lazy_off, lazy_size, "lazy", true);
+    printf("[*] %zu unique symbols in lazy (function) stream\n", g_lazy_names.size());
     apply_bind_stream(bind_off, bind_size, "regular");
     apply_bind_stream(lazy_off, lazy_size, "lazy");
-    printf("[*] Unresolved imports: %zu unique\n", g_unresolved_imports.size());
+    printf("[*] Unresolved imports: %zu unique (%zu function -> shim_unresolved, %zu data -> poison)\n",
+           g_unresolved_imports.size(), g_unresolved_fn_names.size(), g_poison_names.size());
     for (const auto& n : g_unresolved_imports) {
-        fprintf(stderr, "  UNRESOLVED %s\n", n.c_str());
+        fprintf(stderr, "  UNRESOLVED %s %s\n", is_function_import(n) ? "fn  " : "data", n.c_str());
     }
+    if (g_trace_mode) dump_direct_bound_list();
 
     // 7. TLS veneers in the pool adjacent to the image.
     // Site: `b veneer`. Veneer: mrs Xd, tpidr_el0; add/sub Xd; `b back`.
@@ -2090,6 +2383,133 @@ int main(int argc, char** argv) {
     printf("\n======================================================\n");
     printf("   GATE 2 / HEADLESS IL2CPP BOOT: 100%% VERIFIED PASS!\n");
     printf("======================================================\n");
+
+    // [6/5] Invoke one simple managed method through il2cpp_runtime_invoke.
+    typedef const char* (*image_get_name_fn)(void*);
+    typedef void* (*class_from_name_fn)(void*, const char*, const char*);
+    typedef void* (*class_get_methods_fn)(void*, void**);
+    typedef const char* (*method_get_name_fn)(void*);
+    typedef uint32_t (*method_get_param_count_fn)(void*);
+    typedef void* (*method_get_param_fn)(void*, uint32_t);
+    typedef void* (*method_get_return_type_fn)(void*);
+    typedef uint32_t (*method_get_flags_fn)(void*, uint32_t*);
+    typedef char* (*type_get_name_fn)(void*);
+    typedef void* (*runtime_invoke_fn)(void*, void*, void**, void**);
+    typedef void* (*object_unbox_fn)(void*);
+    typedef void* (*object_get_class_fn)(void*);
+    typedef void (*format_exception_fn)(void*, char*, int);
+    typedef int (*string_length_fn)(void*);
+    typedef uint16_t* (*string_chars_fn)(void*);
+    auto image_get_name = reinterpret_cast<image_get_name_fn>(get_fn(0xbe0128));
+    auto class_from_name = reinterpret_cast<class_from_name_fn>(get_fn(0xbdee6c));
+    auto class_get_methods = reinterpret_cast<class_get_methods_fn>(get_fn(0xbdeefc));
+    auto method_get_name = reinterpret_cast<method_get_name_fn>(get_fn(0xbdfa9c));
+    auto method_get_param_count = reinterpret_cast<method_get_param_count_fn>(get_fn(0xbdfadc));
+    auto method_get_param = reinterpret_cast<method_get_param_fn>(get_fn(0xbdfaec));
+    auto method_get_return_type = reinterpret_cast<method_get_return_type_fn>(get_fn(0xbdfa6c));
+    auto method_get_flags = reinterpret_cast<method_get_flags_fn>(get_fn(0xbdfb2c));
+    auto type_get_name = reinterpret_cast<type_get_name_fn>(get_fn(0xbdff64));
+    auto runtime_invoke = reinterpret_cast<runtime_invoke_fn>(get_fn(0xbdfd48));
+    auto object_unbox = reinterpret_cast<object_unbox_fn>(get_fn(0xbdfc94));
+    auto object_get_class = reinterpret_cast<object_get_class_fn>(get_fn(0xbdfc40));
+    auto format_exception = reinterpret_cast<format_exception_fn>(get_fn(0xbdf58c));
+    auto string_length = reinterpret_cast<string_length_fn>(get_fn(0xbdfdac));
+    auto string_chars = reinterpret_cast<string_chars_fn>(get_fn(0xbdfdbc));
+
+    printf("\n[6/5] Invoking a managed static method via il2cpp_runtime_invoke...\n");
+    void* mscorlib = nullptr;
+    for (size_t i = 0; i < asm_count; ++i) {
+        void* img = il2cpp_assembly_get_image(assemblies[i]);
+        const char* iname = image_get_name(img);
+        if (iname && std::strcmp(iname, "mscorlib.dll") == 0) { mscorlib = img; break; }
+    }
+    printf("[*] mscorlib.dll image: %p\n", mscorlib);
+
+    struct Candidate {
+        const char* ns; const char* cls; const char* method; int nparams;
+        const char* p0; const char* p1;
+    };
+    const Candidate candidates[] = {
+        {"System", "Math", "Max", 2, "System.Int32", "System.Int32"},
+        {"System", "Math", "Abs", 1, "System.Int32", nullptr},
+        {"System", "String", "Concat", 2, "System.String", "System.String"},
+        {"System", "Int32", "Parse", 1, "System.String", nullptr},
+    };
+
+    void* chosen = nullptr;
+    const Candidate* chosen_c = nullptr;
+    for (const auto& c : candidates) {
+        if (!mscorlib) break;
+        void* klass = class_from_name(mscorlib, c.ns, c.cls);
+        printf("[*] class %s.%s -> %p\n", c.ns, c.cls, klass);
+        if (!klass) continue;
+        void* iter = nullptr;
+        size_t listed = 0;
+        while (void* m = class_get_methods(klass, &iter)) {
+            const char* mn = method_get_name(m);
+            if (!mn || std::strcmp(mn, c.method) != 0) continue;
+            uint32_t pc = method_get_param_count(m);
+            uint32_t fl = method_get_flags(m, nullptr);
+            bool is_static = (fl & 0x10) != 0;
+            std::string sig;
+            bool match = pc == static_cast<uint32_t>(c.nparams) && is_static;
+            for (uint32_t k = 0; k < pc; ++k) {
+                char* tn = type_get_name(method_get_param(m, k));
+                sig += (k ? ", " : ""); sig += tn ? tn : "?";
+                const char* want = k == 0 ? c.p0 : c.p1;
+                if (match && (!want || !tn || std::strcmp(tn, want) != 0)) match = false;
+            }
+            ++listed;
+            printf("    %s.%s(%s) static=%d%s\n", c.cls, mn, sig.c_str(), is_static, match ? "  <== match" : "");
+            if (match && !chosen) { chosen = m; chosen_c = &c; }
+        }
+        if (listed == 0) printf("    (no methods named %s found; likely stripped)\n", c.method);
+        if (chosen) break;
+    }
+
+    if (!chosen) {
+        printf("[-] [6/5] no suitable candidate method found in mscorlib (see listing above)\n");
+    } else {
+        printf("[*] Invoking %s.%s.%s (method=%p)\n", chosen_c->ns, chosen_c->cls, chosen_c->method, chosen);
+        int a = 7, b = 42;
+        void* str_a = nullptr;
+        void* str_b = nullptr;
+        void* args[2] = {nullptr, nullptr};
+        if (std::strcmp(chosen_c->p0, "System.Int32") == 0) {
+            args[0] = &a;
+            args[1] = chosen_c->nparams > 1 ? static_cast<void*>(&b) : nullptr;
+            printf("[*] args: int %d%s\n", a, chosen_c->nparams > 1 ? ", int 42" : "");
+        } else {
+            str_a = il2cpp_string_new(chosen_c->nparams > 1 ? "Hello, " : "1234");
+            str_b = chosen_c->nparams > 1 ? il2cpp_string_new("il2cpp") : nullptr;
+            args[0] = str_a;
+            args[1] = str_b;
+            printf("[*] args: string objects %p %p\n", str_a, str_b);
+        }
+        void* exc = nullptr;
+        void* ret = runtime_invoke(chosen, nullptr, args, &exc);
+        printf("[*] il2cpp_runtime_invoke returned object=%p exception=%p\n", ret, exc);
+        if (exc) {
+            char msg[2048] = {0};
+            format_exception(exc, msg, sizeof(msg));
+            void* ek = object_get_class(exc);
+            printf("[-] managed exception (%s): %s\n", ek ? il2cpp_class_get_name(ek) : "?", msg);
+        } else if (ret) {
+            char* rtn = type_get_name(method_get_return_type(chosen));
+            printf("[*] return type: %s\n", rtn ? rtn : "?");
+            if (rtn && std::strcmp(rtn, "System.String") == 0) {
+                int len = string_length(ret);
+                const uint16_t* ch = string_chars(ret);
+                std::string out;
+                for (int i = 0; i < len; ++i) out.push_back(static_cast<char>(ch[i] < 128 ? ch[i] : '?'));
+                printf("[+] [6/5] returned string (%d chars): \"%s\"\n", len, out.c_str());
+            } else {
+                printf("[+] [6/5] returned int: %d\n", *static_cast<int*>(object_unbox(ret)));
+            }
+        } else {
+            printf("[-] [6/5] returned null with no exception\n");
+        }
+    }
 
     return 0;
 }

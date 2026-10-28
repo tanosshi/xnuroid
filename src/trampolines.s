@@ -2,6 +2,7 @@
 .align 4
 .extern native_mmap_impl
 .extern callframe_dispatch
+.extern direct_trace_log
 
 // Generic C++ Shim Trampoline with ARMv8.5+ BTI support.
 // Incoming: x17 = &TrampolineEntry { handler, symbol_name }, x0-x8 = guest args.
@@ -43,6 +44,45 @@ callframe_trampoline:
     ret
 
 .size callframe_trampoline, .-callframe_trampoline
+
+// Logging forwarder for imports bound directly to bionic (debug mode only).
+// Incoming: x17 = &DirectTraceEntry { target, name, calls }, x0-x8/q0-q7 = guest args.
+// Saves every argument register, calls direct_trace_log(entry, guest_lr, &saved_x0),
+// restores everything and TAIL-JUMPS (br) to the target, so the target sees the
+// guest's original lr, sp and stack arguments.
+.globl direct_trace_forward
+.type direct_trace_forward, %function
+direct_trace_forward:
+    hint #34
+    stp x29, x30, [sp, #-224]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    stp x8, x17, [sp, #80]
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    mov x0, x17
+    mov x1, x30
+    add x2, sp, #16
+    bl direct_trace_log
+    ldp q6, q7, [sp, #192]
+    ldp q4, q5, [sp, #160]
+    ldp q2, q3, [sp, #128]
+    ldp q0, q1, [sp, #96]
+    ldp x8, x17, [sp, #80]
+    ldp x6, x7, [sp, #64]
+    ldp x4, x5, [sp, #48]
+    ldp x2, x3, [sp, #32]
+    ldp x0, x1, [sp, #16]
+    ldp x29, x30, [sp], #224
+    ldr x16, [x17]
+    br x16
+
+.size direct_trace_forward, .-direct_trace_forward
 
 // Raw entry capture for guest mmap. Spills x0-x7/lr/sp into a ring, then
 // tail-calls the C implementation with the original argument registers.
