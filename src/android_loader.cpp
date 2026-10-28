@@ -1523,7 +1523,8 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
     }
     if (sel == "maxBufferLength" || sel == "recommendedMaxWorkingSetSize") { frame.ret_x0 = 0x40000000ull; return true; }
     if (sel == "registryID") { frame.ret_x0 = 1; return true; }
-    if (sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy") { frame.ret_x0 = frame.x[0]; return true; }
+    if (sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" || sel == "alloc" ||
+        sel == "allocWithZone:" || starts("init")) { frame.ret_x0 = frame.x[0]; return true; }
     return false;
 }
 // Returns true if the message was answered.
@@ -1900,6 +1901,256 @@ static void dump_direct_bound_list() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Apple framework function stubs (CoreFoundation / CoreGraphics / AudioToolbox / ...), engine mode.
+// CF types are toll-free bridged with the fake NS objects above, so they share fake_lookup()/objc_string_value().
+// ---------------------------------------------------------------------------
+#include <atomic>
+#include <thread>
+
+extern "C" {
+void* native_cf_retain(void* o) { return o; }
+void native_cf_release(void*) {}
+int64_t native_cfstring_get_length(void* s) { std::string v; return objc_string_value(reinterpret_cast<uint64_t>(s), v) ? static_cast<int64_t>(v.size()) : 0; }
+int native_cfstring_get_cstring(void* s, char* buf, int64_t size, uint32_t) {
+    std::string v;
+    if (!buf || size <= 0 || !objc_string_value(reinterpret_cast<uint64_t>(s), v)) return 0;
+    if (static_cast<int64_t>(v.size()) + 1 > size) return 0;
+    std::memcpy(buf, v.c_str(), v.size() + 1);
+    return 1;
+}
+int64_t native_cfstring_max_size(int64_t len, uint32_t) { return len * 4 + 1; }
+void* native_cf_null() { return nullptr; }
+int native_cf_false() { return 0; }
+int64_t native_cf_zero() { return 0; }
+void* native_cfarray_create_mutable(void*, int64_t, void*) { return reinterpret_cast<void*>(fake_make(3, "cfarray")); }
+void* native_cfstring_create_with_characters(void*, const uint16_t* chars, int64_t n) {
+    std::string s;
+    for (int64_t i = 0; chars && i < n; ++i) s.push_back(chars[i] < 128 ? static_cast<char>(chars[i]) : '?');
+    return reinterpret_cast<void*>(fake_make(2, s));
+}
+// NS functions
+void* native_nsclass_from_string(void* name) {
+    std::string n;
+    objc_string_value(reinterpret_cast<uint64_t>(name), n);
+    static std::unordered_map<std::string, uint64_t> classes;
+    auto it = classes.find(n);
+    if (it == classes.end()) it = classes.emplace(n, fake_make(3, "class:" + n)).first;
+    return reinterpret_cast<void*>(it->second);
+}
+void* native_ns_temp_dir() { return reinterpret_cast<void*>(fake_make(2, "/data/local/tmp/")); }
+void* native_ns_search_paths(uint64_t, uint64_t, int) { return nullptr; }
+void* native_ns_uncaught_handler_get() { return nullptr; }
+void native_ns_uncaught_handler_set(void*) {}
+void native_chkstk_darwin() {}
+// CoreGraphics math (CGAffineTransform = 6 doubles, returned via x8; CGRect = HFA of 4 doubles)
+struct CGAT { double a, b, c, d, tx, ty; };
+struct CGR { double x, y, w, h; };
+CGAT native_cgat_concat(CGAT t1, CGAT t2) {
+    return {t1.a * t2.a + t1.b * t2.c, t1.a * t2.b + t1.b * t2.d, t1.c * t2.a + t1.d * t2.c, t1.c * t2.b + t1.d * t2.d,
+            t1.tx * t2.a + t1.ty * t2.c + t2.tx, t1.tx * t2.b + t1.ty * t2.d + t2.ty};
+}
+CGAT native_cgat_invert(CGAT t) {
+    double det = t.a * t.d - t.b * t.c;
+    if (det == 0) return t;
+    return {t.d / det, -t.b / det, -t.c / det, t.a / det, (t.c * t.ty - t.d * t.tx) / det, (t.b * t.tx - t.a * t.ty) / det};
+}
+CGAT native_cgat_make_rotation(double r) { return {cos(r), sin(r), -sin(r), cos(r), 0, 0}; }
+CGR native_cgrect_union(CGR a, CGR b) {
+    double x0 = std::min(a.x, b.x), y0 = std::min(a.y, b.y);
+    double x1 = std::max(a.x + a.w, b.x + b.w), y1 = std::max(a.y + a.h, b.y + b.h);
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+void* native_fake_handle() { return reinterpret_cast<void*>(fake_make(3, "handle")); }
+int native_ret_error() { return -1; }
+struct CMTime { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch; };
+double native_cmtime_seconds(CMTime t) { return t.timescale ? static_cast<double>(t.value) / t.timescale : 0.0; }
+CMTime native_cmtime_make(int64_t v, int32_t ts) { return {v, ts, 1, 0}; }
+CMTime native_cmtime_make_seconds(double s, int32_t ts) { return {static_cast<int64_t>(s * ts), ts, 1, 0}; }
+int32_t native_cmtime_compare(CMTime a, CMTime b) {
+    double x = native_cmtime_seconds(a), y = native_cmtime_seconds(b);
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+// --- AudioUnit (RemoteIO) output: a real-time pump that drives the render callback and discards the samples ---
+struct AuRenderCallback { int32_t (*proc)(void*, uint32_t*, const void*, uint32_t, uint32_t, void*); void* refcon; };
+struct AuUnit {
+    AuRenderCallback cb{nullptr, nullptr};
+    double rate = 44100.0;
+    uint32_t channels = 2, bits = 32, flags = 0x29;   // float | packed(8) | ... default: interleaved float32
+    bool non_interleaved = false;
+    std::atomic<bool> running{false};
+    std::thread th;
+};
+static char g_audio_component;
+void* native_au_find_next(void* prev, const void*) { return prev ? nullptr : &g_audio_component; }
+int32_t native_au_instance_new(void*, void** out) { if (out) *out = new AuUnit(); return 0; }
+int32_t native_au_instance_dispose(void* u) {
+    auto* a = static_cast<AuUnit*>(u);
+    if (a) { a->running = false; if (a->th.joinable()) a->th.join(); delete a; }
+    return 0;
+}
+int32_t native_au_set_property(void* u, uint32_t prop, uint32_t, uint32_t, const void* data, uint32_t size) {
+    auto* a = static_cast<AuUnit*>(u);
+    if (!a || !data) return 0;
+    if (prop == 23 && size >= sizeof(AuRenderCallback)) {          // kAudioUnitProperty_SetRenderCallback
+        std::memcpy(&a->cb, data, sizeof(AuRenderCallback));
+        fprintf(stderr, "[AUDIO] render callback set: %p refcon=%p\n", reinterpret_cast<void*>(a->cb.proc), a->cb.refcon);
+    } else if (prop == 8 && size >= 40) {                           // kAudioUnitProperty_StreamFormat (ASBD)
+        double rate; uint32_t fl, ch, bits;
+        std::memcpy(&rate, data, 8);
+        std::memcpy(&fl, static_cast<const char*>(data) + 12, 4);
+        std::memcpy(&ch, static_cast<const char*>(data) + 28, 4);
+        std::memcpy(&bits, static_cast<const char*>(data) + 32, 4);
+        if (rate > 0) a->rate = rate;
+        if (ch) a->channels = ch;
+        if (bits) a->bits = bits;
+        a->flags = fl;
+        a->non_interleaved = (fl & 0x20) != 0;
+        fprintf(stderr, "[AUDIO] stream format: %.0f Hz, %u ch, %u bit, flags=0x%x%s\n", a->rate, a->channels, a->bits, fl,
+                a->non_interleaved ? " non-interleaved" : "");
+    }
+    return 0;
+}
+int32_t native_au_get_property(void* u, uint32_t prop, uint32_t, uint32_t, void* data, uint32_t* size) {
+    auto* a = static_cast<AuUnit*>(u);
+    if (!data || !size) return 0;
+    if (prop == 8 && *size >= 40 && a) {                            // default output format: 44.1 kHz stereo float32
+        std::memset(data, 0, 40);
+        double rate = a->rate;
+        uint32_t fid = 0x6c70636d /* 'lpcm' */, fl = 0x29, bpp = 8, fpp = 1, ch = 2, bits = 32;
+        std::memcpy(data, &rate, 8);
+        std::memcpy(static_cast<char*>(data) + 8, &fid, 4);
+        std::memcpy(static_cast<char*>(data) + 12, &fl, 4);
+        std::memcpy(static_cast<char*>(data) + 16, &bpp, 4);
+        std::memcpy(static_cast<char*>(data) + 20, &fpp, 4);
+        std::memcpy(static_cast<char*>(data) + 24, &bpp, 4);
+        std::memcpy(static_cast<char*>(data) + 28, &ch, 4);
+        std::memcpy(static_cast<char*>(data) + 32, &bits, 4);
+        *size = 40;
+    } else if (prop == 14 && *size >= 4) {                          // MaximumFramesPerSlice
+        uint32_t v = 4096; std::memcpy(data, &v, 4); *size = 4;
+    } else {
+        std::memset(data, 0, *size);
+    }
+    return 0;
+}
+int32_t native_au_zero(void*) { return 0; }
+int32_t native_au_start(void* u) {
+    auto* a = static_cast<AuUnit*>(u);
+    if (!a || a->running.exchange(true)) return 0;
+    a->th = std::thread([a] {
+        const uint32_t frames = 512;
+        const uint32_t bytes_per_sample = a->bits / 8 ? a->bits / 8 : 4;
+        const uint32_t nbufs = a->non_interleaved ? a->channels : 1;
+        const uint32_t chans_per_buf = a->non_interleaved ? 1 : a->channels;
+        std::vector<char> storage(static_cast<size_t>(nbufs) * frames * chans_per_buf * bytes_per_sample);
+        struct Ab { uint32_t n_ch, bytes; void* data; };
+        std::vector<char> abl_mem(8 + sizeof(Ab) * nbufs);
+        double sample_time = 0;
+        timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
+        uint64_t calls = 0;
+        while (a->running) {
+            auto* abl = reinterpret_cast<uint32_t*>(abl_mem.data());
+            abl[0] = nbufs;
+            auto* bufs = reinterpret_cast<Ab*>(abl_mem.data() + 8);
+            for (uint32_t i = 0; i < nbufs; ++i) {
+                bufs[i].n_ch = chans_per_buf;
+                bufs[i].bytes = frames * chans_per_buf * bytes_per_sample;
+                bufs[i].data = storage.data() + static_cast<size_t>(i) * bufs[i].bytes;
+            }
+            std::memset(storage.data(), 0, storage.size());
+            alignas(8) char ts[80] = {};
+            std::memcpy(ts, &sample_time, 8);
+            uint32_t ts_flags = 1;   // kAudioTimeStampSampleTimeValid
+            std::memcpy(ts + 68, &ts_flags, 4);
+            uint32_t action_flags = 0;
+            if (a->cb.proc) {
+                a->cb.proc(a->cb.refcon, &action_flags, ts, 0, frames, abl_mem.data());
+                if (++calls == 1) fprintf(stderr, "[AUDIO] first render callback returned\n");
+            }
+            sample_time += frames;
+            next.tv_nsec += static_cast<long>(1e9 * frames / a->rate);
+            while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+        }
+    });
+    return 0;
+}
+int32_t native_au_stop(void* u) {
+    auto* a = static_cast<AuUnit*>(u);
+    if (a) { a->running = false; if (a->th.joinable()) a->th.join(); }
+    return 0;
+}
+} // extern "C"
+
+static void register_darwin_framework_stubs() {
+    auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
+    reg("_CFRetain", reinterpret_cast<void*>(&native_cf_retain));
+    reg("_CFRelease", reinterpret_cast<void*>(&native_cf_release));
+    reg("_CFStringGetLength", reinterpret_cast<void*>(&native_cfstring_get_length));
+    reg("_CFStringGetCString", reinterpret_cast<void*>(&native_cfstring_get_cstring));
+    reg("_CFStringGetMaximumSizeForEncoding", reinterpret_cast<void*>(&native_cfstring_max_size));
+    reg("_CFStringCreateWithCharacters", reinterpret_cast<void*>(&native_cfstring_create_with_characters));
+    reg("_CFArrayCreateMutable", reinterpret_cast<void*>(&native_cfarray_create_mutable));
+    for (const char* n : {"_CFArrayAppendValue", "_CFWriteStreamOpen", "_CFStreamCreateBoundPair", "_CGColorRelease",
+                          "_CGColorSpaceRelease", "_CVBufferRelease"})
+        reg(n, reinterpret_cast<void*>(&native_cf_release));
+    for (const char* n : {"_CFDataCreateWithBytesNoCopy", "_CFDataGetBytePtr", "_CFDictionaryGetValue", "_CFLocaleCopyCurrent",
+                          "_CFLocaleGetIdentifier", "_CFLocaleGetValue", "_CFURLGetFileSystemRepresentation", "_CFUUIDCreate",
+                          "_CFUUIDCreateFromUUIDBytes", "_CFUUIDCreateString", "_CFStringGetBytes", "_CFNumberGetValue",
+                          "_CTFontCopyFontDescriptor", "_CTFontCreateUIFontForLanguage", "_CTFontDescriptorCopyAttribute",
+                          "_CTFontDescriptorCreateMatchingFontDescriptor", "_CTFontDescriptorCreateWithAttributes",
+                          "_CTFontDescriptorCreateWithNameAndSize", "_CMFormatDescriptionGetExtension",
+                          "_CMAudioFormatDescriptionGetRichestDecodableFormat", "_CMSampleBufferGetImageBuffer",
+                          "_SCNetworkReachabilityCreateWithAddress", "_SecCertificateCopyData", "_SecCertificateCreateWithData",
+                          "_SecPolicyCreateBasicX509", "_SecTrustGetCertificateAtIndex", "_UIImagePNGRepresentation",
+                          "_MTAudioProcessingTapGetStorage", "_CVMetalTextureGetTexture"})
+        reg(n, reinterpret_cast<void*>(&native_cf_null));
+    for (const char* n : {"_CFDataGetLength", "_CMFormatDescriptionGetMediaSubType", "_SecTrustGetCertificateCount",
+                          "_CVPixelBufferGetHeight", "_CVPixelBufferGetWidth", "_CVPixelBufferGetPixelFormatType"})
+        reg(n, reinterpret_cast<void*>(&native_cf_zero));
+    for (const char* n : {"_SCNetworkReachabilityGetFlags", "_SecTrustCreateWithCertificates", "_SecTrustEvaluate",
+                          "_CVPixelBufferCreate", "_CVMetalTextureCacheCreate", "_CVMetalTextureCacheCreateTextureFromImage",
+                          "_MTAudioProcessingTapCreate", "_MTAudioProcessingTapGetSourceAudio", "_UIApplicationMain",
+                          "_CMVideoFormatDescriptionGetPresentationDimensions", "_CMSampleBufferGetPresentationTimeStamp",
+                          "_CMTimeRangeMake", "_CMTimeMultiply", "_CMTimeMultiplyByFloat64", "_CVMetalTextureCacheFlush"})
+        reg(n, reinterpret_cast<void*>(&native_ret_error));
+    reg("_CGColorCreate", reinterpret_cast<void*>(&native_fake_handle));
+    reg("_CGColorSpaceCreateDeviceRGB", reinterpret_cast<void*>(&native_fake_handle));
+    reg("_CGAffineTransformConcat", reinterpret_cast<void*>(&native_cgat_concat));
+    reg("_CGAffineTransformInvert", reinterpret_cast<void*>(&native_cgat_invert));
+    reg("_CGAffineTransformMakeRotation", reinterpret_cast<void*>(&native_cgat_make_rotation));
+    reg("_CGRectUnion", reinterpret_cast<void*>(&native_cgrect_union));
+    reg("_CMTimeGetSeconds", reinterpret_cast<void*>(&native_cmtime_seconds));
+    reg("_CMTimeMake", reinterpret_cast<void*>(&native_cmtime_make));
+    reg("_CMTimeMakeWithSeconds", reinterpret_cast<void*>(&native_cmtime_make_seconds));
+    reg("_CMTimeCompare", reinterpret_cast<void*>(&native_cmtime_compare));
+    reg("_NSClassFromString", reinterpret_cast<void*>(&native_nsclass_from_string));
+    reg("_NSTemporaryDirectory", reinterpret_cast<void*>(&native_ns_temp_dir));
+    reg("_NSSearchPathForDirectoriesInDomains", reinterpret_cast<void*>(&native_ns_search_paths));
+    reg("_NSGetUncaughtExceptionHandler", reinterpret_cast<void*>(&native_ns_uncaught_handler_get));
+    reg("_NSSetUncaughtExceptionHandler", reinterpret_cast<void*>(&native_ns_uncaught_handler_set));
+    reg("___chkstk_darwin", reinterpret_cast<void*>(&native_chkstk_darwin));
+    // AudioUnit output
+    reg("_AudioComponentFindNext", reinterpret_cast<void*>(&native_au_find_next));
+    reg("_AudioComponentInstanceNew", reinterpret_cast<void*>(&native_au_instance_new));
+    reg("_AudioComponentInstanceDispose", reinterpret_cast<void*>(&native_au_instance_dispose));
+    reg("_AudioUnitSetProperty", reinterpret_cast<void*>(&native_au_set_property));
+    reg("_AudioUnitGetProperty", reinterpret_cast<void*>(&native_au_get_property));
+    reg("_AudioUnitInitialize", reinterpret_cast<void*>(&native_au_zero));
+    reg("_AudioUnitUninitialize", reinterpret_cast<void*>(&native_au_zero));
+    reg("_AudioOutputUnitStart", reinterpret_cast<void*>(&native_au_start));
+    reg("_AudioOutputUnitStop", reinterpret_cast<void*>(&native_au_stop));
+    // AudioQueue / AudioFile: report failure so the caller falls back or skips
+    for (const char* n : {"_AudioQueueAllocateBuffer", "_AudioQueueAllocateBufferWithPacketDescriptions", "_AudioQueueDispose",
+                          "_AudioQueueEnqueueBuffer", "_AudioQueueFlush", "_AudioQueueNewOutput", "_AudioQueueOfflineRender",
+                          "_AudioQueueSetOfflineRenderFormat", "_AudioQueueSetProperty", "_AudioQueueStart", "_AudioQueueStop",
+                          "_AudioUnitRender", "_AudioFileClose", "_AudioFileGetProperty", "_AudioFileGetPropertyInfo",
+                          "_AudioFileOpenWithCallbacks", "_AudioFileReadPacketData"})
+        reg(n, reinterpret_cast<void*>(&native_ret_error));
+}
+
 static void init_custom_shims() {
     g_custom_shims["_open"] = allocate_trampoline(shim_open, "_open");
     // setjmp family: asm, tail-bound, guest-sized (192-byte) jmp_buf
@@ -1989,6 +2240,7 @@ static void init_custom_shims() {
         if (getenv("LOADER_ENGINE")) {   // engine mode only: keep the default run on plain bionic dlopen/dlsym
             reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
             reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
+            register_darwin_framework_stubs();
         }
         reg("___tolower", reinterpret_cast<void*>(&native_tolower));
         reg("___toupper", reinterpret_cast<void*>(&native_toupper));
