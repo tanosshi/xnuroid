@@ -268,7 +268,7 @@ objc_msgSend_guest:
     ldp x29, x30, [sp], #224
     cbz x16, 2f
     br x16
-2:  b objc_fallback_c
+2:  b objc_fallback_asm
 1:  mov x0, #0
     mov x1, #0
     movi v0.2d, #0
@@ -306,5 +306,23 @@ objc_msgSendSuper2_guest:
     ldr x0, [x0]            // receiver out of the objc_super struct
     cbz x16, 2f
     br x16
-2:  b objc_fallback_c
+2:  b objc_fallback_asm
 .size objc_msgSendSuper2_guest, .-objc_msgSendSuper2_guest
+
+// Calls the C fallback with the original argument registers, then loads d0-d3 from the thread-local return area
+// the fallback may have filled (CGFloat / CGRect / float answers) while keeping x0 as its integer answer.
+.globl objc_fallback_asm
+.type objc_fallback_asm, %function
+objc_fallback_asm:
+    hint #34
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    bl objc_fallback_c
+    str x0, [sp, #16]
+    bl objc_ret_d_ptr
+    ldp d0, d1, [x0]
+    ldp d2, d3, [x0, #16]
+    ldr x0, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.size objc_fallback_asm, .-objc_fallback_asm

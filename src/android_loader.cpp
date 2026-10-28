@@ -1477,6 +1477,12 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
 
 // Minimal Foundation for engine mode: one fake NSBundle and heap-allocated fake NSStrings.
 // Pointers are tracked in a set (receivers can be arbitrary), so lookups never dereference unknown memory.
+static thread_local double g_objc_ret_d[4];
+extern "C" double* objc_ret_d_ptr() { return g_objc_ret_d; }
+static void objc_ret_double(double v) { g_objc_ret_d[0] = v; }
+static void objc_ret_float(float v) { g_objc_ret_d[0] = 0; std::memcpy(&g_objc_ret_d[0], &v, sizeof v); }
+static void objc_ret_rect(double x, double y, double w, double h) { g_objc_ret_d[0] = x; g_objc_ret_d[1] = y; g_objc_ret_d[2] = w; g_objc_ret_d[3] = h; }
+
 struct FakeObjcObj { int kind; std::string s; };   // kind 1 = bundle, 2 = string
 static std::unordered_map<void*, FakeObjcObj*> g_fake_objc;
 static FakeObjcObj* fake_lookup(uint64_t p) {
@@ -1531,6 +1537,51 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
 // Returns true if the message was answered.
 static bool fake_foundation(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
+    // --- UIKit / Foundation singletons (kind 6, name in s) ---
+    if (sel == "currentDevice" || sel == "mainScreen" || sel == "sharedApplication" || sel == "processInfo" ||
+        sel == "currentLocale" || sel == "preferredLanguages") {
+        static std::unordered_map<std::string, uint64_t> singles;
+        const char* nm = sel == "currentDevice" ? "UIDevice" : sel == "mainScreen" ? "UIScreen" :
+                         sel == "sharedApplication" ? "UIApplication" : sel == "processInfo" ? "NSProcessInfo" : "NSLocale";
+        auto it = singles.find(nm);
+        if (it == singles.end()) it = singles.emplace(nm, fake_make(6, nm)).first;
+        frame.ret_x0 = it->second;
+        return true;
+    }
+    if (self && self->kind == 6) {
+        const std::string& cls = self->s;
+        if (cls == "UIDevice") {
+            if (sel == "systemVersion") { frame.ret_x0 = fake_make(2, "16.0"); return true; }
+            if (sel == "systemName") { frame.ret_x0 = fake_make(2, "iOS"); return true; }
+            if (sel == "model" || sel == "localizedModel") { frame.ret_x0 = fake_make(2, "iPhone"); return true; }
+            if (sel == "name") { frame.ret_x0 = fake_make(2, "iPhone"); return true; }
+            if (sel == "identifierForVendor") { frame.ret_x0 = fake_make(5, "uuid"); return true; }
+            if (sel == "userInterfaceIdiom") { frame.ret_x0 = 0; return true; }       // UIUserInterfaceIdiomPhone
+            if (sel == "orientation") { frame.ret_x0 = 1; return true; }              // portrait
+            if (sel == "isMultitaskingSupported") { frame.ret_x0 = 1; return true; }
+            if (sel == "batteryLevel") { objc_ret_float(1.0f); return true; }
+            if (sel == "batteryState") { frame.ret_x0 = 2; return true; }
+        } else if (cls == "UIScreen") {
+            if (sel == "bounds" || sel == "applicationFrame") { objc_ret_rect(0, 0, 360, 780); return true; }
+            if (sel == "nativeBounds") { objc_ret_rect(0, 0, 1080, 2340); return true; }
+            if (sel == "scale" || sel == "nativeScale") { objc_ret_double(3.0); return true; }
+            if (sel == "maximumFramesPerSecond") { frame.ret_x0 = 60; return true; }
+            if (sel == "brightness") { objc_ret_double(0.5); return true; }
+        } else if (cls == "UIApplication") {
+            if (sel == "applicationState") { frame.ret_x0 = 0; return true; }           // active
+            if (sel == "statusBarOrientation") { frame.ret_x0 = 1; return true; }
+            if (sel == "isIdleTimerDisabled") { frame.ret_x0 = 0; return true; }
+        } else if (cls == "NSProcessInfo") {
+            if (sel == "physicalMemory") { frame.ret_x0 = 6ull << 30; return true; }
+            if (sel == "processorCount" || sel == "activeProcessorCount") { frame.ret_x0 = 8; return true; }
+            if (sel == "isLowPowerModeEnabled") { frame.ret_x0 = 0; return true; }
+            if (sel == "systemUptime") { objc_ret_double(1000.0); return true; }
+            if (sel == "processName") { frame.ret_x0 = fake_make(2, "UnityFramework"); return true; }
+        }
+        bool keep = sel == "retain" || sel == "autorelease" || sel == "self";
+        frame.ret_x0 = keep ? frame.x[0] : 0;
+        return true;
+    }
     if (self && self->kind == 5) {      // generic foreign object (NSMutableArray, UIView, ...): inert, answers nil/0
         bool keep = sel.compare(0, 4, "init") == 0 || sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" ||
                     sel == "mutableCopy" || sel == "alloc";
@@ -2132,6 +2183,7 @@ extern "C" uint64_t objc_fallback_c(uint64_t x0, uint64_t x1, uint64_t x2, uint6
             if (s == "respondsToSelector:") return objcrt::lookup_imp(x0, reinterpret_cast<const char*>(x2)) != 0;
         }
     }
+    g_objc_ret_d[0] = g_objc_ret_d[1] = g_objc_ret_d[2] = g_objc_ret_d[3] = 0;
     CallFrame f{};
     f.x[0] = x0; f.x[1] = x1; f.x[2] = x2; f.x[3] = x3; f.x[4] = x4; f.x[5] = x5; f.x[6] = x6; f.x[7] = x7;
     shim_objc_msgSend(f, nullptr);
