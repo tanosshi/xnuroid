@@ -525,6 +525,30 @@ extern "C" void native_dispatch_async(void* queue, void* block) {}
 extern "C" void native_dispatch_sync(void* queue, void (*work)(void*)) { if (work) work(nullptr); }
 extern "C" void native_dispatch_release(void* obj) {}
 
+// Guest dlopen/dlsym: Apple frameworks resolve to a fake handle; MTLCreateSystemDefaultDevice returns a fake device.
+static char g_fake_framework_handle[16];
+extern "C" void* native_mtl_create_system_default_device();
+extern "C" void* native_guest_dlopen(const char* path, int flags) {
+    if (path && (std::strstr(path, "/System/Library/") || std::strstr(path, ".framework"))) {
+        fprintf(stderr, "[DLOPEN] fake framework handle for %s\n", path);
+        return g_fake_framework_handle;
+    }
+    return dlopen(path, RTLD_NOW);
+}
+extern "C" void* native_guest_dlsym(void* handle, const char* name) {
+    if (handle == static_cast<void*>(g_fake_framework_handle)) {
+        fprintf(stderr, "[DLSYM] fake framework: %s\n", name ? name : "(null)");
+        if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
+            return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
+        return nullptr;
+    }
+    // Darwin RTLD_NEXT=-1, RTLD_DEFAULT=-2, RTLD_SELF=-3, RTLD_MAIN_ONLY=-5
+    intptr_t h = reinterpret_cast<intptr_t>(handle);
+    if (h == -2 || h == -3 || h == -5) handle = RTLD_DEFAULT;
+    else if (h == -1) handle = RTLD_NEXT;
+    return dlsym(handle, name);
+}
+
 // ---------------------------------------------------------------------------
 // Batch of small Darwin libc/libSystem replacements (natives: plain C ABI, bound directly).
 // ---------------------------------------------------------------------------
@@ -1463,9 +1487,33 @@ static uint64_t fake_make(int kind, const std::string& s) {
     return reinterpret_cast<uint64_t>(handle);
 }
 static const char* const kFakeAppDir = "/data/local/tmp/game";
+// kind 3 = generic fake Metal object (device, queue, buffer, texture, library, ...): capability queries say yes,
+// factory selectors (new*/make*) return another fake, everything else is nil/0.
+static uint64_t fake_metal_object() { return fake_make(3, "mtl"); }
+static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
+    auto starts = [&](const char* p) { return sel.compare(0, std::strlen(p), p) == 0; };
+    if (sel == "name" || sel == "label" || sel == "description") { frame.ret_x0 = fake_make(2, "FakeGPU"); return true; }
+    if (starts("supports") || sel == "isDepth24Stencil8PixelFormatSupported" || sel == "areProgrammableSamplePositionsSupported") {
+        frame.ret_x0 = 1; return true;
+    }
+    if (starts("new") || starts("make") || starts("heap") || sel == "device" || sel == "commandBuffer" ||
+        sel == "commandBufferWithUnretainedReferences" || sel == "blitCommandEncoder" || sel == "renderCommandEncoderWithDescriptor:" ||
+        sel == "computeCommandEncoder") {
+        frame.ret_x0 = fake_metal_object(); return true;
+    }
+    if (sel == "maxBufferLength" || sel == "recommendedMaxWorkingSetSize") { frame.ret_x0 = 0x40000000ull; return true; }
+    if (sel == "registryID") { frame.ret_x0 = 1; return true; }
+    if (sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy") { frame.ret_x0 = frame.x[0]; return true; }
+    return false;
+}
 // Returns true if the message was answered.
 static bool fake_foundation(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
+    if (self && self->kind == 3) {
+        if (fake_metal_message(frame, sel)) return true;
+        frame.ret_x0 = 0;
+        return true;
+    }
     if (sel == "mainBundle") {
         static uint64_t bundle = fake_make(1, kFakeAppDir);
         frame.ret_x0 = bundle;
@@ -1502,6 +1550,11 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
         if (sel == "description" || sel == "copy" || sel == "retain" || sel == "autorelease") { frame.ret_x0 = frame.x[0]; return true; }
     }
     return false;
+}
+
+extern "C" void* native_mtl_create_system_default_device() {
+    static uint64_t dev = fake_make(3, "device");
+    return reinterpret_cast<void*>(dev);
 }
 
 static void shim_objc_msgSend(CallFrame& frame, void*) {
@@ -1898,6 +1951,10 @@ static void init_custom_shims() {
     g_custom_shims["_dispatch_release"] = reinterpret_cast<void*>(&native_dispatch_release);
     {
         auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
+        if (getenv("LOADER_ENGINE")) {   // engine mode only: keep the default run on plain bionic dlopen/dlsym
+            reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
+            reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
+        }
         reg("___tolower", reinterpret_cast<void*>(&native_tolower));
         reg("___toupper", reinterpret_cast<void*>(&native_toupper));
         reg("___maskrune", reinterpret_cast<void*>(&native_maskrune));
@@ -2839,6 +2896,16 @@ int main(int argc, char** argv) {
         if (atoi(eng) >= 6) {
             // startUnity's next step: graphics init at image+0x7cc5c4. It asks image+0x170dc for the rendering API and
             // treats -1 as "none", passing a no-graphics flag to PlayerInitEngineGraphics (image+0x4ae350).
+            // -[UnityAppController selectRenderingAPI] (image+0x1720c) probes Metal via dlopen/dlsym and records the choice;
+            // -[UnityAppController renderingAPI] (image+0x17360) reads it back. self only needs to be valid memory.
+            {
+                typedef void (*sel_api_fn)(void*, void*);
+                typedef int (*get_api_fn)(void*, void*);
+                void* fake_self = calloc(1, 1024);
+                printf("[E2b] selectRenderingAPI image+0x1720c...\n"); fflush(stdout);
+                reinterpret_cast<sel_api_fn>(get_fn(0x1720c))(fake_self, nullptr);
+                printf("[E2b] renderingAPI -> %d\n", reinterpret_cast<get_api_fn>(get_fn(0x17360))(fake_self, nullptr)); fflush(stdout);
+            }
             printf("[E3] UnityInitApplicationGraphics image+0x7cc5c4...\n"); fflush(stdout);
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cc5c4))();
             printf("[E3] returned\n"); fflush(stdout);
