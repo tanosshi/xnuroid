@@ -1680,13 +1680,18 @@ static void shim_objc_msgSend(CallFrame& frame, void*) {
     std::string sel_str = sel ? sel : "null";
     if (seen_selectors.find(sel_str) == seen_selectors.end()) {
         seen_selectors.insert(sel_str);
-        printf("[OBJC_DYNAMIC #%d] [%p %s]\n", ++call_seq, receiver, sel_str.c_str());
+        FakeObjcObj* fo = fake_lookup(frame.x[0]);
+        printf("[OBJC_DYNAMIC #%d] [%p %s]%s%s\n", ++call_seq, receiver, sel_str.c_str(), fo ? "  fake:" : "", fo ? (std::to_string(fo->kind) + ":" + fo->s).c_str() : "");
     }
     // Engine mode (LOADER_ENGINE / LOADER_OBJC_NIL): behave like an empty Foundation. Messages answer nil/0 (so fast
     // enumeration ends, lookups miss, bundles are absent) except the retain/alloc family, which hands back the receiver.
     static const bool nil_mode = getenv("LOADER_ENGINE") != nullptr || getenv("LOADER_OBJC_NIL") != nullptr;
     if (nil_mode) {
-        if (fake_foundation(frame, sel_str)) return;
+        if (fake_foundation(frame, sel_str)) {
+            static std::unordered_set<std::string> ret_seen;
+            if (ret_seen.insert(sel_str).second) printf("[OBJC_RET] %s -> %#llx\n", sel_str.c_str(), static_cast<unsigned long long>(frame.ret_x0));
+            return;
+        }
         static const char* const keep_self[] = {"alloc", "allocWithZone:", "init", "new", "retain", "autorelease", "self",
                                                 "copy", "mutableCopy", "copyWithZone:", "mutableCopyWithZone:",
                                                 "retainAutorelease", nullptr};
