@@ -165,4 +165,5 @@ def main():
             print(f"    {v:6d}  {k}")
 
 
-main()
+if __name__ == "__main__":
+    main()

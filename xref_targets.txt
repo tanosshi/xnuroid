@@ -1,0 +1,4 @@
+# Globals whose readers/writers run_phases.ps1 lists via macho_xref.py (image offsets)
+0x2b59340   # null singleton returned by image+0x31d488, dereferenced at +0x40 -> crash
+0x2c0c198   # object allocated at 7cc460 and stored by UnityInitApplicationNoGraphics
+0x2b428c8   # bundle path cache

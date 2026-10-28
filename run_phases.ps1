@@ -10,7 +10,8 @@ param(
     [string]$Ndk = "",
     [string]$Adb = "",
     [switch]$Push,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$Quick   # skip the slow static scans; disassembly regions, xrefs and the device runs still happen
 )
 $ErrorActionPreference = "Continue"  # native tools write warnings to stderr; failures are checked explicitly
 Set-Location $PSScriptRoot
@@ -54,23 +55,28 @@ if (-not $SkipBuild) {
 # ---- static inspection of the guest (no device needed): Unity entry points ----
 $fw = Get-ChildItem -Recurse -Filter UnityFramework -File -Path (Join-Path $PSScriptRoot "MyGame-v1-7-2") -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($fw) {
+    if (-not $Quick) {
     python il2cpp_exports.py $fw.FullName "_Unity" | Out-File -Encoding utf8 (Join-Path $logs "exports_Unity.txt")
     python il2cpp_exports.py $fw.FullName "_" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
     python macho_symbols.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "symbols_unity.txt")
     python macho_objc.py $fw.FullName "^Unity(?!PLCrash)" 3 | Out-File -Encoding utf8 (Join-Path $logs "objc_unity.txt")
+    }
     $objdump = $null
     foreach ($c in @((Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source, "C:\Program Files\LLVM\bin\llvm-objdump.exe", (Join-Path (Find-Ndk) "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-objdump.exe"))) { if ($c -and (Test-Path $c)) { $objdump = $c; break } }
     if ($objdump) {
-        $regions = @( @("didFinishLaunching", 0x11e4c, 0x12100), @("startUnity", 0x11638, 0x11984), @("helper_1516c", 0x1516c, 0x15400),
-                      @("init_nographics_7cc3d4", 0x7cc3d4, 0x7cc800), @("startup_7cde30", 0x7cde30, 0x7cdf40), @("repaint", 0x16e3c, 0x16ee0),
-                      @("getter_31d488", 0x31d488, 0x31d5c0), @("use_31db04", 0x31db04, 0x31dc00), @("fn_7cc11c", 0x7cc11c, 0x7cc260),
-                      @("fn_7caa74", 0x7caa74, 0x7cab60), @("alloc_359a54", 0x359a54, 0x359b88), @("helper_tail_15240", 0x15240, 0x152a0) )
+        # disasm_regions.txt: "name 0xstart 0xend" per line (image offsets); edit/push it to request more code
+        $regions = @()
+        foreach ($line in (Get-Content (Join-Path $PSScriptRoot "disasm_regions.txt") -ErrorAction SilentlyContinue)) {
+            $t = ($line -split '#')[0].Trim()
+            if ($t) { $p = $t -split '\s+'; $regions += ,@($p[0], [Convert]::ToInt64($p[1], 16), [Convert]::ToInt64($p[2], 16)) }
+        }
         foreach ($r in $regions) {
             & $objdump -d --no-show-raw-insn ("--start-address=0x{0:x}" -f $r[1]) ("--stop-address=0x{0:x}" -f $r[2]) $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs ("disasm_" + $r[0] + ".txt"))
         }
     } else { Write-Host "llvm-objdump not found: skipped disassembly dumps" }
-    python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt")
-    Write-Host "exports: $((Get-Content (Join-Path $logs 'exports_Unity.txt')).Count) _Unity* symbols"
+    if (Test-Path xref_targets.txt) { python macho_xref.py $fw.FullName xref_targets.txt | Out-File -Encoding utf8 (Join-Path $logs "xref.txt") }
+    if (-not $Quick) { python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt") }
+    if (Test-Path (Join-Path $logs 'exports_Unity.txt')) { Write-Host "exports: $((Get-Content (Join-Path $logs 'exports_Unity.txt')).Count) _Unity* symbols" }
 }
 
 # ---- deploy ----
@@ -80,15 +86,15 @@ if ($fw) {
 & $adb shell chmod 755 /data/local/tmp/xnuroid_loader
 
 # ---- test matrix ----
-$runs = @(
-    @{ name = "1_default";          env = "" },
-    @{ name = "2_exc_no_fde";       env = "LOADER_EXCEPTION_TEST=1" },
-    @{ name = "3_exc_fde_subset";   env = "LOADER_EXCEPTION_TEST=1 LOADER_FDE_ONLY=/data/local/tmp/throw_frames.txt LOADER_FDE_DUMP=1" },
-    @{ name = "4_exc_fde_all";      env = "LOADER_EXCEPTION_TEST=1 LOADER_FDE=all LOADER_EXCEPTION_BENCH=1" },
-    @{ name = "5_default_fde_all";  env = "LOADER_FDE=all" },
-    @{ name = "6_engine1";          env = "LOADER_FDE=all LOADER_ENGINE=1" },
-    @{ name = "7_engine2";          env = "LOADER_FDE=all LOADER_ENGINE=2" }
-)
+$runs = @()
+$matrix = Join-Path $PSScriptRoot "run_matrix.txt"   # "name|ENV=1 ENV2=x" per line; '#' comments
+if (Test-Path $matrix) {
+    foreach ($line in (Get-Content $matrix)) {
+        $t = ($line -split '#')[0].Trim()
+        if ($t) { $p = $t -split '\|', 2; $runs += @{ name = $p[0].Trim(); env = $(if ($p.Count -gt 1) { $p[1].Trim() } else { "" }) } }
+    }
+}
+if ($runs.Count -eq 0) { $runs = @( @{ name = "1_default"; env = "" } ) }
 $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add("run_phases $stamp  commit: $(git rev-parse --short HEAD)")
 foreach ($r in $runs) {
