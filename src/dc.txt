@@ -1,0 +1,157 @@
+This is the spec I'd use. I haven't opened the sources you linked, and I haven't run the commands below. Constants and bit layouts come from my memory of `loader.h`, `fixup-chains.h` and `llvm-objdump`, so treat the headers as authoritative and use the inventory to catch my mistakes. LLVM Mach-O options vary by version (`--chained-fixups` and `--dyld-info` are newer), so check `llvm-objdump --help` first.
+
+## What the inventory should report
+
+Run it per Mach-O in the IPA: the main executable, `UnityFramework`, and every other `Frameworks/*.framework`, `*.dylib` and `PlugIns/*` binary. Record each file's SHA-256 and the tool versions used, so results are reproducible.
+
+**A. Package level**
+- `Info.plist` keys: `MinimumOSVersion`, `UIRequiredDeviceCapabilities` (look for `arm64`, `metal`), supported orientations, background modes.
+- Entitlements from the code signature blob.
+- `.metallib` presence, and the Unity version if you can derive it. The IL2CPP `global-metadata.dat` header (magic and version) helps.
+- A list of embedded third-party frameworks. Each is another Mach-O to inventory, and each brings its own import surface.
+
+**B. Container and header**
+- Fat versus thin. For fat files, list each slice's cputype, cpusubtype and offset (including the 64-bit fat variant).
+- Per slice, `cputype` and `cpusubtype` as raw hex, with capability bits split out from the subtype. For arm64e, also the pointer-auth ABI version bits.
+- `filetype` (`MH_EXECUTE` or `MH_DYLIB`), `ncmds`, `sizeofcmds`, and decoded `flags`.
+- Notable flags: PIE, two-level namespace, `MH_HAS_TLV_DESCRIPTORS`, app-extension-safe, no-heap-exec.
+
+**C. Load-command families**
+
+Record every command by number. Any unknown command with the `LC_REQ_DYLD` bit set is a hard stop, because dyld would refuse the image too.
+
+| Family | Commands |
+|---|---|
+| Layout | `LC_SEGMENT_64`, plus `LC_SEGMENT_SPLIT_INFO` |
+| Dependencies | `LC_LOAD_DYLIB`, `_WEAK_`, `_REEXPORT_`, `_LAZY_`, `_UPWARD_`, `LC_ID_DYLIB`, `LC_RPATH`, `LC_SUB_*` |
+| Symbols | `LC_SYMTAB`, `LC_DYSYMTAB`, `LC_FUNCTION_STARTS`, `LC_DATA_IN_CODE` |
+| Fixups and exports | `LC_DYLD_CHAINED_FIXUPS`, `LC_DYLD_EXPORTS_TRIE`, `LC_DYLD_INFO(_ONLY)` |
+| Entry | `LC_MAIN`, `LC_UNIXTHREAD`, `LC_ROUTINES_64` (old-style init) |
+| Build and platform | `LC_BUILD_VERSION` (platform, minos, sdk, tool list), legacy `LC_VERSION_MIN_*`, `LC_SOURCE_VERSION`, `LC_UUID` |
+| Protection and signing | `LC_ENCRYPTION_INFO_64` (`cryptid`), `LC_CODE_SIGNATURE` |
+| Misc | `LC_LINKER_OPTION`, `LC_NOTE`, `LC_DYLD_ENVIRONMENT` |
+
+Check the platform in `LC_BUILD_VERSION`: simulator and Mac Catalyst builds have a different ABI and would invalidate the whole plan.
+
+**D. Segments and sections**
+- Per segment: vmaddr, vmsize, fileoff, filesize, `initprot` and `maxprot`, and alignment. Flag any writable `__TEXT`.
+- Per section: type and attributes, not just names. The types that matter are:
+  - `S_MOD_INIT_FUNC_POINTERS`
+  - `S_INIT_FUNC_OFFSETS`
+  - `S_THREAD_LOCAL_*` (variables, regular, zerofill, variable pointers, init functions)
+  - `S_SYMBOL_STUBS`
+  - the lazy and non-lazy pointer types
+  - zerofill
+- Auth-pointer sections (`__auth_got`, `__auth_stubs`, `__auth_ptr`) are a second, independent arm64e indicator.
+
+**E. Chained fixups** (`LC_DYLD_CHAINED_FIXUPS`)
+- Header: version, `imports_format` (plain, with addend, with 64-bit addend), `symbols_format` (uncompressed or compressed), import count.
+- Per segment: `page_size` (expect 4K or 16K), `pointer_format`, `segment_offset`, `max_valid_pointer`, `page_count`, and the page-start encoding. Count single starts, multi-start overflow entries, and no-start pages.
+- Chain walk results: chain count, total rebases, total binds, and whether every chain terminates inside its page. Also record stride per format, and for 64-bit formats the high8 usage. For arm64e formats, record key, diversity and address-diversity statistics.
+- Per import: ordinal, symbol, library, weak flag, and addend. Special ordinals (self, main executable, flat lookup, weak lookup) need sign-extension from the field width. Resolve every ordinal against the dylib list and flag out-of-range ones.
+- The format list only says what the linker declared. A valid chain proves the parser works. It doesn't prove the pointers are executable.
+
+**F. Classic dyld streams** (`LC_DYLD_INFO(_ONLY)`)
+- Decode rebase, bind, weak-bind and lazy-bind opcode streams, not just their byte ranges. Include the threaded-bind opcodes.
+- Emit the same tuple shape as E (segment, offset, symbol, ordinal, addend, weak).
+- Expect these to be absent in a modern chained-fixups build. If both are present, merge both into one import set.
+
+**G. Symbols and exports**
+- Every `nlist_64` entry, with type, section, library ordinal from `n_desc`, and the weak-reference, weak-definition, indirect and resolver bits.
+- Diff the undefined symbols against the chained import list. They should agree on names and ordinals.
+- Indirect symbol table mapped through `reserved1` of stub and GOT sections.
+- The full export trie with flags (regular, thread-local, absolute, weak-definition, re-export, stub-and-resolver). For `UnityFramework`, the ObjC class and C entry exports are what phase 3 needs.
+
+**H. Import surface** (the main effort estimate)
+- Counts per dylib, split into functions and data, and weak versus strong.
+- The same counts bucketed into libSystem, libc++/libc++abi, libobjc, Foundation/CoreFoundation, UIKit, Metal/MetalKit/QuartzCore, AVFoundation/CoreAudio, CoreMotion/CoreHaptics/GameController, GameKit/StoreKit/other Apple services, Swift runtime, and everything else.
+- Plus a flat sorted symbol list per bucket. That list becomes the trap-stub to-do list.
+- Flag any `libswift*.dylib` dependency or `__swift5_*` sections. A Swift runtime is a much bigger surface than the C/ObjC one.
+
+**I. Objective-C metadata**
+- Section counts: class list, non-lazy class list (`+load` classes, which run at image load), category and non-lazy category lists, protocols, class refs, super refs, selector refs, `__objc_imageinfo`, relative method lists, and `__objc_stubs` (linker-generated `objc_msgSend$sel` stubs, which are not imports).
+- From the class and method structures: class names and external superclasses (these appear as binds), selector names, and a count of distinct external classes referenced.
+
+**J. Initializers and TLS**
+- Counts and targets of `__mod_init_func` and `__init_offsets`, term funcs, and `LC_ROUTINES_64`.
+- TLV descriptors from `__thread_vars` (thunk, key, offset), the `__thread_data` and `__thread_bss` sizes, and which import the thunk binds to.
+
+**K. Unwind and exception metadata**
+- `__unwind_info` parsed: page counts, encodings histogram, personality array, LSDA index.
+- Fraction of functions with the DWARF-fallback encoding.
+- Whether `__eh_frame` and `__gcc_except_tab` exist, and which personality is imported.
+
+**L. Disassembly-derived scans** (each is a heuristic, see the table below)
+- Counts and addresses of `svc`, `mrs`/`msr` by system register, PAC instructions, and x18 operand uses.
+- Use `LC_FUNCTION_STARTS` and `LC_DATA_IN_CODE` to separate code from embedded data. Otherwise literal pools produce false hits.
+- Cstring scan for `dlopen`, `dlsym`, `NSClassFromString` arguments and framework paths. Dynamic lookups never appear in the import table.
+
+## LLVM cross-checks
+
+```bash
+# container / header / load commands
+llvm-lipo -detailed_info X
+llvm-objdump --macho --universal-headers X
+llvm-objdump --macho --private-header X
+llvm-otool -hl X                          # full load-command dump
+
+# dependencies, rpaths, symbols
+llvm-objdump --macho --dylibs-used X
+llvm-objdump --macho --rpaths X
+llvm-nm -m --undefined-only X             # undefined syms + library ordinals
+llvm-objdump --macho --indirect-symbols X
+
+# fixups and exports
+llvm-objdump --macho --chained-fixups X   # newer LLVM
+llvm-objdump --macho --dyld-info X        # newer LLVM
+llvm-objdump --macho --rebase --bind --weak-bind --lazy-bind X
+llvm-objdump --macho --exports-trie X
+
+# metadata and sections
+llvm-objdump --macho --objc-meta-data X
+llvm-objdump --macho --unwind-info X
+llvm-objdump --macho --section-headers X
+llvm-objdump --macho --full-contents --section=__mod_init_func X   # section filter syntax varies by version
+
+# disassembly scans
+llvm-objdump --macho -d --no-show-raw-insn X > X.s
+grep -cE 'svc[[:space:]]+#0x80' X.s
+grep -ciE 'tpidrro_el0' X.s
+grep -E '\bm(rs|sr)\b' X.s | awk '{print $NF}' | sort | uniq -c   # system regs used
+grep -cE '\b[xw]18\b' X.s
+grep -ciE '\b(pac[ib]|aut[ib]|bra[ab]|blra[ab]|reta[ab])' X.s
+```
+
+The pass condition is zero diff between your tool and LLVM on every field in sections B through K. Wherever LLVM prints something your tool doesn't, that's a parser gap. LLVM can also be wrong, or lack a flag in your version, so resolve disagreements against the Apple headers rather than assuming either side is right.
+
+## What each kind of evidence can and can't establish
+
+| Question | Static inspection | Disassembly | Android fixture |
+|---|---|---|---|
+| arm64 vs arm64e | Yes: subtype, pointer formats, auth sections | Confirms: PAC instructions | Only matters if arm64e |
+| Fixup format, chain validity, import list | Yes | No | Confirms the relocated bytes behave correctly |
+| Full import surface | Yes, except dynamic lookups | Partial: strings hint at `dlsym` and `NSClassFromString` | Trap census shows what's reached |
+| Which imports are needed at startup | No | Partial, via call-graph tracing | Yes |
+| Raw `svc`, TPIDRRO reads, odd system registers | No | Yes, if you scan all code. Reachability still unknown | Yes |
+| Exception tables present and well-formed | Yes | No | Needed to prove throw/catch works |
+| `+load` and initializer contents | Yes: counts and targets | Yes: what they call | Yes: what they do |
+| W^X path (RW, then RX, then execute) | No | No | Yes: first test |
+| Variadic ABI, `va_list` shape, `long double` | No | Call sites reveal what's passed | Yes: only a fixture proves it |
+| TLS access | Yes: descriptors present | Yes: access patterns | Yes |
+| Page size handling | Yes: segment alignment | No | Yes |
+| Whether the game actually starts | No | No | Only the full runtime |
+
+ABI details the fixture needs to cover, which static inspection can't resolve:
+- **Variadics:** Apple arm64 passes variadic arguments on the stack, AAPCS64 passes them in registers, and `va_list` differs in type.
+- **`long double`:** I believe it's 64-bit on Apple and 128-bit on Android. Any import taking or returning one is a trap.
+- **Small integer arguments:** if I remember right, Apple expects them extended to 32 bits by the caller, while AAPCS64 doesn't guarantee that. Test this on callbacks from Android code into iOS code.
+- **`svc #0x80`:** Darwin puts the syscall number in x16 and Linux uses x8, so a stray `svc` would issue a nonsense Linux syscall. Android's app seccomp filter could kill the process instead of returning an error.
+
+## Two corrections to my earlier suggestions
+
+1. **My loader hard-codes `HOST_PAGE = 4096`.** Use `sysconf(_SC_PAGESIZE)` instead, rounding spans and `mprotect` ranges to `max(host page, 16K)`. Android also documents support for 16 KB-page devices, so don't bake in 4K.
+2. **GLES isn't a likely good sign.** I listed it as one, but a contemporary Unity iOS build is most likely Metal-only, so expect Metal imports. Treat any `OpenGLES.framework` link as a surprise, not the baseline.
+
+On x18: both ABIs reserve it, so zero uses in the image is the expected result. Any hits would be worth a close look.
+
+I can write this inventory tool next as portable C++17, starting with the header, load commands, chained-fixups walker and import histogram, with JSON output so the LLVM diff can be automated. Want me to start with that?

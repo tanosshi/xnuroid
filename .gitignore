@@ -1,0 +1,18 @@
+# Game assets and extracted payload (large, user-supplied)
+MyGame-v1-7-2/
+*.ipa
+
+# Device library copies
+device_libc++.so
+phone_libc++.so
+
+# Build outputs
+build/
+*.o
+*.exe
+__pycache__/
+xnuroid_loader
+gate1_wx_test
+probe_bionic_tls
+test_tls_registers
+test_tsd_diff

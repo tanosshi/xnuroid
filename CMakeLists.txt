@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(xnuroid_macho_inspector LANGUAGES CXX)
+
+add_executable(macho-inspect src/main.cpp src/chained_fixups.cpp)
+target_compile_features(macho-inspect PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(macho-inspect PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(macho-inspect PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+endif()
