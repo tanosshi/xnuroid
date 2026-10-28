@@ -315,14 +315,29 @@ objc_msgSendSuper2_guest:
 .type objc_fallback_asm, %function
 objc_fallback_asm:
     hint #34
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-128]!
     mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    stp d0, d1, [sp, #80]
+    stp d2, d3, [sp, #96]
+    bl objc_in_d_ptr          // x0 = thread-local double[4]: the message's d0-d3 arguments
+    ldp d0, d1, [sp, #80]
+    stp d0, d1, [x0]
+    ldp d2, d3, [sp, #96]
+    stp d2, d3, [x0, #16]
+    ldp x0, x1, [sp, #16]
+    ldp x2, x3, [sp, #32]
+    ldp x4, x5, [sp, #48]
+    ldp x6, x7, [sp, #64]
     bl objc_fallback_c
     str x0, [sp, #16]
     bl objc_ret_d_ptr
     ldp d0, d1, [x0]
     ldp d2, d3, [x0, #16]
     ldr x0, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #128
     ret
 .size objc_fallback_asm, .-objc_fallback_asm
