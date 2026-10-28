@@ -865,6 +865,58 @@ static bool selftest_variadic_snprintf(void* stub) {
 }
 
 // ---------------------------------------------------------------------------
+// Darwin setjmp family (assembly in trampolines.s; 192-byte guest jmp_buf)
+// ---------------------------------------------------------------------------
+extern "C" int darwin_setjmp(void* buf) __attribute__((returns_twice));
+extern "C" void darwin_longjmp(void* buf, int val) __attribute__((noreturn));
+extern "C" int darwin_jmp_fp_selftest(void* buf);
+
+struct alignas(16) JmpTest {
+    int buf[48];                 // Darwin-sized buffer
+    uint64_t guard[8];           // detects any write past 192 bytes
+};
+
+static __attribute__((noinline)) void jmp_nested(int depth, JmpTest* t, volatile int* trail) {
+    trail[depth] = 1;
+    if (depth == 0) darwin_longjmp(t->buf, 7);
+    jmp_nested(depth - 1, t, trail);
+    trail[depth] = 2;  // must never run
+}
+
+static bool selftest_setjmp() {
+    static JmpTest t;
+    for (auto& g : t.guard) g = 0xA5A5A5A5A5A5A5A5ull;
+    volatile int trail[8] = {0};
+    volatile int stage = 0;
+    bool ok = true;
+    int rc = darwin_setjmp(t.buf);
+    if (rc == 0) {
+        stage = 1;
+        jmp_nested(5, &t, trail);
+        stage = 99;  // not reached
+    } else {
+        ok = ok && rc == 7 && stage == 1;
+        for (int i = 0; i <= 5; ++i) ok = ok && trail[i] == 1;  // all frames entered, none returned
+    }
+    for (auto g : t.guard) ok = ok && g == 0xA5A5A5A5A5A5A5A5ull;
+    // longjmp(buf, 0) must return 1
+    volatile int second = 0;
+    int rc2 = darwin_setjmp(t.buf);
+    if (rc2 == 0) { second = 1; darwin_longjmp(t.buf, 0); }
+    ok = ok && rc2 == 1 && second == 1;
+    wr_str(2, "[SELFTEST] Darwin setjmp/longjmp (nested depth 5, val 7 and val 0->1, 192-byte guard) ");
+    wr_str(2, ok ? "PASS\n" : "FAIL\n");
+    // d8-d15: set known values, setjmp, zero them, longjmp, verify restored (in assembly).
+    static JmpTest fp;
+    for (auto& g : fp.guard) g = 0xA5A5A5A5A5A5A5A5ull;
+    bool fp_ok = darwin_jmp_fp_selftest(fp.buf) == 1;
+    for (auto g : fp.guard) fp_ok = fp_ok && g == 0xA5A5A5A5A5A5A5A5ull;
+    wr_str(2, "[SELFTEST] Darwin setjmp/longjmp restores d8-d15 (clobbered to 0 between) ");
+    wr_str(2, fp_ok ? "PASS\n" : "FAIL\n");
+    return ok && fp_ok;
+}
+
+// ---------------------------------------------------------------------------
 // open / openat / fcntl / ioctl (Darwin constants + variadic args)
 // ---------------------------------------------------------------------------
 static std::string remap_game_path(const char* path) {
@@ -1575,6 +1627,13 @@ static void dump_direct_bound_list() {
 
 static void init_custom_shims() {
     g_custom_shims["_open"] = allocate_trampoline(shim_open, "_open");
+    // setjmp family: asm, tail-bound, guest-sized (192-byte) jmp_buf
+    g_custom_shims["_setjmp"] = reinterpret_cast<void*>(&darwin_setjmp);
+    g_custom_shims["__setjmp"] = reinterpret_cast<void*>(&darwin_setjmp);
+    g_custom_shims["_sigsetjmp"] = reinterpret_cast<void*>(&darwin_setjmp);
+    g_custom_shims["_longjmp"] = reinterpret_cast<void*>(&darwin_longjmp);
+    g_custom_shims["__longjmp"] = reinterpret_cast<void*>(&darwin_longjmp);
+    g_custom_shims["_siglongjmp"] = reinterpret_cast<void*>(&darwin_longjmp);
     g_custom_shims["_open$NOCANCEL"] = allocate_trampoline(shim_open, "_open$NOCANCEL");
     g_custom_shims["_openat"] = allocate_trampoline(shim_openat, "_openat");
     g_custom_shims["_fcntl"] = allocate_trampoline(shim_fcntl, "_fcntl");
@@ -1943,6 +2002,8 @@ int main(int argc, char** argv) {
     sa.sa_sigaction = segv_handler;
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);  // std::terminate / abort() -> full dump
+    sigaction(SIGILL, &sa, nullptr);
 
     printf("=== Native ARM64 Mach-O Android Loader ===\n");
 
@@ -2290,6 +2351,7 @@ int main(int argc, char** argv) {
                             reinterpret_cast<char*>(g_trampoline_code) + TRAMPOLINE_POOL_SIZE);
     printf("[*] Page protections set and instruction caches cleared.\n");
     if (g_custom_shims.count("_snprintf")) selftest_variadic_snprintf(g_custom_shims["_snprintf"]);
+    selftest_setjmp();
 
     // Check value at 0x29b8890
     uint64_t* bzero_slot = reinterpret_cast<uint64_t*>(image_base + 0x29b8890);
@@ -2508,6 +2570,41 @@ int main(int argc, char** argv) {
             }
         } else {
             printf("[-] [6/5] returned null with no exception\n");
+        }
+    }
+
+    // [7/5] Managed exception round-trip: Int32.Parse("abc") must throw FormatException,
+    // which il2cpp_runtime_invoke should catch and return through the exception out-param.
+    const char* exc_test = getenv("LOADER_EXCEPTION_TEST");
+    if (exc_test && (std::strcmp(exc_test, "1") == 0 || std::strcmp(exc_test, "parse") == 0) && mscorlib) {
+        printf("\n[7/5] Invoking System.Int32.Parse(\"abc\") (expected: managed FormatException; needs CF locale)...\n");
+        void* int32_cls = class_from_name(mscorlib, "System", "Int32");
+        void* parse = nullptr;
+        void* it2 = nullptr;
+        while (void* m = class_get_methods(int32_cls, &it2)) {
+            const char* mn = method_get_name(m);
+            if (!mn || std::strcmp(mn, "Parse") != 0 || method_get_param_count(m) != 1) continue;
+            char* tn = type_get_name(method_get_param(m, 0));
+            printf("    Int32.Parse(%s)\n", tn ? tn : "?");
+            if (tn && std::strcmp(tn, "System.String") == 0) parse = m;
+        }
+        if (!parse) {
+            printf("[-] [7/5] Int32.Parse(string) not present (stripped)\n");
+        } else {
+            void* bad = il2cpp_string_new("abc");
+            void* pargs[1] = {bad};
+            void* pexc = nullptr;
+            printf("[*] calling il2cpp_runtime_invoke(Parse, null, [\"abc\"], &exc); if the process dies now, exception unwinding failed\n");
+            void* pret = runtime_invoke(parse, nullptr, pargs, &pexc);
+            printf("[*] runtime_invoke returned object=%p exception=%p\n", pret, pexc);
+            if (pexc) {
+                char msg[2048] = {0};
+                format_exception(pexc, msg, sizeof(msg));
+                void* ek = object_get_class(pexc);
+                printf("[+] [7/5] caught managed exception (%s): %s\n", ek ? il2cpp_class_get_name(ek) : "?", msg);
+            } else {
+                printf("[-] [7/5] no exception returned (unexpected); ret=%p\n", pret);
+            }
         }
     }
 

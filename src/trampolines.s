@@ -115,6 +115,107 @@ native_mmap:
 
 .size native_mmap, .-native_mmap
 
+// Darwin-ABI setjmp / longjmp. The guest's jmp_buf is only 192 bytes (int[48]);
+// bionic's is 256, so the bionic routines would overrun it. These are bound directly
+// as the import targets (no C shim, no extra frame), so lr and sp stay the guest's.
+// Layout inside the 192-byte buffer (168 bytes used):
+//   +0   x19,x20   +16 x21,x22   +32 x23,x24   +48 x25,x26   +64 x27,x28
+//   +80  x29,x30   +96 sp        +104 d8..d15 (64 bytes)
+// Signal mask is not saved or restored (sigsetjmp savemask is ignored).
+.globl darwin_setjmp
+.type darwin_setjmp, %function
+darwin_setjmp:
+    hint #34
+    stp x19, x20, [x0, #0]
+    stp x21, x22, [x0, #16]
+    stp x23, x24, [x0, #32]
+    stp x25, x26, [x0, #48]
+    stp x27, x28, [x0, #64]
+    stp x29, x30, [x0, #80]
+    mov x2, sp
+    str x2, [x0, #96]
+    stp d8, d9, [x0, #104]
+    stp d10, d11, [x0, #120]
+    stp d12, d13, [x0, #136]
+    stp d14, d15, [x0, #152]
+    mov w0, #0
+    ret
+.size darwin_setjmp, .-darwin_setjmp
+
+.globl darwin_longjmp
+.type darwin_longjmp, %function
+darwin_longjmp:
+    hint #34
+    ldp x19, x20, [x0, #0]
+    ldp x21, x22, [x0, #16]
+    ldp x23, x24, [x0, #32]
+    ldp x25, x26, [x0, #48]
+    ldp x27, x28, [x0, #64]
+    ldp x29, x30, [x0, #80]
+    ldr x2, [x0, #96]
+    mov sp, x2
+    ldp d8, d9, [x0, #104]
+    ldp d10, d11, [x0, #120]
+    ldp d12, d13, [x0, #136]
+    ldp d14, d15, [x0, #152]
+    cmp w1, #0
+    csinc w0, w1, wzr, ne
+    ret
+.size darwin_longjmp, .-darwin_longjmp
+
+// int darwin_jmp_fp_selftest(void* buf192): returns 1 if d8-d15 are restored by longjmp.
+// Written in assembly so the compiler cannot touch the callee-saved FP registers.
+// Loads known values into d8-d15, setjmp, zeroes d8-d15, longjmp, then verifies them.
+.globl darwin_jmp_fp_selftest
+.type darwin_jmp_fp_selftest, %function
+darwin_jmp_fp_selftest:
+    hint #34
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp d8, d9, [sp, #32]
+    stp d10, d11, [sp, #48]
+    stp d12, d13, [sp, #64]
+    stp d14, d15, [sp, #80]
+    mov x19, x0
+    .irp n, 8, 9, 10, 11, 12, 13, 14, 15
+    mov x1, #(0x1100 + \n)
+    movk x1, #0xabcd, lsl #48
+    fmov d\n, x1
+    .endr
+    mov x0, x19
+    bl darwin_setjmp
+    cbnz w0, .Lfp_after_longjmp
+    .irp n, 8, 9, 10, 11, 12, 13, 14, 15
+    movi d\n, #0
+    .endr
+    mov x0, x19
+    mov w1, #5
+    bl darwin_longjmp
+.Lfp_after_longjmp:
+    cmp w0, #5
+    b.ne .Lfp_fail
+    .irp n, 8, 9, 10, 11, 12, 13, 14, 15
+    fmov x1, d\n
+    mov x2, #(0x1100 + \n)
+    movk x2, #0xabcd, lsl #48
+    cmp x1, x2
+    b.ne .Lfp_fail
+    .endr
+    mov w0, #1
+    b .Lfp_done
+.Lfp_fail:
+    mov w0, #0
+.Lfp_done:
+    ldp d14, d15, [sp, #80]
+    ldp d12, d13, [sp, #64]
+    ldp d10, d11, [sp, #48]
+    ldp d8, d9, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+.size darwin_jmp_fp_selftest, .-darwin_jmp_fp_selftest
+
 .bss
 .align 4
 .globl g_mmap_capture
