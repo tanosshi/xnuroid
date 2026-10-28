@@ -86,6 +86,29 @@ if ($fw) {
 & $adb push throw_frames.txt /data/local/tmp/throw_frames.txt | Out-Null
 & $adb shell chmod 755 /data/local/tmp/xnuroid_loader
 
+# ---- sync game data: push files that exist in the IPA's Data folder but are missing on the phone ----
+if ($fw) {
+    $appDir = Split-Path (Split-Path $fw.DirectoryName)
+    $localData = Join-Path $appDir "Data"
+    if (Test-Path $localData) {
+        $remote = @{}
+        (& $adb shell 'cd /data/local/tmp/game/Data 2>/dev/null && find . -type f') | ForEach-Object { $r = $_.Trim() -replace '^\./', ''; if ($r) { $remote[$r] = $true } }
+        $root = (Resolve-Path $localData).Path
+        $pushed = New-Object System.Collections.Generic.List[string]
+        foreach ($f in (Get-ChildItem $localData -Recurse -File)) {
+            $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
+            if (-not $remote.ContainsKey($rel)) {
+                $dst = "/data/local/tmp/game/Data/$rel"
+                & $adb shell ("mkdir -p '" + (Split-Path $dst -Parent).Replace('\', '/') + "'") | Out-Null
+                & $adb push $f.FullName $dst | Out-Null
+                $pushed.Add("$rel ($($f.Length) bytes)")
+            }
+        }
+        Write-Host "data sync: $($remote.Count) files already on phone, pushed $($pushed.Count)"
+        $pushed | Out-File -Encoding utf8 (Join-Path $logs "data_sync.txt")
+    } else { Write-Host "data sync skipped: $localData not found" }
+}
+
 # ---- test matrix ----
 $runs = @()
 $matrix = Join-Path $PSScriptRoot "run_matrix.txt"   # "name|ENV=1 ENV2=x" per line; '#' comments
