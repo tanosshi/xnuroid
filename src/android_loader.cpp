@@ -1364,6 +1364,62 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
     frame.ret_x0 = frame.x[0];
 }
 
+// Minimal Foundation for engine mode: one fake NSBundle and heap-allocated fake NSStrings.
+// Pointers are tracked in a set (receivers can be arbitrary), so lookups never dereference unknown memory.
+struct FakeObjcObj { int kind; std::string s; };   // kind 1 = bundle, 2 = string
+static std::unordered_map<void*, FakeObjcObj*> g_fake_objc;
+static FakeObjcObj* fake_lookup(uint64_t p) {
+    auto it = g_fake_objc.find(reinterpret_cast<void*>(p));
+    return it == g_fake_objc.end() ? nullptr : it->second;
+}
+static uint64_t fake_make(int kind, const std::string& s) {
+    auto* o = new FakeObjcObj{kind, s};
+    void* handle = calloc(1, 32);   // a real, distinct, non-null address to hand to the guest
+    g_fake_objc[handle] = o;
+    return reinterpret_cast<uint64_t>(handle);
+}
+static const char* const kFakeAppDir = "/data/local/tmp/game";
+// Returns true if the message was answered.
+static bool fake_foundation(CallFrame& frame, const std::string& sel) {
+    FakeObjcObj* self = fake_lookup(frame.x[0]);
+    if (sel == "mainBundle") {
+        static uint64_t bundle = fake_make(1, kFakeAppDir);
+        frame.ret_x0 = bundle;
+        return true;
+    }
+    if (sel == "stringWithUTF8String:" || sel == "stringWithCString:encoding:") {
+        const char* c = reinterpret_cast<const char*>(frame.x[2]);
+        frame.ret_x0 = c ? fake_make(2, c) : 0;
+        return true;
+    }
+    if (self && self->kind == 1) {
+        if (sel == "bundlePath" || sel == "resourcePath" || sel == "executablePath" || sel == "privateFrameworksPath") {
+            frame.ret_x0 = fake_make(2, self->s);
+            return true;
+        }
+        if (sel == "bundleIdentifier") { frame.ret_x0 = fake_make(2, "com.fake.game"); return true; }
+    }
+    if (self && self->kind == 2) {
+        if (sel == "UTF8String" || sel == "cString" || sel == "fileSystemRepresentation" || sel == "lossyCString") {
+            frame.ret_x0 = reinterpret_cast<uint64_t>(self->s.c_str());
+            return true;
+        }
+        if (sel == "length") { frame.ret_x0 = self->s.size(); return true; }
+        if (sel == "stringByAppendingPathComponent:") {
+            FakeObjcObj* arg = fake_lookup(frame.x[2]);
+            frame.ret_x0 = arg ? fake_make(2, self->s + "/" + arg->s) : 0;
+            return true;
+        }
+        if (sel == "isEqualToString:") {
+            FakeObjcObj* arg = fake_lookup(frame.x[2]);
+            frame.ret_x0 = arg && arg->s == self->s;
+            return true;
+        }
+        if (sel == "description" || sel == "copy" || sel == "retain" || sel == "autorelease") { frame.ret_x0 = frame.x[0]; return true; }
+    }
+    return false;
+}
+
 static void shim_objc_msgSend(CallFrame& frame, void*) {
     void* receiver = reinterpret_cast<void*>(frame.x[0]);
     const char* sel = reinterpret_cast<const char*>(frame.x[1]);
@@ -1378,6 +1434,7 @@ static void shim_objc_msgSend(CallFrame& frame, void*) {
     // enumeration ends, lookups miss, bundles are absent) except the retain/alloc family, which hands back the receiver.
     static const bool nil_mode = getenv("LOADER_ENGINE") != nullptr || getenv("LOADER_OBJC_NIL") != nullptr;
     if (nil_mode) {
+        if (fake_foundation(frame, sel_str)) return;
         static const char* const keep_self[] = {"alloc", "allocWithZone:", "init", "new", "retain", "autorelease", "self",
                                                 "copy", "mutableCopy", "copyWithZone:", "mutableCopyWithZone:",
                                                 "retainAutorelease", nullptr};
