@@ -1489,6 +1489,24 @@ static uint64_t fake_make(int kind, const std::string& s) {
     return reinterpret_cast<uint64_t>(handle);
 }
 static const char* const kFakeAppDir = "/data/local/tmp/game";
+// Reads an NSString argument: one of our fake strings, or a compile-time @"..." literal (__NSConstantString:
+// isa, flags, char* data, length) living in the loaded guest image.
+static bool objc_string_value(uint64_t p, std::string& out) {
+    if (!p) return false;
+    if (FakeObjcObj* f = fake_lookup(p)) {
+        if (f->kind != 2) return false;
+        out = f->s;
+        return true;
+    }
+    uint64_t base = reinterpret_cast<uint64_t>(g_loaded_image_base);
+    uint64_t end = base + g_loaded_image_size;
+    if (p < base || p + 32 > end) return false;
+    uint64_t data = *reinterpret_cast<uint64_t*>(p + 16);
+    uint64_t len = *reinterpret_cast<uint64_t*>(p + 24);
+    if (data < base || data >= end || len > 4096) return false;
+    out.assign(reinterpret_cast<const char*>(data), static_cast<size_t>(len));
+    return true;
+}
 // kind 3 = generic fake Metal object (device, queue, buffer, texture, library, ...): capability queries say yes,
 // factory selectors (new*/make*) return another fake, everything else is nil/0.
 static uint64_t fake_metal_object() { return fake_make(3, "mtl"); }
@@ -1517,11 +1535,10 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
         return true;
     }
     if (sel == "bundleWithPath:" || sel == "bundleForClass:" || sel == "bundleWithIdentifier:") {
-        const char* p = sel == "bundleWithPath:" ? reinterpret_cast<const char*>(0) : nullptr;
-        (void)p;
-        FakeObjcObj* arg = fake_lookup(frame.x[2]);
-        if (arg && arg->s.find("/System/Library/") != std::string::npos) {
-            frame.ret_x0 = fake_make(4, arg->s);   // kind 4 = Apple framework bundle: load succeeds
+        std::string path;
+        if (objc_string_value(frame.x[2], path) && path.find("/System/Library/") != std::string::npos) {
+            fprintf(stderr, "[OBJC] framework bundle %s -> fake, load succeeds\n", path.c_str());
+            frame.ret_x0 = fake_make(4, path);   // kind 4 = Apple framework bundle: load succeeds
             return true;
         }
     }
@@ -1556,13 +1573,13 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
         }
         if (sel == "length") { frame.ret_x0 = self->s.size(); return true; }
         if (sel == "stringByAppendingPathComponent:") {
-            FakeObjcObj* arg = fake_lookup(frame.x[2]);
-            frame.ret_x0 = arg ? fake_make(2, self->s + "/" + arg->s) : 0;
+            std::string a;
+            frame.ret_x0 = objc_string_value(frame.x[2], a) ? fake_make(2, self->s + "/" + a) : 0;
             return true;
         }
         if (sel == "isEqualToString:") {
-            FakeObjcObj* arg = fake_lookup(frame.x[2]);
-            frame.ret_x0 = arg && arg->s == self->s;
+            std::string a;
+            frame.ret_x0 = objc_string_value(frame.x[2], a) && a == self->s;
             return true;
         }
         if (sel == "description" || sel == "copy" || sel == "retain" || sel == "autorelease") { frame.ret_x0 = frame.x[0]; return true; }
