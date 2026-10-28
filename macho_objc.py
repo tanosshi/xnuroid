@@ -275,9 +275,25 @@ def funcs_mode():
                 addrs.append(int(t.split()[0], 16))
     except OSError:
         addrs = [int(x, 16) for x in spec.split(",")]
+    starts = []
+    try:
+        from compact_unwind import parse_unwind_info, functions
+        d = img.d
+        ui = img.secs["__unwind_info"]
+        pers, entries, end, lsda = parse_unwind_info(d[ui[2]:ui[2] + ui[1]])
+        starts = [f[0] for f in functions(entries, end)]
+    except Exception as e:  # snapping is a convenience only
+        print(f"[no function snapping: {e}]")
+    import bisect
     for a in addrs:
-        print(f"\n=== function image+{a:#x}")
-        for ln in describe(img, img.base + a, depth, set()):
+        fn = a
+        if starts:
+            k = bisect.bisect_right(starts, a) - 1
+            if k >= 0:
+                fn = starts[k]
+        note = "" if fn == a else f"  (address image+{a:#x} is inside this function)"
+        print(f"\n=== function image+{fn:#x}{note}")
+        for ln in describe(img, img.base + fn, depth, set()):
             print(ln)
 
 
