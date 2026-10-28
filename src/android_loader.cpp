@@ -2395,6 +2395,8 @@ int main(int argc, char** argv) {
             if (name >> 63) {
                 n_name_hi++;
                 if (!hi_example) { hi_example = b.symbol; hi_example_val = name; }
+                // Apple's non-unique-RTTI flag; Android's libc++ would deref the raw word. Clear it.
+                reinterpret_cast<uint64_t*>(b.loc)[1] = name & ~(1ull << 63);
             } else if ((name >> 48) != 0) {
                 n_name_noncanon++;
             }
@@ -2404,7 +2406,7 @@ int main(int argc, char** argv) {
         printf("[*] Addended-bind name pointers (word[1]): %zu with bit 63 set, %zu other non-canonical\n",
                n_name_hi, n_name_noncanon);
         if (hi_example)
-            printf("[*]   bit-63 example: vptr symbol %s, name word=0x%llx\n",
+            printf("[*]   bit-63 cleared on %zu name words; example: vptr symbol %s, name word was 0x%llx\n", n_name_hi,
                    hi_example, static_cast<unsigned long long>(hi_example_val));
     }
     printf("[*] Unresolved imports: %zu unique (%zu function -> shim_unresolved, %zu data -> poison)\n",
