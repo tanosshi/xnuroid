@@ -2787,7 +2787,7 @@ int main(int argc, char** argv) {
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
             printf("[E1] returned\n"); fflush(stdout);
         }
-        if (std::strcmp(eng, "5") == 0) {
+        if (atoi(eng) >= 5) {
             // Replay -[UnityFramework frameworkWarmup:argv:] (image+0x16850) minus the UIKit swizzling at image+0x12b90:
             // UnityInitRuntime(argc, argv) at image+0x7cc27c, then image+0x1b304 (mono/feature registration).
             static char arg0[] = "UnityFramework";
@@ -2820,6 +2820,19 @@ int main(int argc, char** argv) {
         printf("[E2] UnityInitApplicationNoGraphics(\"/data/local/tmp/game\") image+0x7cc3d4...\n"); fflush(stdout);
         reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))("/data/local/tmp/game");
         printf("[E2] returned: engine init without graphics completed\n"); fflush(stdout);
+        if (atoi(eng) >= 6) {
+            // startUnity's next step: graphics init at image+0x7cc5c4. It asks image+0x170dc for the rendering API and
+            // treats -1 as "none", passing a no-graphics flag to PlayerInitEngineGraphics (image+0x4ae350).
+            printf("[E3] UnityInitApplicationGraphics image+0x7cc5c4...\n"); fflush(stdout);
+            reinterpret_cast<engine_pre_fn>(get_fn(0x7cc5c4))();
+            printf("[E3] returned\n"); fflush(stdout);
+        }
+        if (atoi(eng) >= 7) {
+            // image+0x7cc6cc reaches PlayerLoadFirstScene (image+0x4ae81c: 'level0', 'sharedassets0.assets').
+            printf("[E4] load application / first scene image+0x7cc6cc...\n"); fflush(stdout);
+            reinterpret_cast<engine_pre_fn>(get_fn(0x7cc6cc))();
+            printf("[E4] returned\n"); fflush(stdout);
+        }
         return 0;
     }
 

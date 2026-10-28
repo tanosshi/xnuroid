@@ -1,4 +1,6 @@
 # Device runs executed by run_phases.ps1: name|environment. Edit and push to change what gets tested.
 1_default|
 4_exc_fde_all|LOADER_EXCEPTION_TEST=1 LOADER_FDE=all LOADER_EXCEPTION_BENCH=1
-8_engine5|LOADER_FDE=all LOADER_ENGINE=5 LOADER_PEEK=0x2bf5700,0x2b59340
+8_engine5|LOADER_FDE=all LOADER_ENGINE=5
+9_engine6|LOADER_FDE=all LOADER_ENGINE=6
+10_engine7|LOADER_FDE=all LOADER_ENGINE=7
