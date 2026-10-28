@@ -542,6 +542,8 @@ extern "C" void* native_guest_dlsym(void* handle, const char* name) {
             return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
         return nullptr;
     }
+    if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
+        return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
     // Darwin RTLD_NEXT=-1, RTLD_DEFAULT=-2, RTLD_SELF=-3, RTLD_MAIN_ONLY=-5
     intptr_t h = reinterpret_cast<intptr_t>(handle);
     if (h == -2 || h == -3 || h == -5) handle = RTLD_DEFAULT;
@@ -1511,6 +1513,22 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
     if (self && self->kind == 3) {
         if (fake_metal_message(frame, sel)) return true;
+        frame.ret_x0 = 0;
+        return true;
+    }
+    if (sel == "bundleWithPath:" || sel == "bundleForClass:" || sel == "bundleWithIdentifier:") {
+        const char* p = sel == "bundleWithPath:" ? reinterpret_cast<const char*>(0) : nullptr;
+        (void)p;
+        FakeObjcObj* arg = fake_lookup(frame.x[2]);
+        if (arg && arg->s.find("/System/Library/") != std::string::npos) {
+            frame.ret_x0 = fake_make(4, arg->s);   // kind 4 = Apple framework bundle: load succeeds
+            return true;
+        }
+    }
+    if (self && self->kind == 4) {
+        if (sel == "load") { frame.ret_x0 = 1; return true; }
+        if (sel == "isLoaded") { frame.ret_x0 = 1; return true; }
+        if (sel == "unload") { frame.ret_x0 = 0; return true; }
         frame.ret_x0 = 0;
         return true;
     }
