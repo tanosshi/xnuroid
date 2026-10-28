@@ -1374,6 +1374,20 @@ static void shim_objc_msgSend(CallFrame& frame, void*) {
         seen_selectors.insert(sel_str);
         printf("[OBJC_DYNAMIC #%d] [%p %s]\n", ++call_seq, receiver, sel_str.c_str());
     }
+    // Engine mode (LOADER_ENGINE / LOADER_OBJC_NIL): behave like an empty Foundation. Messages answer nil/0 (so fast
+    // enumeration ends, lookups miss, bundles are absent) except the retain/alloc family, which hands back the receiver.
+    static const bool nil_mode = getenv("LOADER_ENGINE") != nullptr || getenv("LOADER_OBJC_NIL") != nullptr;
+    if (nil_mode) {
+        static const char* const keep_self[] = {"alloc", "allocWithZone:", "init", "new", "retain", "autorelease", "self",
+                                                "copy", "mutableCopy", "copyWithZone:", "mutableCopyWithZone:",
+                                                "retainAutorelease", nullptr};
+        bool keep = false;
+        for (const char* const* k = keep_self; *k; ++k)
+            if (sel_str == *k) { keep = true; break; }
+        if (!keep && sel_str.compare(0, 8, "initWith") == 0) keep = true;
+        frame.ret_x0 = keep ? frame.x[0] : 0;
+        return;
+    }
     // Return receiver
     frame.ret_x0 = frame.x[0];
 }
