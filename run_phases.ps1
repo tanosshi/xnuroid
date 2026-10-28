@@ -103,7 +103,15 @@ if ($fw) {
             if (-not $remote.ContainsKey($rel)) {
                 $dst = "/data/local/tmp/game/Data/$rel"
                 & $adb shell ("mkdir -p '" + (Split-Path $dst -Parent).Replace('\', '/') + "'") | Out-Null
-                & $adb push $f.FullName $dst | Out-Null
+                $src = $f.FullName
+                if ($src.Length -ge 240) {
+                    # adb cannot open Windows paths over MAX_PATH; stage through a short temp file (\\?\ prefix lifts the limit)
+                    $tmp = Join-Path $env:TEMP "adb_sync_stage.tmp"
+                    try { [System.IO.File]::Copy("\\?\" + $src, $tmp, $true); $src = $tmp }
+                    catch { $pushed.Add("FAILED (long path, copy): $rel"); continue }
+                }
+                & $adb push $src $dst 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) { $pushed.Add("FAILED (adb push): $rel"); continue }
                 $pushed.Add("$rel ($($f.Length) bytes)")
             }
         }
