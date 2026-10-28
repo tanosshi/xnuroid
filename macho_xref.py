@@ -16,13 +16,17 @@ def main():
     data = open(sys.argv[1], "rb").read()
     targets, calls = set(), set()
 
+    ptrs = set()
+
     def add(tok):
-        if tok.startswith("call:"):
+        if tok.startswith("ptr:"):
+            ptrs.add(int(tok[4:], 16))
+        elif tok.startswith("call:"):
             calls.add(int(tok[5:], 16))
         else:
             targets.add(int(tok, 16))
     for a in sys.argv[2:]:
-        if a.startswith("0x") or a.startswith("call:"):
+        if a.startswith(("0x", "call:", "ptr:")):
             add(a)
         else:
             for line in open(a):
@@ -119,6 +123,20 @@ def main():
                 continue
             if tgt in hits:
                 hits[tgt].append((va, kind))
+    if ptrs:  # 8-byte pointers to a function/data address stored anywhere in the file (vtables, init tables)
+        ncm = struct.unpack_from("<I", data, 16)[0]
+        p2 = 32
+        for _ in range(ncm):
+            cmd, size = struct.unpack_from("<II", data, p2)
+            if cmd == 0x19:
+                segname = data[p2 + 8:p2 + 24].rstrip(b"\0").decode()
+                vm, vmsz, fo, fsz = struct.unpack_from("<QQQQ", data, p2 + 24)
+                if segname != "__TEXT" or True:
+                    for k in range(0, fsz - 7, 8):
+                        v = struct.unpack_from("<Q", data, fo + k)[0]
+                        if v in ptrs:
+                            print(f"ptr to image+{v:#x} stored at image+{vm + k:#x} ({segname})")
+            p2 += size
     for c in sorted(calls):
         print(f"\n=== calls to image+{c:#x}: {len(call_hits[c])}")
         for va, kind in call_hits[c][:60]:
