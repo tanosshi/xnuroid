@@ -1,6 +1,3 @@
-# Globals/calls listed in xref.txt by run_phases.ps1 (image offsets; call:/ptr: prefixes)
-0x2bf5700   # null map/registry used by the crashing lookup (5e400c)
-call:0x7cc6cc
-call:0x7cc3d4
-ptr:0x7cc3d4
-ptr:0x7cc6cc
+call:0x5e4610
+ptr:0x5e4610
+0x2bf5700
