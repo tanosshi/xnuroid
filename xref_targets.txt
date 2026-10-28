@@ -1,5 +1,1 @@
-str:creating device client
-str:nographics
-str:gfx device intialization failed
-str:GPU not supported
-0x2b42908
+
