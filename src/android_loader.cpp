@@ -533,16 +533,26 @@ static std::atomic<int> g_thread_seq{0};
 static void* guest_thread_tramp(void* p) {
     GuestThreadStart st = *static_cast<GuestThreadStart*>(p);
     free(p);
-    fprintf(stderr, "[THREADS] #%d started: fn=%p arg=%p\n", st.id, reinterpret_cast<void*>(st.fn), st.arg);
+    static const bool log = getenv("LOADER_LOG_THREADS") != nullptr;
+    if (log) fprintf(stderr, "[THREADS] #%d started: fn=%p arg=%p\n", st.id, reinterpret_cast<void*>(st.fn), st.arg);
     void* r = st.fn(st.arg);
-    fprintf(stderr, "[THREADS] #%d returned %p\n", st.id, r);
+    if (log) fprintf(stderr, "[THREADS] #%d returned %p\n", st.id, r);
     return r;
 }
 extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg) {
     auto* st = static_cast<GuestThreadStart*>(malloc(sizeof(GuestThreadStart)));
     st->fn = fn; st->arg = arg; st->id = ++g_thread_seq;
-    int rc = pthread_create(t, attr, guest_thread_tramp, st);
-    fprintf(stderr, "[THREADS] pthread_create #%d fn=%p -> rc=%d%s\n", st->id, reinterpret_cast<void*>(fn), rc, rc ? " (FAILED)" : "");
+    // iOS lets threads ask for SCHED_RR; an unprivileged Android process gets EPERM and the thread is never created
+    // (Unity's job workers!). Keep the guest's stack size etc. but drop explicit scheduling.
+    pthread_attr_t a2;
+    if (attr) std::memcpy(&a2, attr, sizeof a2); else pthread_attr_init(&a2);
+    sched_param sp{};
+    pthread_attr_setinheritsched(&a2, PTHREAD_INHERIT_SCHED);
+    pthread_attr_setschedpolicy(&a2, SCHED_OTHER);
+    pthread_attr_setschedparam(&a2, &sp);
+    int rc = pthread_create(t, &a2, guest_thread_tramp, st);
+    static const bool log = getenv("LOADER_LOG_THREADS") != nullptr;
+    if (log || rc) fprintf(stderr, "[THREADS] pthread_create #%d fn=%p -> rc=%d%s\n", st->id, reinterpret_cast<void*>(fn), rc, rc ? " (FAILED)" : "");
     if (rc) free(st);
     return rc;
 }
@@ -2593,7 +2603,7 @@ static void init_custom_shims() {
         if (getenv("LOADER_ENGINE")) {   // engine mode only: keep the default run on plain bionic dlopen/dlsym
             reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
             reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
-            if (getenv("LOADER_LOG_THREADS")) reg("_pthread_create", reinterpret_cast<void*>(&native_pthread_create_logged));
+            reg("_pthread_create", reinterpret_cast<void*>(&native_pthread_create_logged));
             register_darwin_framework_stubs();
             if (!getenv("LOADER_NO_OBJC_RT")) register_objc_runtime_natives();
         }
