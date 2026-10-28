@@ -2790,11 +2790,27 @@ int main(int argc, char** argv) {
         if (atoi(eng) >= 5) {
             // Replay -[UnityFramework frameworkWarmup:argv:] (image+0x16850) minus the UIKit swizzling at image+0x12b90:
             // UnityInitRuntime(argc, argv) at image+0x7cc27c, then image+0x1b304 (mono/feature registration).
+            // LOADER_ENGINE_ARGS="-batchmode -nographics" appends engine command-line switches (parsed at image+0x51e1d4).
             static char arg0[] = "UnityFramework";
-            static char* fake_argv[] = {arg0, nullptr};
+            static std::vector<std::string> extra;
+            static std::vector<char*> fake_argv_v;
+            fake_argv_v.push_back(arg0);
+            if (const char* ea = getenv("LOADER_ENGINE_ARGS")) {
+                std::string all = ea;
+                size_t i = 0;
+                while (i < all.size()) {
+                    size_t j = all.find(' ', i);
+                    if (j == std::string::npos) j = all.size();
+                    if (j > i) extra.push_back(all.substr(i, j - i));
+                    i = j + 1;
+                }
+                for (auto& e : extra) fake_argv_v.push_back(e.data());
+            }
+            fake_argv_v.push_back(nullptr);
+            int fake_argc = static_cast<int>(fake_argv_v.size()) - 1;
             typedef void (*runtime_init_fn)(int, char**);
-            printf("[E1a] UnityInitRuntime(1, argv) image+0x7cc27c...\n"); fflush(stdout);
-            reinterpret_cast<runtime_init_fn>(get_fn(0x7cc27c))(1, fake_argv);
+            printf("[E1a] UnityInitRuntime(%d, argv) image+0x7cc27c...\n", fake_argc); fflush(stdout);
+            reinterpret_cast<runtime_init_fn>(get_fn(0x7cc27c))(fake_argc, fake_argv_v.data());
             printf("[E1a] returned\n"); fflush(stdout);
             if (!getenv("LOADER_ENGINE_SKIP_1B304")) {
                 printf("[E1b] image+0x1b304()...\n"); fflush(stdout);

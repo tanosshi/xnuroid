@@ -1,3 +1,6 @@
 # Device runs executed by run_phases.ps1: name|environment. Edit and push to change what gets tested.
 1_default|
 8_engine5|LOADER_FDE=all LOADER_ENGINE=5
+9_engine6_nogfx|LOADER_FDE=all LOADER_ENGINE=6 LOADER_ENGINE_ARGS=-nographics
+9b_engine6_batch|LOADER_FDE=all LOADER_ENGINE=6 LOADER_ENGINE_ARGS=-batchmode_-nographics
+10_engine7_nogfx|LOADER_FDE=all LOADER_ENGINE=7 LOADER_ENGINE_ARGS=-nographics
