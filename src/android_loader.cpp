@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -525,6 +526,26 @@ extern "C" void* native_dispatch_get_global_queue(long identifier, unsigned long
 extern "C" void native_dispatch_async(void* queue, void* block) {}
 extern "C" void native_dispatch_sync(void* queue, void (*work)(void*)) { if (work) work(nullptr); }
 extern "C" void native_dispatch_release(void* obj) {}
+
+// Engine-mode pthread_create wrapper: logs the result and the lifetime of every guest thread.
+struct GuestThreadStart { void* (*fn)(void*); void* arg; int id; };
+static std::atomic<int> g_thread_seq{0};
+static void* guest_thread_tramp(void* p) {
+    GuestThreadStart st = *static_cast<GuestThreadStart*>(p);
+    free(p);
+    fprintf(stderr, "[THREADS] #%d started: fn=%p arg=%p\n", st.id, reinterpret_cast<void*>(st.fn), st.arg);
+    void* r = st.fn(st.arg);
+    fprintf(stderr, "[THREADS] #%d returned %p\n", st.id, r);
+    return r;
+}
+extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg) {
+    auto* st = static_cast<GuestThreadStart*>(malloc(sizeof(GuestThreadStart)));
+    st->fn = fn; st->arg = arg; st->id = ++g_thread_seq;
+    int rc = pthread_create(t, attr, guest_thread_tramp, st);
+    fprintf(stderr, "[THREADS] pthread_create #%d fn=%p -> rc=%d%s\n", st->id, reinterpret_cast<void*>(fn), rc, rc ? " (FAILED)" : "");
+    if (rc) free(st);
+    return rc;
+}
 
 // Guest dlopen/dlsym: Apple frameworks resolve to a fake handle; MTLCreateSystemDefaultDevice returns a fake device.
 static char g_fake_framework_handle[16];
@@ -2572,6 +2593,7 @@ static void init_custom_shims() {
         if (getenv("LOADER_ENGINE")) {   // engine mode only: keep the default run on plain bionic dlopen/dlsym
             reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
             reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
+            if (getenv("LOADER_LOG_THREADS")) reg("_pthread_create", reinterpret_cast<void*>(&native_pthread_create_logged));
             register_darwin_framework_stubs();
             if (!getenv("LOADER_NO_OBJC_RT")) register_objc_runtime_natives();
         }
