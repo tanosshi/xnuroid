@@ -425,9 +425,11 @@ extern "C" void native_memset_pattern16(void* b, const void* pattern16, size_t l
 // Apple Darwin TSD / pthread_key emulation
 static int g_next_apple_key = 1;
 
-extern "C" int native_pthread_key_create(pthread_key_t* key, void (*destructor)(void*)) {
+// Darwin's pthread_key_t is a 64-bit unsigned long; bionic's is a 32-bit int. The guest's key variable is 8 bytes, so
+// write all of it (a 4-byte store leaves garbage in the upper half and key*8 becomes a wild TSD index).
+extern "C" int native_pthread_key_create(uint64_t* key, void (*destructor)(void*)) {
     if (!key) return EINVAL;
-    *key = g_next_apple_key++;
+    *key = static_cast<uint64_t>(g_next_apple_key++);
     return 0;
 }
 
