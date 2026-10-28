@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 
 #include "shim_types.hpp"
+#include "guest_fde.hpp"
 
 // Thread-local Apple TSD block (512 64-bit slots = 4096 bytes per thread)
 alignas(64) __thread uint64_t g_apple_tsd[512] = {0};
@@ -2139,6 +2140,7 @@ int main(int argc, char** argv) {
     uint32_t bind_off = 0, bind_size = 0;
     uint32_t lazy_off = 0, lazy_size = 0;
     uint32_t export_off = 0, export_size = 0;
+    uint64_t unwind_info_vm = 0, unwind_info_size = 0, eh_frame_vm = 0, eh_frame_size = 0;
 
     for (uint32_t i = 0; i < ncmds; ++i) {
         uint32_t cmd = *reinterpret_cast<uint32_t*>(file_data + cur);
@@ -2152,6 +2154,14 @@ int main(int argc, char** argv) {
             uint64_t filesize = *reinterpret_cast<uint64_t*>(file_data + cur + 48);
             uint32_t initprot = *reinterpret_cast<uint32_t*>(file_data + cur + 60);
             segments.push_back({segname, vmaddr, vmsize, fileoff, filesize, initprot});
+            uint32_t nsects = *reinterpret_cast<uint32_t*>(file_data + cur + 64);
+            for (uint32_t k = 0; k < nsects; ++k) {
+                const uint8_t* sp = file_data + cur + 72 + 80 * k;
+                uint64_t saddr = *reinterpret_cast<const uint64_t*>(sp + 32);
+                uint64_t ssize = *reinterpret_cast<const uint64_t*>(sp + 40);
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__unwind_info", 16) == 0) { unwind_info_vm = saddr; unwind_info_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__eh_frame", 16) == 0) { eh_frame_vm = saddr; eh_frame_size = ssize; }
+            }
         } else if (cmd == 0x22 || cmd == 0x80000022) { // LC_DYLD_INFO
             rebase_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
             rebase_size = *reinterpret_cast<uint32_t*>(file_data + cur + 12);
@@ -2476,6 +2486,38 @@ int main(int argc, char** argv) {
     printf("[*] Page protections set and instruction caches cleared.\n");
     if (g_custom_shims.count("_snprintf")) selftest_variadic_snprintf(g_custom_shims["_snprintf"]);
     selftest_setjmp();
+
+    // Compact unwind -> DWARF FDEs for the system unwinder (opt-in).
+    //   LOADER_FDE=all              register every guest function
+    //   LOADER_FDE_ONLY=<file>      register only functions containing the image offsets listed in <file>
+    //   LOADER_FDE_DUMP=1           log every registered function
+    {
+        const char* fde_all = getenv("LOADER_FDE");
+        const char* fde_only = getenv("LOADER_FDE_ONLY");
+        if ((fde_all && *fde_all) || (fde_only && *fde_only)) {
+            guest_fde::Options fo;
+            fo.dump = getenv("LOADER_FDE_DUMP") != nullptr;
+            if (fde_only && *fde_only) {
+                fo.only = true;
+                FILE* lf = fopen(fde_only, "r");
+                if (!lf) { fprintf(stderr, "[FATAL] LOADER_FDE_ONLY: cannot open %s\n", fde_only); return 1; }
+                char line[256];
+                while (fgets(line, sizeof line, lf)) {
+                    const char* x = strstr(line, "0x");
+                    if (x) fo.only_offsets.push_back(strtoull(x, nullptr, 16));
+                }
+                fclose(lf);
+                fprintf(stderr, "[FDE] subset mode: %zu addresses from %s\n", fo.only_offsets.size(), fde_only);
+            }
+            if (!unwind_info_vm) { fprintf(stderr, "[FATAL] no __unwind_info section\n"); return 1; }
+            const uint8_t* text_base = image_base + (text_seg->vmaddr - min_vm);
+            guest_fde::Result fr;
+            bool ok = guest_fde::register_all(
+                text_base, image_base + (unwind_info_vm - min_vm), unwind_info_size,
+                eh_frame_vm ? image_base + (eh_frame_vm - min_vm) : nullptr, eh_frame_size, fo, fr);
+            if (!ok) { fprintf(stderr, "[FATAL] FDE registration failed\n"); return 1; }
+        }
+    }
 
     // Check value at 0x29b8890
     uint64_t* bzero_slot = reinterpret_cast<uint64_t*>(image_base + 0x29b8890);

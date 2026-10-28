@@ -1,0 +1,7 @@
+# Image offsets from the frame walk of the 7A crash (throw_run.err): return addresses, so the
+# function containing addr-1 is registered. Use: LOADER_FDE_ONLY=throw_frames.txt
+0xc1d28c
+0xbe1510
+0x22f1774
+0x128718
+0xc3463c
