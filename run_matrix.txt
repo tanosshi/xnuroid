@@ -1,2 +1,3 @@
 # Device runs executed by run_phases.ps1: name|environment. Edit and push to change what gets tested.
 1_default|
+10_engine7|LOADER_FDE=all LOADER_ENGINE=7 LOADER_WATCHDOG=20 LOADER_WATCHDOG_COUNT=4

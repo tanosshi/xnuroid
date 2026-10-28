@@ -2835,19 +2835,24 @@ static void start_watchdog(unsigned seconds) {
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = thread_dump_handler;
     sigaction(SIGUSR2, &sa, nullptr);
-    std::thread([seconds] {
-        sleep(seconds);
-        fprintf(stderr, "\n[WATCHDOG] %u s elapsed: dumping all threads\n", seconds);
-        fflush(stderr);
-        pid_t pid = getpid();
-        if (DIR* d = opendir("/proc/self/task")) {
-            std::vector<int> tids;
-            while (dirent* e = readdir(d)) if (e->d_name[0] != '.') tids.push_back(atoi(e->d_name));
-            closedir(d);
-            for (int tid : tids) {
-                g_wd_done = 0;
-                syscall(SYS_tgkill, pid, tid, SIGUSR2);
-                for (int i = 0; i < 50 && !g_wd_done; ++i) usleep(10000);
+    int count = getenv("LOADER_WATCHDOG_COUNT") ? atoi(getenv("LOADER_WATCHDOG_COUNT")) : 1;
+    std::thread([seconds, count] {
+        for (int round = 1; round <= count; ++round) {
+            sleep(seconds);
+            timespec cpu{}; clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
+            fprintf(stderr, "\n[WATCHDOG] sample %d/%d at +%u s (process cpu %.1f s): dumping all threads\n", round, count, seconds * round,
+                    cpu.tv_sec + cpu.tv_nsec / 1e9);
+            fflush(stderr);
+            pid_t pid = getpid();
+            if (DIR* d = opendir("/proc/self/task")) {
+                std::vector<int> tids;
+                while (dirent* e = readdir(d)) if (e->d_name[0] != '.') tids.push_back(atoi(e->d_name));
+                closedir(d);
+                for (int tid : tids) {
+                    g_wd_done = 0;
+                    syscall(SYS_tgkill, pid, tid, SIGUSR2);
+                    for (int i = 0; i < 50 && !g_wd_done; ++i) usleep(10000);
+                }
             }
         }
         fprintf(stderr, "[WATCHDOG] done\n");
