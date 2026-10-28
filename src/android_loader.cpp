@@ -2582,6 +2582,14 @@ int main(int argc, char** argv) {
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
             printf("[E1] returned\n"); fflush(stdout);
         }
+        if (std::strcmp(eng, "3") == 0 || std::strcmp(eng, "4") == 0) {
+            // image+0x31eae8 allocates the 0x58-byte registry that image+0x2b59340 should point to (xref.txt);
+            // its only static caller is on the scene-loading path, so create it up front.
+            printf("[E1] registry ctor image+0x31eae8() (global before: %p)...\n",
+                   *reinterpret_cast<void**>(get_fn(0x2b59340))); fflush(stdout);
+            reinterpret_cast<engine_pre_fn>(get_fn(0x31eae8))();
+            printf("[E1] registry global now %p\n", *reinterpret_cast<void**>(get_fn(0x2b59340))); fflush(stdout);
+        }
         // image+0x1516c caches the app bundle path in image+0x2b428c8 and returns it as-is when set, so seed it
         // and the engine never needs [[NSBundle mainBundle] bundlePath].
         {
