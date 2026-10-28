@@ -2575,6 +2575,27 @@ int main(int argc, char** argv) {
     if (const char* eng = getenv("LOADER_ENGINE")) {
         typedef void (*engine_init_fn)(const char*);
         typedef void (*engine_pre_fn)();
+        // LOADER_PEEK=0x2bf5700,0x2b59340: print the 8-byte value at image offsets, the segment it lives in,
+        // and the import it was bound to (if any).
+        if (const char* peek = getenv("LOADER_PEEK")) {
+            std::string list = peek;
+            size_t pos = 0;
+            while (pos < list.size()) {
+                size_t comma = list.find(',', pos);
+                std::string tok = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                pos = comma == std::string::npos ? list.size() : comma + 1;
+                uint64_t off = strtoull(tok.c_str(), nullptr, 16);
+                const char* segn = "?";
+                for (auto& sg : segments)
+                    if (sg.vmaddr <= off + min_vm && off + min_vm < sg.vmaddr + sg.vmsize) segn = sg.name.c_str();
+                uint64_t val = *reinterpret_cast<uint64_t*>(image_base + off);
+                const char* bound = "";
+                for (const auto& b : g_binds)
+                    if (b.loc == reinterpret_cast<uint64_t>(image_base + off)) { bound = b.symbol; break; }
+                printf("[PEEK] image+%#llx (%s) = %#llx%s%s\n", static_cast<unsigned long long>(off), segn,
+                       static_cast<unsigned long long>(val), *bound ? "  bound import: " : "", bound);
+            }
+        }
         printf("\n=== ENGINE STAGE (LOADER_ENGINE=%s) ===\n", eng);
         fflush(stdout);
         if (std::strcmp(eng, "2") == 0) {
