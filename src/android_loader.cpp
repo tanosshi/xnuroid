@@ -2582,6 +2582,13 @@ int main(int argc, char** argv) {
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
             printf("[E1] returned\n"); fflush(stdout);
         }
+        // image+0x1516c caches the app bundle path in image+0x2b428c8 and returns it as-is when set, so seed it
+        // and the engine never needs [[NSBundle mainBundle] bundlePath].
+        {
+            char** bundle_cache = reinterpret_cast<char**>(get_fn(0x2b428c8));
+            printf("[E0] bundle path cache (image+0x2b428c8) was %p; seeding \"/data/local/tmp/game\"\n", static_cast<void*>(*bundle_cache));
+            *bundle_cache = strdup("/data/local/tmp/game");
+        }
         printf("[E2] UnityInitApplicationNoGraphics(\"/data/local/tmp/game\") image+0x7cc3d4...\n"); fflush(stdout);
         reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))("/data/local/tmp/game");
         printf("[E2] returned: engine init without graphics completed\n"); fflush(stdout);

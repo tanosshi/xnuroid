@@ -62,7 +62,9 @@ if ($fw) {
     foreach ($c in @((Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source, "C:\Program Files\LLVM\bin\llvm-objdump.exe", (Join-Path (Find-Ndk) "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-objdump.exe"))) { if ($c -and (Test-Path $c)) { $objdump = $c; break } }
     if ($objdump) {
         $regions = @( @("didFinishLaunching", 0x11e4c, 0x12100), @("startUnity", 0x11638, 0x11984), @("helper_1516c", 0x1516c, 0x15400),
-                      @("init_nographics_7cc3d4", 0x7cc3d4, 0x7cc800), @("startup_7cde30", 0x7cde30, 0x7cdf40), @("repaint", 0x16e3c, 0x16ee0) )
+                      @("init_nographics_7cc3d4", 0x7cc3d4, 0x7cc800), @("startup_7cde30", 0x7cde30, 0x7cdf40), @("repaint", 0x16e3c, 0x16ee0),
+                      @("getter_31d488", 0x31d488, 0x31d5c0), @("use_31db04", 0x31db04, 0x31dc00), @("fn_7cc11c", 0x7cc11c, 0x7cc260),
+                      @("fn_7caa74", 0x7caa74, 0x7cab60), @("alloc_359a54", 0x359a54, 0x359b88), @("helper_tail_15240", 0x15240, 0x152a0) )
         foreach ($r in $regions) {
             & $objdump -d --no-show-raw-insn ("--start-address=0x{0:x}" -f $r[1]) ("--stop-address=0x{0:x}" -f $r[2]) $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs ("disasm_" + $r[0] + ".txt"))
         }
