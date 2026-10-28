@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <time.h>
 #include <stdarg.h>
@@ -184,9 +185,24 @@ static const char* base_name(const char* p) {
     return s ? s + 1 : p;
 }
 
+// Return addresses saved by PAC-enabled system libraries are signed (extra bits above bit 38 on
+// this 39-bit-VA device). Code addresses never carry a tag byte, so strip bits >= 39 when the top
+// byte is zero.
+static uint64_t strip_pac(uint64_t a) {
+    if ((a >> 39) != 0 && (a >> 56) == 0) return a & 0x7fffffffffULL;
+    return a;
+}
+
 // Prints "[kind] detail" for an address. kind: image / tramp / loader / libc / libc++ / other.
 // Returns 1 for guest image, 2 for trampoline, 3 for loader, 4 for libc, 0 otherwise.
-static int describe_addr(int fd, uint64_t a) {
+static int describe_addr(int fd, uint64_t a, bool is_return_addr = false) {
+    {
+        uint64_t s = strip_pac(a);
+        if (s != a) {
+            wr_str(fd, "(pac-signed, stripped to "); wr_hex(fd, s); wr_str(fd, ") ");
+            a = s;
+        }
+    }
     if (in_image(a)) {
         wr_str(fd, "[image] image_base+");
         wr_hex(fd, a - reinterpret_cast<uint64_t>(g_loaded_image_base));
@@ -199,7 +215,8 @@ static int describe_addr(int fd, uint64_t a) {
         return 2;
     }
     Dl_info di{};
-    if (a && dladdr(reinterpret_cast<void*>(a), &di) && di.dli_fname) {
+    // A return address can sit exactly on the next function's first byte; look up the call site.
+    if (a && dladdr(reinterpret_cast<void*>(is_return_addr ? a - 1 : a), &di) && di.dli_fname) {
         const char* bn = base_name(di.dli_fname);
         int kind = 0;
         const char* tag = "other";
@@ -283,10 +300,10 @@ static void dump_shim_ring(int fd) {
 static void dump_frame_walk(int fd, uint64_t pc, uint64_t lr, uint64_t fp, uint64_t sp) {
     wr_str(fd, "\n--- Frame walk (x29 chain) ---\n");
     wr_str(fd, "  #pc  "); wr_hex(fd, pc); wr_str(fd, " "); describe_addr(fd, pc); wr_str(fd, "\n");
-    wr_str(fd, "  #lr  "); wr_hex(fd, lr); wr_str(fd, " "); describe_addr(fd, lr); wr_str(fd, "\n");
+    wr_str(fd, "  #lr  "); wr_hex(fd, lr); wr_str(fd, " "); describe_addr(fd, lr, true); wr_str(fd, "\n");
     int first_guest = -1;
     uint64_t guest_ret = 0;
-    if (in_image(lr)) { first_guest = -2; guest_ret = lr; }
+    if (in_image(strip_pac(lr))) { first_guest = -2; guest_ret = strip_pac(lr); }
     for (int depth = 0; depth < 48; ++depth) {
         if ((fp & 0xf) || fp < sp || fp - sp > (32ull << 20)) {
             wr_str(fd, "  (chain stops: fp="); wr_hex(fd, fp); wr_str(fd, " invalid/out of stack range)\n");
@@ -297,9 +314,9 @@ static void dump_frame_walk(int fd, uint64_t pc, uint64_t lr, uint64_t fp, uint6
         wr_str(fd, "  #"); wr_hex(fd, static_cast<uint64_t>(depth));
         wr_str(fd, "  fp="); wr_hex(fd, fp);
         wr_str(fd, " ret="); wr_hex(fd, rec[1]); wr_str(fd, " ");
-        int k = describe_addr(fd, rec[1]);
+        int k = describe_addr(fd, rec[1], true);
         wr_str(fd, "\n");
-        if (k == 1 && first_guest == -1) { first_guest = depth; guest_ret = rec[1]; }
+        if (k == 1 && first_guest == -1) { first_guest = depth; guest_ret = strip_pac(rec[1]); }
         if (rec[0] <= fp || rec[1] == 0) break;
         fp = rec[0];
     }
@@ -1431,6 +1448,19 @@ struct DirectEntry {
 };
 static DirectEntry g_direct_entries[MAX_TRAMPOLINES];
 static int g_trace_mode = 0;  // 0 off, 1 capped, 2 all, 3 list only
+
+// C++ exception machinery imports that get logging stubs when LOADER_EXCEPTION_TEST or
+// LOADER_TRACE_UNWIND is set (independent of LOADER_TRACE_DIRECT).
+static bool g_trace_unwind = false;
+static bool is_unwind_hook_name(const std::string& n) {
+    static const char* const names[] = {
+        "___cxa_throw", "___cxa_rethrow", "___cxa_begin_catch", "___cxa_end_catch",
+        "___cxa_allocate_exception", "___cxa_free_exception", "___cxa_call_unexpected",
+        "__ZSt9terminatev", "__Unwind_Resume", nullptr};
+    for (const char* const* p = names; *p; ++p)
+        if (n == *p) return true;
+    return false;
+}
 static const uint64_t kTraceCap = 8;
 extern "C" void direct_trace_forward();
 
@@ -1836,7 +1866,8 @@ static void* resolve_symbol(const std::string& name) {
         Dl_info di{};
         bool from_libcxx = dladdr(target, &di) && di.dli_fname && std::strstr(di.dli_fname, "libc++") != nullptr;
         g_direct_bound.push_back({name, from_libcxx, lazy, di.dli_fname ? base_name(di.dli_fname) : "?"});
-        if ((g_trace_mode == 1 || g_trace_mode == 2) && !from_libcxx && lazy) {
+        if (((g_trace_mode == 1 || g_trace_mode == 2) && !from_libcxx && lazy) ||
+            (g_trace_unwind && is_unwind_hook_name(name))) {
             target = make_direct_trace_stub(target, strdup(name.c_str()));
         }
         g_resolved_cache[name] = target;
@@ -1988,6 +2019,58 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx) {
     _exit(1);
 }
 
+// Asks the system unwinder (bionic libc.so, LLVM libunwind) directly whether it can find an FDE
+// for a few addresses. Positive controls (loader, libc, libc++) must return non-null; a null for
+// guest addresses means any _Unwind_RaiseException passing through guest frames ends there.
+struct EhBases { void* tbase; void* dbase; void* func; };
+struct PhdrScan {
+    uint64_t pc;
+    int objects;
+    int with_eh_frame_hdr;
+    const char* hit;
+};
+
+static int phdr_scan_cb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* s = static_cast<PhdrScan*>(data);
+    ++s->objects;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_GNU_EH_FRAME) ++s->with_eh_frame_hdr;
+        if (ph.p_type == PT_LOAD) {
+            uint64_t lo = info->dlpi_addr + ph.p_vaddr;
+            if (s->pc >= lo && s->pc < lo + ph.p_memsz) s->hit = info->dlpi_name ? info->dlpi_name : "(unnamed)";
+        }
+    }
+    return 0;
+}
+
+static void unwinder_probe(uint64_t guest_pc_a, uint64_t guest_pc_b) {
+    typedef const void* (*find_fde_fn)(void*, EhBases*);
+    auto find_fde = reinterpret_cast<find_fde_fn>(dlsym(RTLD_DEFAULT, "_Unwind_Find_FDE"));
+    fprintf(stderr, "\n[UNWIND-PROBE] _Unwind_Find_FDE=%p __register_frame=%p\n", reinterpret_cast<void*>(find_fde),
+            dlsym(RTLD_DEFAULT, "__register_frame"));
+    PhdrScan scan{guest_pc_a, 0, 0, nullptr};
+    dl_iterate_phdr(phdr_scan_cb, &scan);
+    fprintf(stderr, "[UNWIND-PROBE] dl_iterate_phdr: %d objects (%d with PT_GNU_EH_FRAME); guest pc %#llx covered by: %s\n",
+            scan.objects, scan.with_eh_frame_hdr, static_cast<unsigned long long>(guest_pc_a),
+            scan.hit ? scan.hit : "NO OBJECT (guest image is invisible to the unwinder)");
+    if (!find_fde) return;
+    struct Probe { const char* what; uint64_t pc; };
+    const Probe probes[] = {
+        {"guest  (control: should be NULL)", guest_pc_a},
+        {"guest  (control: should be NULL)", guest_pc_b},
+        {"loader fn      (positive control)", reinterpret_cast<uint64_t>(&init_safe_read)},
+        {"libc abort()   (positive control)", reinterpret_cast<uint64_t>(dlsym(RTLD_DEFAULT, "abort"))},
+        {"libc++ __cxa_throw (positive control)", reinterpret_cast<uint64_t>(dlsym(RTLD_DEFAULT, "__cxa_throw"))},
+    };
+    for (const auto& p : probes) {
+        EhBases b{};
+        const void* fde = find_fde(reinterpret_cast<void*>(p.pc + 4), &b);
+        fprintf(stderr, "[UNWIND-PROBE] _Unwind_Find_FDE(%#llx) %-38s -> fde=%p func=%p\n",
+                static_cast<unsigned long long>(p.pc + 4), p.what, fde, b.func);
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -1997,6 +2080,7 @@ int main(int argc, char** argv) {
         g_trace_mode = std::strcmp(tm, "all") == 0 ? 2 : std::strcmp(tm, "list") == 0 ? 3 : 1;
     }
     g_poison_continue = getenv("LOADER_POISON_STRICT") == nullptr;
+    g_trace_unwind = getenv("LOADER_EXCEPTION_TEST") != nullptr || getenv("LOADER_TRACE_UNWIND") != nullptr;
     struct sigaction sa{};
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = segv_handler;
@@ -2576,7 +2660,60 @@ int main(int argc, char** argv) {
     // [7/5] Managed exception round-trip: Int32.Parse("abc") must throw FormatException,
     // which il2cpp_runtime_invoke should catch and return through the exception out-param.
     const char* exc_test = getenv("LOADER_EXCEPTION_TEST");
-    if (exc_test && (std::strcmp(exc_test, "1") == 0 || std::strcmp(exc_test, "parse") == 0) && mscorlib) {
+    if (exc_test && std::strcmp(exc_test, "1") == 0 && mscorlib) {
+        // Culture-free throw tests: exceptions raised by managed IL with no CultureInfo/CF locale use.
+        //   A) Math.Abs(Int32.MinValue)      -> OverflowException   (IL `throw new OverflowException(msg)`)
+        //   B) Array.Copy(null, null, 0)     -> ArgumentNullException (IL `throw new ArgumentNullException(name)`)
+        // Only the exception's class name is read; the message path is never touched.
+        printf("\n[7/5] Managed throw tests with no culture lookup (unwinder test)\n");
+        auto find_method = [&](void* klass, const char* name, std::initializer_list<const char*> ptypes) -> void* {
+            void* it = nullptr;
+            while (void* m = class_get_methods(klass, &it)) {
+                const char* mn = method_get_name(m);
+                if (!mn || std::strcmp(mn, name) != 0 || method_get_param_count(m) != ptypes.size()) continue;
+                uint32_t k = 0;
+                bool ok = true;
+                for (const char* want : ptypes) {
+                    char* tn = type_get_name(method_get_param(m, k++));
+                    if (!tn || std::strcmp(tn, want) != 0) { ok = false; break; }
+                }
+                if (ok && (method_get_flags(m, nullptr) & 0x10)) return m;
+            }
+            return nullptr;
+        };
+        auto class_get_namespace = reinterpret_cast<const char* (*)(void*)>(get_fn(0xbdef2c));
+        auto run_throw_test = [&](const char* label, void* method, void** margs, const char* expect) {
+            if (!method) { printf("[-] %s: method not present (stripped)\n", label); return; }
+            void* exc = nullptr;
+            printf("[*] %s: invoking method=%p, expecting %s. If the process dies after this line, unwinding failed.\n",
+                   label, method, expect);
+            void* ret = runtime_invoke(method, nullptr, margs, &exc);
+            printf("[*] %s: runtime_invoke returned object=%p exception=%p\n", label, ret, exc);
+            if (exc) {
+                void* ek = object_get_class(exc);
+                printf("[+] %s: caught managed exception of class %s.%s\n", label,
+                       ek ? class_get_namespace(ek) : "?", ek ? il2cpp_class_get_name(ek) : "?");
+            } else {
+                printf("[-] %s: NO exception returned (ret=%p)\n", label, ret);
+            }
+        };
+
+        void* math_cls = class_from_name(mscorlib, "System", "Math");
+        void* arr_cls = class_from_name(mscorlib, "System", "Array");
+        void* abs_m = math_cls ? find_method(math_cls, "Abs", {"System.Int32"}) : nullptr;
+        void* copy_m = arr_cls ? find_method(arr_cls, "Copy", {"System.Array", "System.Array", "System.Int32"}) : nullptr;
+        printf("[*] System.Math.Abs(Int32)=%p  System.Array.Copy(Array,Array,Int32)=%p\n", abs_m, copy_m);
+
+        unwinder_probe(reinterpret_cast<uint64_t>(image_base) + 0xc02988, reinterpret_cast<uint64_t>(image_base) + 0xbdb304);
+
+        int int_min = INT32_MIN;
+        void* abs_args[1] = {&int_min};
+        run_throw_test("7A Math.Abs(int.MinValue)", abs_m, abs_args, "System.OverflowException");
+        int zero = 0;
+        void* copy_args[3] = {nullptr, nullptr, &zero};
+        run_throw_test("7B Array.Copy(null,null,0)", copy_m, copy_args, "System.ArgumentNullException");
+    }
+    if (exc_test && std::strcmp(exc_test, "parse") == 0 && mscorlib) {
         printf("\n[7/5] Invoking System.Int32.Parse(\"abc\") (expected: managed FormatException; needs CF locale)...\n");
         void* int32_cls = class_from_name(mscorlib, "System", "Int32");
         void* parse = nullptr;
