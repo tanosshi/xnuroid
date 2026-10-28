@@ -524,6 +524,88 @@ extern "C" void* native_dispatch_get_global_queue(long identifier, unsigned long
 extern "C" void native_dispatch_async(void* queue, void* block) {}
 extern "C" void native_dispatch_sync(void* queue, void (*work)(void*)) { if (work) work(nullptr); }
 extern "C" void native_dispatch_release(void* obj) {}
+
+// ---------------------------------------------------------------------------
+// Batch of small Darwin libc/libSystem replacements (natives: plain C ABI, bound directly).
+// ---------------------------------------------------------------------------
+#include <cmath>
+#include <cctype>
+extern "C" int native_tolower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+extern "C" int native_toupper(int c) { return (c >= 'a' && c <= 'z') ? c - 32 : c; }
+// Darwin <runetype.h> class bits; ASCII only (no locale tables).
+extern "C" int native_maskrune(uint32_t c, unsigned long mask) {
+    if (c >= 128) return 0;
+    unsigned long r = 0;
+    int ch = static_cast<int>(c);
+    if (isalpha(ch)) r |= 0x100;       // _CTYPE_A
+    if (iscntrl(ch)) r |= 0x200;       // _CTYPE_C
+    if (isdigit(ch)) r |= 0x400;       // _CTYPE_D
+    if (isgraph(ch)) r |= 0x800;       // _CTYPE_G
+    if (islower(ch)) r |= 0x1000;      // _CTYPE_L
+    if (isprint(ch)) r |= 0x40000;     // _CTYPE_R
+    if (ispunct(ch)) r |= 0x2000;      // _CTYPE_P
+    if (isspace(ch)) r |= 0x4000;      // _CTYPE_S
+    if (isupper(ch)) r |= 0x8000;      // _CTYPE_U
+    if (isxdigit(ch)) r |= 0x10000;    // _CTYPE_X
+    if (ch == ' ' || ch == '\t') r |= 0x20000;  // _CTYPE_B (blank)
+    return (r & mask) != 0;
+}
+struct ScD { double s, c; };
+struct ScF { float s, c; };
+extern "C" ScD native_sincos_stret(double x) { return {sin(x), cos(x)}; }
+extern "C" ScF native_sincosf_stret(float x) { return {sinf(x), cosf(x)}; }
+extern "C" float native_exp10f(float x) { return powf(10.0f, x); }
+extern "C" int native_atexit(void (*fn)(void)) { (void)fn; return 0; }
+extern "C" uint64_t native_clock_gettime_nsec_np(int darwin_clock) {
+    clockid_t id = CLOCK_MONOTONIC;
+    switch (darwin_clock) {  // Darwin clockid_t -> Linux
+        case 0: id = CLOCK_REALTIME; break;
+        case 4: case 8: id = CLOCK_MONOTONIC_RAW; break;  // MONOTONIC_RAW, UPTIME_RAW
+        case 6: id = CLOCK_MONOTONIC; break;
+        case 12: id = CLOCK_PROCESS_CPUTIME_ID; break;
+        case 16: id = CLOCK_THREAD_CPUTIME_ID; break;
+        default: break;
+    }
+    timespec ts;
+    if (clock_gettime(id, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+// dispatch_once: predicate is a Darwin intptr; 0 = not run, ~0 = done. A Block's invoke pointer sits at +16.
+static pthread_mutex_t g_once_mutex = PTHREAD_MUTEX_INITIALIZER;
+extern "C" void native_dispatch_once_f(intptr_t* pred, void* ctx, void (*fn)(void*)) {
+    if (__atomic_load_n(pred, __ATOMIC_ACQUIRE) == -1) return;
+    pthread_mutex_lock(&g_once_mutex);
+    bool run = (*pred != -1);
+    if (run) *pred = -1;  // mark first so recursive requests on this thread do not deadlock/loop
+    pthread_mutex_unlock(&g_once_mutex);
+    if (run) fn(ctx);
+}
+extern "C" void native_dispatch_once(intptr_t* pred, void* block) {
+    if (__atomic_load_n(pred, __ATOMIC_ACQUIRE) == -1) return;
+    pthread_mutex_lock(&g_once_mutex);
+    bool run = (*pred != -1);
+    if (run) *pred = -1;
+    pthread_mutex_unlock(&g_once_mutex);
+    if (run) reinterpret_cast<void (*)(void*)>(*reinterpret_cast<void**>(static_cast<char*>(block) + 16))(block);
+}
+extern "C" void native_assert_rtn(const char* func, const char* file, int line, const char* expr) {
+    fprintf(stderr, "[ASSERT] %s:%d: %s: Assertion `%s' failed.\n", file ? file : "?", line, func ? func : "?", expr ? expr : "?");
+    fflush(stderr);
+    abort();
+}
+extern "C" void native_block_object_assign(void* dst, const void* src, int flags) { (void)flags; *static_cast<const void**>(dst) = src; }
+extern "C" void native_block_object_dispose(const void* obj, int flags) { (void)obj; (void)flags; }
+// Mach / exception-port / crash-reporter calls: report KERN_FAILURE (5) so the caller takes its error path.
+extern "C" int native_kern_failure() { return 5; }
+extern "C" void* native_null() { return nullptr; }
+extern "C" void* native_dispatch_fake_handle() { return calloc(1, 64); }
+extern "C" uint64_t native_dispatch_time(uint64_t when, int64_t delta) { return when + static_cast<uint64_t>(delta); }
+extern "C" int native_cond_timedwait_relative_np(void*, void*, const timespec* rel) {
+    if (rel) { timespec t = *rel; nanosleep(&t, nullptr); }
+    return 60;  // Darwin ETIMEDOUT
+}
+// ObjC exception personality: C++ exceptions never need to be caught by ObjC frames; keep unwinding.
+extern "C" int native_objc_personality(int, int, uint64_t, void*, void*) { return 8; /* _URC_CONTINUE_UNWIND */ }
 extern "C" void native_dispatch_retain(void* obj) {}
 extern "C" void native_dispatch_resume(void* obj) {}
 extern "C" void native_dispatch_suspend(void* obj) {}
@@ -1814,6 +1896,35 @@ static void init_custom_shims() {
     g_custom_shims["_dispatch_async"] = reinterpret_cast<void*>(&native_dispatch_async);
     g_custom_shims["_dispatch_sync"] = reinterpret_cast<void*>(&native_dispatch_sync);
     g_custom_shims["_dispatch_release"] = reinterpret_cast<void*>(&native_dispatch_release);
+    {
+        auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
+        reg("___tolower", reinterpret_cast<void*>(&native_tolower));
+        reg("___toupper", reinterpret_cast<void*>(&native_toupper));
+        reg("___maskrune", reinterpret_cast<void*>(&native_maskrune));
+        reg("___sincos_stret", reinterpret_cast<void*>(&native_sincos_stret));
+        reg("___sincosf_stret", reinterpret_cast<void*>(&native_sincosf_stret));
+        reg("___exp10f", reinterpret_cast<void*>(&native_exp10f));
+        reg("_atexit", reinterpret_cast<void*>(&native_atexit));
+        reg("_clock_gettime_nsec_np", reinterpret_cast<void*>(&native_clock_gettime_nsec_np));
+        reg("_dispatch_once", reinterpret_cast<void*>(&native_dispatch_once));
+        reg("_dispatch_once_f", reinterpret_cast<void*>(&native_dispatch_once_f));
+        reg("___assert_rtn", reinterpret_cast<void*>(&native_assert_rtn));
+        reg("__Block_object_assign", reinterpret_cast<void*>(&native_block_object_assign));
+        reg("__Block_object_dispose", reinterpret_cast<void*>(&native_block_object_dispose));
+        reg("___objc_personality_v0", reinterpret_cast<void*>(&native_objc_personality));
+        reg("_dispatch_time", reinterpret_cast<void*>(&native_dispatch_time));
+        reg("_dispatch_source_create", reinterpret_cast<void*>(&native_dispatch_fake_handle));
+        for (const char* n : {"_dispatch_source_cancel", "_dispatch_source_set_event_handler", "_dispatch_source_set_timer",
+                              "_class_replaceMethod", "_imp_implementationWithBlock", "_object_getClass"})
+            reg(n, reinterpret_cast<void*>(&native_null));
+        for (const char* n : {"_mach_msg", "_mach_make_memory_entry_64", "_mach_port_move_member", "_mach_port_request_notification",
+                              "_task_get_exception_ports", "_task_swap_exception_ports", "_thread_get_exception_ports",
+                              "_thread_swap_exception_ports", "_task_threads", "_task_info", "_thread_get_state",
+                              "_thread_resume", "_thread_suspend", "_vm_map", "_vm_read_overwrite", "_exception_raise",
+                              "_exception_raise_state", "_exception_raise_state_identity"})
+            reg(n, reinterpret_cast<void*>(&native_kern_failure));
+        reg("_pthread_cond_timedwait_relative_np", reinterpret_cast<void*>(&native_cond_timedwait_relative_np));
+    }
     g_custom_shims["_dispatch_retain"] = reinterpret_cast<void*>(&native_dispatch_retain);
     g_custom_shims["_dispatch_resume"] = reinterpret_cast<void*>(&native_dispatch_resume);
     g_custom_shims["_dispatch_suspend"] = reinterpret_cast<void*>(&native_dispatch_suspend);
