@@ -227,3 +227,84 @@ g_mmap_capture:
 .hidden g_mmap_capture_count
 g_mmap_capture_count:
     .zero 8
+
+// ---------------------------------------------------------------------------
+// Objective-C message dispatch for guest classes (see src/objc_runtime.hpp).
+//   objc_msgSend_guest:      x0 = receiver, x1 = selector. If the receiver is a guest class/instance with a matching
+//                            method, tail-jump to its IMP (all argument registers and lr untouched). Otherwise
+//                            tail-call objc_fallback_c(x0..x7), the fake-Foundation / nil-message path.
+//   objc_msgSendSuper2_guest: x0 = &objc_super{receiver, current_class}; lookup starts at the current class's super.
+// Both are bound directly as the imports, so the guest's lr/sp stay in place for the IMP.
+// ---------------------------------------------------------------------------
+.text
+.balign 16
+.globl objc_msgSend_guest
+.type objc_msgSend_guest, %function
+objc_msgSend_guest:
+    hint #34
+    cbz x0, 1f
+    stp x29, x30, [sp, #-224]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    str x8, [sp, #80]
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    bl objc_lookup_imp_c
+    mov x16, x0
+    ldp q6, q7, [sp, #192]
+    ldp q4, q5, [sp, #160]
+    ldp q2, q3, [sp, #128]
+    ldp q0, q1, [sp, #96]
+    ldr x8, [sp, #80]
+    ldp x6, x7, [sp, #64]
+    ldp x4, x5, [sp, #48]
+    ldp x2, x3, [sp, #32]
+    ldp x0, x1, [sp, #16]
+    ldp x29, x30, [sp], #224
+    cbz x16, 2f
+    br x16
+2:  b objc_fallback_c
+1:  mov x0, #0
+    mov x1, #0
+    movi v0.2d, #0
+    movi v1.2d, #0
+    ret
+.size objc_msgSend_guest, .-objc_msgSend_guest
+
+.globl objc_msgSendSuper2_guest
+.type objc_msgSendSuper2_guest, %function
+objc_msgSendSuper2_guest:
+    hint #34
+    stp x29, x30, [sp, #-224]!
+    mov x29, sp
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    str x8, [sp, #80]
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    bl objc_lookup_super_imp_c
+    mov x16, x0
+    ldp q6, q7, [sp, #192]
+    ldp q4, q5, [sp, #160]
+    ldp q2, q3, [sp, #128]
+    ldp q0, q1, [sp, #96]
+    ldr x8, [sp, #80]
+    ldp x6, x7, [sp, #64]
+    ldp x4, x5, [sp, #48]
+    ldp x2, x3, [sp, #32]
+    ldp x0, x1, [sp, #16]
+    ldp x29, x30, [sp], #224
+    ldr x0, [x0]            // receiver out of the objc_super struct
+    cbz x16, 2f
+    br x16
+2:  b objc_fallback_c
+.size objc_msgSendSuper2_guest, .-objc_msgSendSuper2_guest

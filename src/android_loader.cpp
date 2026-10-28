@@ -23,6 +23,7 @@
 
 #include "shim_types.hpp"
 #include "guest_fde.hpp"
+#include "objc_runtime.hpp"
 
 // Thread-local Apple TSD block (512 64-bit slots = 4096 bytes per thread)
 alignas(64) __thread uint64_t g_apple_tsd[512] = {0};
@@ -1530,6 +1531,12 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
 // Returns true if the message was answered.
 static bool fake_foundation(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
+    if (self && self->kind == 5) {      // generic foreign object (NSMutableArray, UIView, ...): inert, answers nil/0
+        bool keep = sel.compare(0, 4, "init") == 0 || sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" ||
+                    sel == "mutableCopy" || sel == "alloc";
+        frame.ret_x0 = keep ? frame.x[0] : 0;
+        return true;
+    }
     if (self && self->kind == 3) {
         if (fake_metal_message(frame, sel)) return true;
         frame.ret_x0 = 0;
@@ -2084,6 +2091,121 @@ int32_t native_au_stop(void* u) {
 }
 } // extern "C"
 
+
+// ---------------------------------------------------------------------------
+// Objective-C runtime glue: called from objc_msgSend_guest / objc_msgSendSuper2_guest (trampolines.s).
+// ---------------------------------------------------------------------------
+extern "C" void objc_msgSend_guest();
+extern "C" void objc_msgSendSuper2_guest();
+extern "C" uint64_t objc_lookup_imp_c(uint64_t recv, const char* sel) { return objcrt::lookup_imp(recv, sel); }
+extern "C" uint64_t objc_lookup_super_imp_c(uint64_t sup, const char* sel) { return objcrt::lookup_super_imp(sup, sel); }
+
+static uint64_t objc_send_noargs(uint64_t obj, const char* sel) {
+    uint64_t imp = objcrt::lookup_imp(obj, sel);
+    if (!imp) return obj;
+    return reinterpret_cast<uint64_t (*)(uint64_t, const char*)>(imp)(obj, objcrt::intern(sel));
+}
+
+extern "C" uint64_t objc_fallback_c(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7) {
+    const char* sel = reinterpret_cast<const char*>(x1);
+    std::string s = sel ? sel : "";
+    bool is_cls = false;
+    if (objcrt::GClass* gc = objcrt::guest_class_for_object(x0, &is_cls)) {
+        if (is_cls) {   // class receiver
+            if (s == "alloc" || s == "allocWithZone:") return objcrt::alloc_instance(gc);
+            if (s == "new") return objc_send_noargs(objcrt::alloc_instance(gc), "init");
+            if (s == "class" || s == "self" || s == "retain" || s == "autorelease") return x0;
+            if (s == "initialize" || s == "load" || s == "release") return 0;
+            if (s == "respondsToSelector:") return objcrt::lookup_imp(x0, reinterpret_cast<const char*>(x2)) != 0;
+        } else {        // instance receiver
+            if (s.compare(0, 4, "init") == 0 || s == "retain" || s == "autorelease" || s == "self" || s == "copy" ||
+                s == "mutableCopy" || s == "copyWithZone:" || s == "retainAutorelease") return x0;
+            if (s == "release" || s == "dealloc" || s == "performSelector:") return 0;
+            if (s == "class") return gc->addr;
+            if (s == "isEqual:") return x0 == x2;
+            if (s == "hash") return x0;
+            if (s == "isKindOfClass:" || s == "isMemberOfClass:") {
+                bool c2 = false;
+                objcrt::GClass* t = objcrt::guest_class_for_object(x2, &c2);
+                return t && c2 && objcrt::is_kind_of(gc, t);
+            }
+            if (s == "respondsToSelector:") return objcrt::lookup_imp(x0, reinterpret_cast<const char*>(x2)) != 0;
+        }
+    }
+    CallFrame f{};
+    f.x[0] = x0; f.x[1] = x1; f.x[2] = x2; f.x[3] = x3; f.x[4] = x4; f.x[5] = x5; f.x[6] = x6; f.x[7] = x7;
+    shim_objc_msgSend(f, nullptr);
+    return f.ret_x0;
+}
+
+extern "C" {
+uint64_t native_objc_alloc(uint64_t cls) {
+    bool is_cls = false;
+    if (objcrt::GClass* gc = objcrt::guest_class_for_object(cls, &is_cls))
+        if (is_cls) return objcrt::alloc_instance(gc);
+    return fake_make(5, "obj");
+}
+uint64_t native_objc_alloc_init(uint64_t cls) { return objc_send_noargs(native_objc_alloc(cls), "init"); }
+uint64_t native_objc_identity(uint64_t x) { return x; }
+void native_objc_noop() {}
+void native_objc_store_strong(uint64_t* addr, uint64_t v) { if (addr) *addr = v; }
+uint64_t native_objc_load_weak(uint64_t* addr) { return addr ? *addr : 0; }
+uint64_t native_objc_store_weak(uint64_t* addr, uint64_t v) { if (addr) *addr = v; return v; }
+void native_objc_copy_weak(uint64_t* to, uint64_t* from) { if (to) *to = from ? *from : 0; }
+uint64_t native_objc_get_property(uint64_t self, void*, int64_t off, bool) { return self ? *reinterpret_cast<uint64_t*>(self + off) : 0; }
+void native_objc_set_property(uint64_t self, void*, uint64_t v, int64_t off) { if (self) *reinterpret_cast<uint64_t*>(self + off) = v; }
+uint64_t native_objc_opt_class(uint64_t o) {
+    bool is_cls = false;
+    objcrt::GClass* gc = objcrt::guest_class_for_object(o, &is_cls);
+    return gc ? gc->addr : 0;
+}
+uint64_t native_objc_opt_is_kind_of(uint64_t o, uint64_t cls) {
+    bool oc = false, tc = false;
+    objcrt::GClass* gc = objcrt::guest_class_for_object(o, &oc);
+    objcrt::GClass* t = objcrt::guest_class_for_object(cls, &tc);
+    return gc && t && objcrt::is_kind_of(gc, t);
+}
+uint64_t native_objc_opt_responds(uint64_t o, const char* sel) { return sel && objcrt::lookup_imp(o, sel) != 0; }
+uint64_t native_objc_get_class(const char* name) {
+    if (!name) return 0;
+    if (objcrt::GClass* gc = objcrt::find_class_by_name(name)) return gc->addr;
+    return reinterpret_cast<uint64_t>(native_nsclass_from_string(reinterpret_cast<void*>(fake_make(2, name))));
+}
+uint64_t native_object_get_class(uint64_t o) { return native_objc_opt_class(o); }
+const char* native_sel_register(const char* n) { return n ? objcrt::intern(n) : nullptr; }
+void native_objc_copy_struct(void* dst, const void* src, size_t n, bool, bool) { if (dst && src) std::memcpy(dst, src, n); }
+}
+
+static void register_objc_runtime_natives() {
+    auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
+    reg("_objc_msgSend", reinterpret_cast<void*>(&objc_msgSend_guest));
+    reg("_objc_msgSendSuper2", reinterpret_cast<void*>(&objc_msgSendSuper2_guest));
+    for (const char* n : {"_objc_alloc", "_objc_allocWithZone"}) reg(n, reinterpret_cast<void*>(&native_objc_alloc));
+    for (const char* n : {"_objc_alloc_init", "_objc_opt_new"}) reg(n, reinterpret_cast<void*>(&native_objc_alloc_init));
+    for (const char* n : {"_objc_retain", "_objc_retainAutoreleasedReturnValue", "_objc_retainAutorelease",
+                          "_objc_retainAutoreleaseReturnValue", "_objc_autorelease", "_objc_autoreleaseReturnValue",
+                          "_objc_unsafeClaimAutoreleasedReturnValue", "_objc_retainBlock", "__Block_copy"})
+        reg(n, reinterpret_cast<void*>(&native_objc_identity));
+    for (const char* n : {"_objc_release", "_objc_destroyWeak", "__Block_release", "_objc_enumerationMutation"})
+        reg(n, reinterpret_cast<void*>(&native_objc_noop));
+    reg("_objc_storeStrong", reinterpret_cast<void*>(&native_objc_store_strong));
+    for (const char* n : {"_objc_loadWeakRetained", "_objc_loadWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_load_weak));
+    for (const char* n : {"_objc_storeWeak", "_objc_initWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_store_weak));
+    for (const char* n : {"_objc_copyWeak", "_objc_moveWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_copy_weak));
+    reg("_objc_getProperty", reinterpret_cast<void*>(&native_objc_get_property));
+    for (const char* n : {"_objc_setProperty_atomic", "_objc_setProperty_nonatomic", "_objc_setProperty_atomic_copy",
+                          "_objc_setProperty_nonatomic_copy"})
+        reg(n, reinterpret_cast<void*>(&native_objc_set_property));
+    reg("_objc_opt_class", reinterpret_cast<void*>(&native_objc_opt_class));
+    reg("_objc_opt_isKindOfClass", reinterpret_cast<void*>(&native_objc_opt_is_kind_of));
+    reg("_objc_opt_respondsToSelector", reinterpret_cast<void*>(&native_objc_opt_responds));
+    for (const char* n : {"_objc_getClass", "_objc_lookUpClass", "_objc_getRequiredClass"})
+        reg(n, reinterpret_cast<void*>(&native_objc_get_class));
+    reg("_object_getClass", reinterpret_cast<void*>(&native_object_get_class));
+    reg("_sel_registerName", reinterpret_cast<void*>(&native_sel_register));
+    reg("_objc_copyStruct", reinterpret_cast<void*>(&native_objc_copy_struct));
+}
+
 static void register_darwin_framework_stubs() {
     auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
     reg("_CFRetain", reinterpret_cast<void*>(&native_cf_retain));
@@ -2241,6 +2363,7 @@ static void init_custom_shims() {
             reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
             reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
             register_darwin_framework_stubs();
+            if (!getenv("LOADER_NO_OBJC_RT")) register_objc_runtime_natives();
         }
         reg("___tolower", reinterpret_cast<void*>(&native_tolower));
         reg("___toupper", reinterpret_cast<void*>(&native_toupper));
@@ -2669,6 +2792,7 @@ int main(int argc, char** argv) {
     uint32_t lazy_off = 0, lazy_size = 0;
     uint32_t export_off = 0, export_size = 0;
     uint64_t unwind_info_vm = 0, unwind_info_size = 0, eh_frame_vm = 0, eh_frame_size = 0;
+    uint64_t objc_classlist_vm = 0, objc_classlist_size = 0, objc_catlist_vm = 0, objc_catlist_size = 0, objc_methname_vm = 0, objc_methname_size = 0;
 
     for (uint32_t i = 0; i < ncmds; ++i) {
         uint32_t cmd = *reinterpret_cast<uint32_t*>(file_data + cur);
@@ -2689,6 +2813,9 @@ int main(int argc, char** argv) {
                 uint64_t ssize = *reinterpret_cast<const uint64_t*>(sp + 40);
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__unwind_info", 16) == 0) { unwind_info_vm = saddr; unwind_info_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__eh_frame", 16) == 0) { eh_frame_vm = saddr; eh_frame_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_classlist", 16) == 0) { objc_classlist_vm = saddr; objc_classlist_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_catlist", 16) == 0) { objc_catlist_vm = saddr; objc_catlist_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_methname", 16) == 0) { objc_methname_vm = saddr; objc_methname_size = ssize; }
             }
         } else if (cmd == 0x22 || cmd == 0x80000022) { // LC_DYLD_INFO
             rebase_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
@@ -3103,6 +3230,18 @@ int main(int argc, char** argv) {
     if (const char* eng = getenv("LOADER_ENGINE")) {
         typedef void (*engine_init_fn)(const char*);
         typedef void (*engine_pre_fn)();
+        // Register the guest's own Objective-C classes/categories so messages reach their real method implementations.
+        if (!getenv("LOADER_NO_OBJC_RT") && objc_classlist_vm) {
+            auto rt = [&](uint64_t vm) { return reinterpret_cast<uint64_t>(image_base) + (vm - min_vm); };
+            objcrt::init(reinterpret_cast<uint64_t>(image_base), reinterpret_cast<uint64_t>(image_base) + total_vmsize,
+                         rt(objc_classlist_vm), objc_classlist_size, objc_catlist_vm ? rt(objc_catlist_vm) : 0, objc_catlist_size,
+                         objc_methname_vm ? rt(objc_methname_vm) : 0, objc_methname_size,
+                         [&](uint64_t slot) -> const char* {
+                             for (const auto& b : g_binds)
+                                 if (b.loc == slot) return b.symbol;
+                             return nullptr;
+                         });
+        }
         // LOADER_PEEK=0x2bf5700,0x2b59340: print the 8-byte value at image offsets, the segment it lives in,
         // and the import it was bound to (if any).
         if (const char* peek = getenv("LOADER_PEEK")) {
