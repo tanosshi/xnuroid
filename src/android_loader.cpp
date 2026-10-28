@@ -528,17 +528,153 @@ extern "C" void native_dispatch_sync(void* queue, void (*work)(void*)) { if (wor
 extern "C" void native_dispatch_release(void* obj) {}
 
 // Engine-mode pthread_create wrapper: logs the result and the lifetime of every guest thread.
+struct MachThread;
+static MachThread* mach_register_current();
+static void mach_unregister_current();
 struct GuestThreadStart { void* (*fn)(void*); void* arg; int id; };
 static std::atomic<int> g_thread_seq{0};
 static void* guest_thread_tramp(void* p) {
     GuestThreadStart st = *static_cast<GuestThreadStart*>(p);
     free(p);
     static const bool log = getenv("LOADER_LOG_THREADS") != nullptr;
+    mach_register_current();
     if (log) fprintf(stderr, "[THREADS] #%d started: fn=%p arg=%p\n", st.id, reinterpret_cast<void*>(st.fn), st.arg);
     void* r = st.fn(st.arg);
     if (log) fprintf(stderr, "[THREADS] #%d returned %p\n", st.id, r);
+    mach_unregister_current();
     return r;
 }
+
+// ---------------------------------------------------------------------------
+// Mach thread emulation (engine mode). IL2CPP's Boehm GC stops the world on Apple platforms with task_threads /
+// thread_suspend / thread_get_state / thread_resume. Here a thread's "port" is its tid; suspend is a SIGUSR1 whose
+// handler records the interrupted registers and parks the thread until resume.
+// ---------------------------------------------------------------------------
+#include <semaphore.h>
+#include <sys/syscall.h>
+struct MachThread {
+    uint32_t port = 0;
+    pid_t tid = 0;
+    pthread_t pt{};
+    sem_t resume;
+    volatile int suspended = 0;
+    int suspend_count = 0;
+    uint64_t regs[31] = {};
+    uint64_t sp = 0, pc = 0;
+    uint32_t cpsr = 0;
+};
+static std::mutex g_mt_mu;
+static std::vector<MachThread*> g_mt;
+static thread_local MachThread* t_mach_self = nullptr;
+static bool g_mt_signal_installed = false;
+
+static void mach_suspend_handler(int, siginfo_t*, void* ctx) {
+    MachThread* me = t_mach_self;
+    if (!me) return;
+    ucontext_t* uc = reinterpret_cast<ucontext_t*>(ctx);
+    for (int i = 0; i < 31; ++i) me->regs[i] = uc->uc_mcontext.regs[i];
+    me->sp = uc->uc_mcontext.sp;
+    me->pc = uc->uc_mcontext.pc;
+    me->cpsr = static_cast<uint32_t>(uc->uc_mcontext.pstate);
+    me->suspended = 1;
+    while (sem_wait(&me->resume) != 0 && errno == EINTR) {}
+    me->suspended = 0;
+}
+static MachThread* mach_register_current() {
+    if (t_mach_self) return t_mach_self;
+    auto* m = new MachThread();
+    m->tid = static_cast<pid_t>(syscall(SYS_gettid));
+    m->port = static_cast<uint32_t>(m->tid);
+    m->pt = pthread_self();
+    sem_init(&m->resume, 0, 0);
+    t_mach_self = m;
+    std::lock_guard<std::mutex> l(g_mt_mu);
+    if (!g_mt_signal_installed) {
+        struct sigaction sa{};
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sa.sa_sigaction = mach_suspend_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, nullptr);
+        g_mt_signal_installed = true;
+    }
+    g_mt.push_back(m);
+    return m;
+}
+static void mach_unregister_current() {
+    if (!t_mach_self) return;
+    std::lock_guard<std::mutex> l(g_mt_mu);
+    for (size_t i = 0; i < g_mt.size(); ++i) if (g_mt[i] == t_mach_self) { g_mt.erase(g_mt.begin() + i); break; }
+    t_mach_self = nullptr;   // MachThread leaks on purpose: a late signal must never touch freed memory
+}
+static MachThread* mach_find(uint32_t port) {
+    std::lock_guard<std::mutex> l(g_mt_mu);
+    for (MachThread* m : g_mt) if (m->port == port) return m;
+    return nullptr;
+}
+extern "C" {
+uint32_t native_mach_thread_self_real() { return mach_register_current()->port; }
+uint32_t native_pthread_mach_thread_np_real(pthread_t t) {
+    if (pthread_equal(t, pthread_self())) return mach_register_current()->port;
+    std::lock_guard<std::mutex> l(g_mt_mu);
+    for (MachThread* m : g_mt) if (pthread_equal(m->pt, t)) return m->port;
+    return 0;
+}
+int native_task_threads(uint32_t, uint32_t** list, uint32_t* count) {
+    mach_register_current();
+    std::lock_guard<std::mutex> l(g_mt_mu);
+    auto* arr = static_cast<uint32_t*>(malloc(sizeof(uint32_t) * (g_mt.size() ? g_mt.size() : 1)));
+    for (size_t i = 0; i < g_mt.size(); ++i) arr[i] = g_mt[i]->port;
+    *list = arr;
+    *count = static_cast<uint32_t>(g_mt.size());
+    return 0;
+}
+int native_thread_suspend(uint32_t port) {
+    MachThread* m = mach_find(port);
+    if (!m || m == t_mach_self) return 4;   // KERN_INVALID_ARGUMENT
+    bool signal_it;
+    {
+        std::lock_guard<std::mutex> l(g_mt_mu);
+        signal_it = (m->suspend_count++ == 0);
+    }
+    if (!signal_it) return 0;
+    syscall(SYS_tgkill, getpid(), m->tid, SIGUSR1);
+    for (int i = 0; i < 40000 && !m->suspended; ++i) usleep(50);   // up to 2 s
+    return m->suspended ? 0 : 5;
+}
+int native_thread_resume(uint32_t port) {
+    MachThread* m = mach_find(port);
+    if (!m) return 4;
+    bool post = false;
+    {
+        std::lock_guard<std::mutex> l(g_mt_mu);
+        if (m->suspend_count > 0 && --m->suspend_count == 0) post = true;
+    }
+    if (post) sem_post(&m->resume);
+    return 0;
+}
+// flavor 6 = ARM_THREAD_STATE64: x[29], fp, lr, sp, pc (8 bytes each), cpsr, pad (4 each) = 68 words
+int native_thread_get_state(uint32_t port, int flavor, uint32_t* state, uint32_t* count) {
+    MachThread* m = mach_find(port);
+    if (!m || flavor != 6 || !state || !count || *count < 68) return 5;
+    if (!m->suspended && m != t_mach_self) return 5;
+    uint64_t* w = reinterpret_cast<uint64_t*>(state);
+    if (m == t_mach_self) {   // querying the caller itself: approximate with current sp
+        std::memset(state, 0, 68 * 4);
+        w[31] = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+    } else {
+        for (int i = 0; i < 29; ++i) w[i] = m->regs[i];
+        w[29] = m->regs[29];   // fp
+        w[30] = m->regs[30];   // lr
+        w[31] = m->sp;
+        w[32] = m->pc;
+        state[66] = m->cpsr;
+        state[67] = 0;
+    }
+    *count = 68;
+    return 0;
+}
+}
+
 extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg) {
     auto* st = static_cast<GuestThreadStart*>(malloc(sizeof(GuestThreadStart)));
     st->fn = fn; st->arg = arg; st->id = ++g_thread_seq;
@@ -2601,6 +2737,12 @@ static void init_custom_shims() {
     {
         auto reg = [](const char* n, void* f) { g_custom_shims[n] = f; };
         if (getenv("LOADER_ENGINE")) {   // engine mode only: keep the default run on plain bionic dlopen/dlsym
+            reg("_mach_thread_self", reinterpret_cast<void*>(&native_mach_thread_self_real));
+            reg("_pthread_mach_thread_np", reinterpret_cast<void*>(&native_pthread_mach_thread_np_real));
+            reg("_task_threads", reinterpret_cast<void*>(&native_task_threads));
+            reg("_thread_suspend", reinterpret_cast<void*>(&native_thread_suspend));
+            reg("_thread_resume", reinterpret_cast<void*>(&native_thread_resume));
+            reg("_thread_get_state", reinterpret_cast<void*>(&native_thread_get_state));
             reg("_dlopen", reinterpret_cast<void*>(&native_guest_dlopen));
             reg("_dlsym", reinterpret_cast<void*>(&native_guest_dlsym));
             reg("_pthread_create", reinterpret_cast<void*>(&native_pthread_create_logged));
@@ -2721,6 +2863,16 @@ static void init_custom_shims() {
     g_custom_shims["_kCFLocaleLanguageCode"] = &g_kCFLocaleLanguageCode;
     g_custom_shims["_kCFLocaleScriptCode"] = &g_kCFLocaleScriptCode;
     g_custom_shims["_kCFTypeArrayCallBacks"] = &g_kCFTypeArrayCallBacks;
+
+    // Engine mode: Mach thread emulation must override the earlier KERN_FAILURE stubs and constant-port versions.
+    if (getenv("LOADER_ENGINE")) {
+        g_custom_shims["_mach_thread_self"] = reinterpret_cast<void*>(&native_mach_thread_self_real);
+        g_custom_shims["_pthread_mach_thread_np"] = reinterpret_cast<void*>(&native_pthread_mach_thread_np_real);
+        g_custom_shims["_task_threads"] = reinterpret_cast<void*>(&native_task_threads);
+        g_custom_shims["_thread_suspend"] = reinterpret_cast<void*>(&native_thread_suspend);
+        g_custom_shims["_thread_resume"] = reinterpret_cast<void*>(&native_thread_resume);
+        g_custom_shims["_thread_get_state"] = reinterpret_cast<void*>(&native_thread_get_state);
+    }
 
     // Apple-ABI std::string shims
     extern void register_apple_string_shims(std::unordered_map<std::string, void*>& shims);
@@ -3547,6 +3699,7 @@ int main(int argc, char** argv) {
     if (const char* eng = getenv("LOADER_ENGINE")) {
         typedef void (*engine_init_fn)(const char*);
         typedef void (*engine_pre_fn)();
+        mach_register_current();   // the main thread must be in the Mach thread table before the GC asks for it
         // Register the guest's own Objective-C classes/categories so messages reach their real method implementations.
         if (!getenv("LOADER_NO_OBJC_RT") && objc_classlist_vm) {
             auto rt = [&](uint64_t vm) { return reinterpret_cast<uint64_t>(image_base) + (vm - min_vm); };
