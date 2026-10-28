@@ -130,14 +130,28 @@ if (Test-Path $matrix) {
     }
 }
 if ($runs.Count -eq 0) { $runs = @( @{ name = "1_default"; env = "" } ) }
+& $adb shell svc power stayon true | Out-Null
+& $adb shell input keyevent KEYCODE_WAKEUP | Out-Null
 $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add("run_phases $stamp  commit: $(git rev-parse --short HEAD)")
 foreach ($r in $runs) {
     $n = $r.name
     Write-Host "=== $n ($($r.env)) ==="
     & $adb logcat -c
-    $cmd = 'cd /data/local/tmp; ' + $r.env + ' timeout 240 ./xnuroid_loader >run_' + $n + '.out 2>run_' + $n + '.err; echo EXIT=$?'
-    $exit = (& $adb shell $cmd | Select-Object -Last 1)
+    # Run detached on the phone (a dropped wireless-adb connection must not kill the test) and poll for the exit file.
+    $sh = "cd /data/local/tmp`n" + $r.env + " timeout 240 ./xnuroid_loader > run_$n.out 2> run_$n.err`necho EXIT=`$? > run_$n.exit`n"
+    $tmpSh = Join-Path $env:TEMP "run_$n.sh"
+    [System.IO.File]::WriteAllText($tmpSh, $sh)
+    & $adb shell "rm -f /data/local/tmp/run_$n.exit" | Out-Null
+    & $adb push $tmpSh "/data/local/tmp/run_$n.sh" | Out-Null
+    & $adb shell "nohup sh /data/local/tmp/run_$n.sh >/dev/null 2>&1 &" | Out-Null
+    $exit = ""
+    for ($i = 0; $i -lt 180; $i++) {
+        Start-Sleep -Seconds 2
+        $o = (& $adb shell "cat /data/local/tmp/run_$n.exit 2>/dev/null") 2>$null
+        if ($o -match "EXIT=") { $exit = ($o | Select-Object -Last 1).Trim(); break }
+    }
+    if (-not $exit) { $exit = "EXIT=?(timeout waiting for device)" }
     & $adb pull "/data/local/tmp/run_$n.out" (Join-Path $logs "$n.out") 2>&1 | Out-Null
     & $adb pull "/data/local/tmp/run_$n.err" (Join-Path $logs "$n.err") 2>&1 | Out-Null
     & $adb logcat -d -t 600 | Out-File -Encoding utf8 (Join-Path $logs "$n.logcat")
@@ -150,6 +164,7 @@ foreach ($r in $runs) {
     $poison = (Select-String -Path (Join-Path $logs "$n.err") -Pattern 'POISON' -ErrorAction SilentlyContinue | Measure-Object).Count
     $summary.Add("poison lines in stderr: $poison")
 }
+& $adb shell svc power stayon false | Out-Null
 $summary | Out-File -Encoding utf8 (Join-Path $logs "SUMMARY.txt")
 Write-Host ""
 Write-Host "Done. Logs: $logs"
