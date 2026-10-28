@@ -2567,6 +2567,27 @@ int main(int argc, char** argv) {
     auto il2cpp_class_get_name = reinterpret_cast<il2cpp_class_get_name_fn>(get_fn(0xbdef1c));
     auto il2cpp_string_new = reinterpret_cast<il2cpp_string_new_fn>(get_fn(0xbdfdcc));
 
+    // Engine stage (opt-in): let Unity's own startup code run instead of our manual il2cpp boot.
+    //   LOADER_ENGINE=1  UnityInitApplicationNoGraphics("/data/local/tmp/game")           (image+0x7cc3d4)
+    //   LOADER_ENGINE=2  same, preceded by the startup helper didFinishLaunching calls first (image+0x7cde30)
+    // Offsets come from macho_objc.py's static scan of -[UnityAppController application:didFinishLaunchingWithOptions:];
+    // the argument list of each function is a guess until the disassembly dumps are read.
+    if (const char* eng = getenv("LOADER_ENGINE")) {
+        typedef void (*engine_init_fn)(const char*);
+        typedef void (*engine_pre_fn)();
+        printf("\n=== ENGINE STAGE (LOADER_ENGINE=%s) ===\n", eng);
+        fflush(stdout);
+        if (std::strcmp(eng, "2") == 0) {
+            printf("[E1] startup helper image+0x7cde30()...\n"); fflush(stdout);
+            reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
+            printf("[E1] returned\n"); fflush(stdout);
+        }
+        printf("[E2] UnityInitApplicationNoGraphics(\"/data/local/tmp/game\") image+0x7cc3d4...\n"); fflush(stdout);
+        reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))("/data/local/tmp/game");
+        printf("[E2] returned: engine init without graphics completed\n"); fflush(stdout);
+        return 0;
+    }
+
     printf("\n=== EXECUTING HEADLESS IL2CPP BOOT ON S24+ ===\n");
 
     printf("[1/5] Registering log callback...\n");
