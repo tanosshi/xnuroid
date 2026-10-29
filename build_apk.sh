@@ -17,6 +17,7 @@ GLUE=$NDK/sources/android/native_app_glue
 PKG=com.tanosshi.xnuroid
 OUT=build/apk
 
+rm -rf "$OUT"
 mkdir -p "$OUT/lib/arm64-v8a"
 
 "$CC" -c -O2 -fPIC -I"$GLUE" "$GLUE/android_native_app_glue.c" -o build/native_app_glue.o
