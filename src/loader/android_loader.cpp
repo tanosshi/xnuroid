@@ -246,7 +246,7 @@ static int describe_addr(int fd, uint64_t a, bool is_return_addr = false) {
         const char* bn = base_name(di.dli_fname);
         int kind = 0;
         const char* tag = "other";
-        if (std::strstr(di.dli_fname, "xnuroid")) { tag = "loader"; kind = 3; }
+        if (std::strstr(di.dli_fname, "libxnuroid.so") || std::strstr(di.dli_fname, "xnuroid_loader")) { tag = "loader"; kind = 3; }
         else if (std::strcmp(bn, "libc.so") == 0) { tag = "libc"; kind = 4; }
         else if (std::strstr(bn, "libc++")) { tag = "libc++"; kind = 5; }
         wr_str(fd, "["); wr_str(fd, tag); wr_str(fd, "] ");
@@ -2987,7 +2987,7 @@ static void segv_handler(int sig, siginfo_t* info, void* ctx) {
     if (f) {
         char line[512];
         while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "xnuroid") || strstr(line, "Unity") || strstr(line, "libc++") || strstr(line, "bionic")) {
+            if (strstr(line, "libxnuroid.so") || strstr(line, "xnuroid_loader") || strstr(line, "Unity") || strstr(line, "libc++") || strstr(line, "bionic")) {
                 fprintf(stderr, "  %s", line);
             }
         }
