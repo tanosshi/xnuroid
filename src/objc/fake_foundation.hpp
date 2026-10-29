@@ -450,9 +450,9 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
             if (sel == "batteryLevel") { objc_ret_float(1.0f); return true; }
             if (sel == "batteryState") { frame.ret_x0 = 2; return true; }
         } else if (cls == "UIScreen") {
-            if (sel == "bounds" || sel == "applicationFrame") { objc_ret_rect(0, 0, 360, 780); return true; }
-            if (sel == "nativeBounds") { objc_ret_rect(0, 0, 1080, 2340); return true; }
-            if (sel == "scale" || sel == "nativeScale") { objc_ret_double(3.0); return true; }
+            if (sel == "bounds" || sel == "applicationFrame") { objc_ret_rect(0, 0, screen::kWidth, screen::g_height); return true; }
+            if (sel == "nativeBounds") { objc_ret_rect(0, 0, screen::kWidth * screen::kScale, screen::g_height * screen::kScale); return true; }
+            if (sel == "scale" || sel == "nativeScale") { objc_ret_double(screen::kScale); return true; }
             if (sel == "maximumFramesPerSecond") { frame.ret_x0 = 60; return true; }
             if (sel == "brightness") { objc_ret_double(0.5); return true; }
         } else if (cls == "UIApplication") {

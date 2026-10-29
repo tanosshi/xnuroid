@@ -29,7 +29,7 @@ inline uint64_t send(uint64_t o, const char* s, uint64_t a, uint64_t b) {
 inline uint64_t send_sel(uint64_t o, const char* sel_ptr, uint64_t a) { return reinterpret_cast<Send1>(&objc_msgSend_guest)(o, sel_ptr, a); }
 inline bool guest_implements(uint64_t o, const char* s) { return objcrt::lookup_imp(o, s) != 0; }
 
-constexpr double kScreenW = 360, kScreenH = 780, kScreenScale = 3.0;   // points; 1080x2340 pixels
+constexpr double kScreenW = screen::kWidth, kScreenScale = screen::kScale;
 
 inline double getd(FakeObjcObj* o, const std::string& k, double def) {
     auto it = o->props.find(k + "#d");
@@ -246,7 +246,7 @@ inline uint64_t controller_view(uint64_t vc, FakeObjcObj* st) {
     if (!getp(st, "view")) {
         uint64_t v = fake_make(8, "UIView");
         FakeObjcObj* vs = fake_lookup(v);
-        vs->rect[2] = kScreenW; vs->rect[3] = kScreenH;
+        vs->rect[2] = kScreenW; vs->rect[3] = screen::g_height;
         st->props["view"] = v;
         vs->props["#viewController"] = vc;
     }
@@ -264,7 +264,7 @@ inline uint64_t next_drawable(uint64_t layer, FakeObjcObj* ls) {
         FakeObjcObj* vs = view ? ui_state(view) : nullptr;
         double sc = getd(ls, "contentsScale", 1.0);
         w = (vs ? vs->rect[2] : kScreenW) * sc;
-        h = (vs ? vs->rect[3] : kScreenH) * sc;
+        h = (vs ? vs->rect[3] : screen::g_height) * sc;
     }
     uint64_t pf = ls->props.count("pixelFormat") ? ls->props["pixelFormat"] : 80;   // MTLPixelFormatBGRA8Unorm
     uint64_t key = (static_cast<uint64_t>(w) << 32) ^ (static_cast<uint64_t>(h) << 8) ^ pf;
@@ -516,7 +516,12 @@ inline bool view_message(CallFrame& frame, uint64_t self, FakeObjcObj* st, const
         return true;
     }
     if (sel == "layoutSubviews") return true;   // UIView's own implementation (guest overrides are dispatched first)
-    if (sel == "safeAreaInsets" || sel == "layoutMargins") { objc_ret_rect(0, 0, 0, 0); frame.ret_x0 = 0; return true; }
+    if (sel == "safeAreaInsets") {
+        objc_ret_rect(screen::g_insets[0], screen::g_insets[1], screen::g_insets[2], screen::g_insets[3]);
+        frame.ret_x0 = 0;
+        return true;
+    }
+    if (sel == "layoutMargins") { objc_ret_rect(0, 0, 0, 0); frame.ret_x0 = 0; return true; }
     if (sel == "screen") { frame.ret_x0 = main_screen(); return true; }
     if (sel == "isHidden") { frame.ret_x0 = getp(st, "hidden"); return true; }
     if (sel == "traitCollection" || sel == "nextResponder" || sel == "gestureRecognizers") { frame.ret_x0 = 0; return true; }
@@ -636,7 +641,7 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         if (sel.size() > 5 && sel.compare(sel.size() - 5, 5, "Value") == 0) { frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(v)); return true; }
     }
     if (c == "UIScreenMode") {
-        if (sel == "size") { objc_ret_rect(kScreenW * kScreenScale, kScreenH * kScreenScale, 0, 0); return true; }
+        if (sel == "size") { objc_ret_rect(kScreenW * kScreenScale, screen::g_height * kScreenScale, 0, 0); return true; }
         if (sel == "pixelAspectRatio") { objc_ret_double(1.0); return true; }
     }
     if (c == "CAMetalDrawable") {
@@ -1071,7 +1076,7 @@ inline bool bundle_message(CallFrame& frame, const std::string& sel) {
         uint64_t v = fake_make(8, "UIView");
         FakeObjcObj* vs = fake_lookup(v);
         vs->rect[2] = kScreenW;
-        vs->rect[3] = kScreenH;
+        vs->rect[3] = screen::g_height;
         frame.ret_x0 = new_array({v});
         return true;
     }
@@ -1139,7 +1144,7 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
         if (sel == "coordinateSpace" || sel == "fixedCoordinateSpace") { frame.ret_x0 = self; return true; }
         if (sel == "setCurrentMode:" || sel == "setOverscanCompensation:" || sel == "setBrightness:") return true;
         if (sel == "mirroredScreen" || sel == "overscanCompensation") { frame.ret_x0 = 0; return true; }
-        if (sel == "bounds") { objc_ret_rect(0, 0, kScreenW, kScreenH); frame.ret_x0 = 0; return true; }
+        if (sel == "bounds") { objc_ret_rect(0, 0, kScreenW, screen::g_height); frame.ret_x0 = 0; return true; }
         return false;
     }
     if (f && f->kind == 6 && f->s == "UIApplication") {
@@ -1341,7 +1346,7 @@ static void deliver_host_touches() {
     for (const HostTouch& t : batch) {
         uint64_t& touch = live[t.id];
         if (t.phase == 0 || !touch) touch = fake_make(8, "UITouch");
-        send_touch(touch, t.phase, t.x * fakeui::kScreenW, t.y * fakeui::kScreenH);
+        send_touch(touch, t.phase, t.x * fakeui::kScreenW, t.y * screen::g_height);
         if (t.phase >= 3) live.erase(t.id);
     }
 }

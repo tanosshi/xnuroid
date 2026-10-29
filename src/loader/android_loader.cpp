@@ -1838,6 +1838,7 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
     frame.ret_x0 = frame.x[0];
 }
 
+#include "screen_metrics.hpp"
 #include "fake_foundation.hpp"
 #include "mtl_gles.hpp"
 #include "fake_uikit.hpp"
