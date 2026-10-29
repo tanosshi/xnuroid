@@ -965,6 +965,7 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
         return true;
     }
     if (sel == "presentDrawable:" || sel == "presentDrawable:afterMinimumDuration:" || sel == "presentDrawable:atTime:") {
+        if (FakeObjcObj* cb = fake_lookup(self)) cb->props["#present"] = frame.x[2];   // captured at commit (mtl_gles.hpp)
         uint64_t n = ++g_presents;
         static const bool stats = getenv("LOADER_DRAW_STATS") != nullptr;
         if (stats && n % 60 == 0) {

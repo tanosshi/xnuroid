@@ -27,6 +27,7 @@
 #include "shim_types.hpp"
 #include "guest_fde.hpp"
 #include "objc_runtime.hpp"
+#include "gles_backend.hpp"
 
 // Thread-local Apple TSD block (512 64-bit slots = 4096 bytes per thread)
 alignas(64) __thread uint64_t g_apple_tsd[512] = {0};
@@ -1796,6 +1797,7 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
 }
 
 #include "fake_foundation.hpp"
+#include "mtl_gles.hpp"
 #include "fake_uikit.hpp"
 
 static void shim_objc_msgSend(CallFrame& frame, void*) {
@@ -3081,6 +3083,7 @@ static void unwinder_probe(uint64_t guest_pc_a, uint64_t guest_pc_b) {
 extern "C" int loader_main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    if (const char* dir = getenv("LOADER_MSL_TEST")) return gles::msl_selftest(dir) == 0 ? 0 : 1;
 
     init_safe_read();
     if (const char* tm = getenv("LOADER_TRACE_DIRECT")) {

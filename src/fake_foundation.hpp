@@ -91,6 +91,8 @@ static void run_block(uint64_t block, uint64_t arg) {
 }
 // Metal objects are property bags: set<Name>: stores, <name> reads back, new*/make* create more bags, buffers own real
 // memory, descriptors carry their values into the textures made from them, command buffers fire their handlers.
+static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcObj* self);   // mtl_gles.hpp
+
 static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
     FakeObjcObj* self = fake_lookup(frame.x[0]);
     auto starts = [&](const char* p) { return sel.compare(0, std::strlen(p), p) == 0; };
@@ -112,6 +114,8 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         static const bool on = getenv("LOADER_DRAW_STATS") != nullptr;
         if (on) ++g_draws_this_frame;
     }
+
+    if (mtl_gles_message(frame, sel, self)) return true;
 
     // class-style constructors for descriptors
     if (sel == "texture2DDescriptorWithPixelFormat:width:height:mipmapped:" || sel == "textureCubeDescriptorWithPixelFormat:size:mipmapped:" ||
@@ -193,10 +197,10 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
             }
             // object-valued properties are created on first read
             static const char* const objprops[] = {"Descriptor", "Attachments", "Attachment", "Layouts", "Attributes", "Descriptors",
-                                                   "Buffers", "Layout", "Options"};
+                                                   "Buffers", "Layout", "Options", "attributes", "layouts"};
             for (const char* suf : objprops) {
                 size_t n = std::strlen(suf);
-                if (sel.size() > n && sel.compare(sel.size() - n, n, suf) == 0) {
+                if (sel.size() >= n && sel.compare(sel.size() - n, n, suf) == 0) {
                     uint64_t h; fake_metal_bag(&h);
                     self->props[sel] = h; frame.ret_x0 = h; return true;
                 }
