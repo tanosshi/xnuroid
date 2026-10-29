@@ -8,6 +8,7 @@
 #pragma once
 
 extern "C" void objc_msgSend_guest();
+extern "C" void host_vibrate(int ms, int amplitude);   // haptics.cpp
 
 namespace fakeui {
 
@@ -49,6 +50,7 @@ inline bool is_stateful_class(const std::string& c) {
         "CALayer", "CAMetalLayer", "CAMetalDrawable", "CADisplayLink", "NSArray", "NSMutableArray", "NSDictionary",
         "NSMutableDictionary", "NSMapTable", "NSNumber", "NSRunLoop", "NSNotificationCenter", "NSUserDefaults",
         "AVAudioSession", "NSAssertionHandler", "NSDate", "NSMutableSet", "NSSet", "NSURL", "NSError", "AVURLAsset", "UITouch", "UIEvent",
+        "UIImpactFeedbackGenerator", "UINotificationFeedbackGenerator", "UISelectionFeedbackGenerator",
         "AVAssetResourceLoader"};
     return k.count(c) != 0;
 }
@@ -647,6 +649,31 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         return true;
     }
     if (c == "NSRunLoop" || c == "NSNotificationCenter") { frame.ret_x0 = 0; return true; }
+    // Haptics: UIKit feedback generators -> device vibration (haptics.cpp)
+    if (c == "UIImpactFeedbackGenerator") {
+        if (sel == "initWithStyle:") { st->props["style"] = frame.x[2]; frame.ret_x0 = frame.x[0]; return true; }
+        if (sel == "impactOccurred" || sel == "impactOccurredWithIntensity:") {
+            // UIImpactFeedbackStyle light, medium, heavy, soft, rigid
+            static const int ms[5] = {12, 20, 30, 15, 10}, amp[5] = {90, 150, 255, 70, 200};
+            uint64_t s = getp(st, "style") < 5 ? getp(st, "style") : 1;
+            double k = sel == "impactOccurred" ? 1.0 : std::clamp(in[0], 0.0, 1.0);
+            host_vibrate(ms[s], std::max(1, static_cast<int>(amp[s] * k)));
+            return true;
+        }
+        if (sel == "prepare") return true;
+    }
+    if (c == "UINotificationFeedbackGenerator") {
+        if (sel == "notificationOccurred:") {   // success, warning, error
+            static const int ms[3] = {40, 60, 90};
+            host_vibrate(ms[frame.x[2] < 3 ? frame.x[2] : 0], 200);
+            return true;
+        }
+        if (sel == "prepare") return true;
+    }
+    if (c == "UISelectionFeedbackGenerator") {
+        if (sel == "selectionChanged") { host_vibrate(8, 80); return true; }
+        if (sel == "prepare") return true;
+    }
     if (c == "UITouch") {
         if (sel == "locationInView:" || sel == "preciseLocationInView:") { objc_ret_rect(getd(st, "x", 0), getd(st, "y", 0), 0, 0); return true; }
         if (sel == "previousLocationInView:" || sel == "precisePreviousLocationInView:") {
