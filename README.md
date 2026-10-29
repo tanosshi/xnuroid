@@ -5,10 +5,10 @@ process. The iOS image is mapped, rebound, and executed natively. Calls into Dar
 pthread, Foundation, UIKit, Metal, and AudioUnit are handled by assembly trampolines, shims, fake
 objects, or translation layers.
 
-This is **not a general-purpose iOS emulator**. Development has targeted one title, MyGame
-1.7.2, on one physical arm64 device. The Android app is the playable host; the command-line build is
-the diagnostic host. Status below reflects the repository history and code; no device run was
-performed during this documentation pass.
+This is **not a general-purpose iOS emulator**. Development has targeted a single commercial Unity
+IL2CPP title on one physical arm64 device. The Android app is the playable host; the command-line
+build is the diagnostic host. Status below reflects the repository history and code; no device run
+was performed during this documentation pass.
 
 ## Status
 
@@ -71,6 +71,20 @@ every function or only offsets listed in a file.
 
 The build scripts hardcode the SDK location as `C:\Users\user\AppData\Local\Android\Sdk`
 (overridable with `ANDROID_SDK`). Edit the version variables if your SDK differs.
+
+### Pointing the analysis scripts at your IPA
+
+The scripts in the repository root read the guest bundle location from
+`game_config.py`, which ships empty. Extract your decrypted IPA and create a
+local, git-ignored `game_config_local.py` beside it:
+
+```python
+GAME_ROOT = "path/to/extracted-ipa"   # folder that contains Payload/
+APP_NAME = "YourApp"                  # YourApp.app lives inside Payload/
+```
+
+You can also set the `LOADER_GAME_DIR` and `LOADER_APP_NAME` environment
+variables instead. `run_phases.ps1` accepts the same folder through `-GameDir`.
 
 ## Build
 

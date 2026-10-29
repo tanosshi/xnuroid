@@ -10,9 +10,9 @@ from macho_runner import MachOBinary, ExecutionHarness, align_up
 import capstone
 import unicorn
 from unicorn import arm64_const as uc_arm64
+from game_config import app_bundle_dir, app_executable_path, unity_framework_path
 
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
-unity_macho = MachOBinary(unity_path)
+unity_macho = MachOBinary(unity_framework_path())
 
 UNITY_BASE = 0x200000000
 
@@ -106,8 +106,8 @@ def shim_dispatch_semaphore_create(h):
 def shim_ns_get_executable_path(h):
     buf = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X0)
     bufsize_ptr = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X1)
-    # Return path to MyGame binary
-    path = "MyGame-v1-7-2/Payload/MyGame.app/MyGame\x00".encode('utf-8')
+    # Return the path to the guest executable
+    path = f"{app_executable_path()}\x00".encode('utf-8')
     if buf == 0:
         h.uc.mem_write(bufsize_ptr, struct.pack("<I", len(path)))
         return -1
@@ -205,9 +205,9 @@ def shim_open(h):
     # Candidate path resolution
     candidates = [
         Path(path),
-        Path("MyGame-v1-7-2/Payload/MyGame.app") / path,
-        Path("MyGame-v1-7-2/Payload/MyGame.app/Data") / path.replace("Data/", ""),
-        Path("MyGame-v1-7-2/Payload/MyGame.app/Data/Managed/Metadata/global-metadata.dat")
+        app_bundle_dir() / path,
+        app_bundle_dir() / "Data" / path.replace("Data/", ""),
+        app_bundle_dir() / "Data" / "Managed" / "Metadata" / "global-metadata.dat",
     ]
 
     for cand in candidates:

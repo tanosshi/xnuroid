@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trap Census: Run real UnityFramework code under Unicorn from MyGame launcher.
+Trap Census: Run real UnityFramework code under Unicorn from the guest launcher.
 Logs every single trap hit during the execution of real engine startup code.
 """
 
@@ -10,12 +10,10 @@ from macho_runner import MachOBinary, ExecutionHarness, align_up
 import capstone
 import unicorn
 from unicorn import arm64_const as uc_arm64
+from game_config import app_executable_path, unity_framework_path
 
-launcher_path = Path("MyGame-v1-7-2/Payload/MyGame.app/MyGame")
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
-
-launcher_macho = MachOBinary(launcher_path)
-unity_macho = MachOBinary(unity_path)
+launcher_macho = MachOBinary(app_executable_path())
+unity_macho = MachOBinary(unity_framework_path())
 
 cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 
@@ -24,7 +22,7 @@ UNITY_BASE = 0x200000000
 
 harness = ExecutionHarness(verbose=False)
 
-# 1. Load MyGame at preferred base 0x100000000
+# 1. Load the guest launcher at its preferred base 0x100000000
 launcher_entry = harness.load_macho(launcher_macho, base_slide=0)
 
 # 2. Load UnityFramework at UNITY_BASE
@@ -188,7 +186,7 @@ def census_msg_send(obj, selector, arg1, arg2):
 
 harness._handle_objc_msg_send = census_msg_send
 
-print("\n[Census] Step 2: Executing MyGame main entry point and dispatching into UnityFramework...")
+print("\n[Census] Step 2: Executing the guest main entry point and dispatching into UnityFramework...")
 census_start_idx = len(census_log)
 harness.execute_from(launcher_entry, max_instructions=100000)
 

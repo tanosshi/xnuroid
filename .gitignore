@@ -1,6 +1,12 @@
 # Game assets and extracted payload (large, user-supplied)
-MyGame-v1-7-2/
+Payload/
 *.ipa
+
+# Local game-path configuration (keeps real paths out of git)
+game_config_local.py
+
+# Generated inspection artifacts (embed local paths and game identifiers)
+inventory.json
 
 # Device library copies
 device_libc++.so

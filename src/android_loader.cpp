@@ -3733,7 +3733,7 @@ extern "C" int loader_main(int argc, char** argv) {
     printf("[+] Total managed classes parsed from global-metadata.dat: %zu\n", total_classes);
 
     printf("\n[5/5] Allocating managed string via il2cpp_string_new...\n");
-    void* str_obj = il2cpp_string_new("Hello from MyGame on Android Galaxy S24+!");
+    void* str_obj = il2cpp_string_new("Hello from the guest app on Android Galaxy S24+!");
     printf("[+] il2cpp_string_new allocated managed object at: %p\n", str_obj);
 
     printf("\n======================================================\n");

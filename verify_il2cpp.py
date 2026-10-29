@@ -15,9 +15,9 @@ from macho_runner import MachOBinary, ExecutionHarness, align_up
 import capstone
 import unicorn
 from unicorn import arm64_const as uc_arm64
+from game_config import app_bundle_dir, app_executable_path, unity_framework_path
 
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
-unity_macho = MachOBinary(unity_path)
+unity_macho = MachOBinary(unity_framework_path())
 
 UNITY_BASE = 0x200000000
 harness = ExecutionHarness(verbose=False)
@@ -111,7 +111,7 @@ def shim_dispatch_semaphore_create(h):
 def shim_ns_get_executable_path(h):
     buf = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X0)
     bufsize_ptr = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X1)
-    path = "MyGame-v1-7-2/Payload/MyGame.app/MyGame\x00".encode('utf-8')
+    path = f"{app_executable_path()}\x00".encode('utf-8')
     if buf == 0:
         h.uc.mem_write(bufsize_ptr, struct.pack("<I", len(path)))
         return -1
@@ -198,9 +198,9 @@ def shim_open(h):
     # Resolution
     candidates = [
         Path(path),
-        Path("MyGame-v1-7-2/Payload/MyGame.app") / path,
-        Path("MyGame-v1-7-2/Payload/MyGame.app/Data") / path.replace("Data/", ""),
-        Path("MyGame-v1-7-2/Payload/MyGame.app/Data/Managed/Metadata/global-metadata.dat")
+        app_bundle_dir() / path,
+        app_bundle_dir() / "Data" / path.replace("Data/", ""),
+        app_bundle_dir() / "Data" / "Managed" / "Metadata" / "global-metadata.dat",
     ]
     for cand in candidates:
         if cand.exists() and cand.is_file():
@@ -382,7 +382,7 @@ if count > 0 and assemblies_array != 0:
         print(f"  {idx+1:2d}. {name:30s} (classes: {class_cnt:4d})")
 
 # Step 6: Test Managed String Allocation
-test_str = harness.allocate_string("MyGame Running via Antigravity!")
+test_str = harness.allocate_string("IL2CPP managed string round-trip OK!")
 managed_str_obj = call_func(UNITY_BASE + 0xbdfdcc, test_str)
 print(f"\n>>> _il2cpp_string_new returned managed string object at {hex(managed_str_obj)}")
 

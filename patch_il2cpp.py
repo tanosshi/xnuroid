@@ -1,3 +1,6 @@
+from game_config import APP_EXECUTABLE, guest_bundle_path
+
+
 def shim_realloc(h):
     ptr = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X0)
     size = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X1)
@@ -17,7 +20,7 @@ def shim_realloc(h):
 def shim_ns_get_executable_path(h):
     buf = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X0)
     bufsize_ptr = h.uc.reg_read(uc_arm64.UC_ARM64_REG_X1)
-    path = "/Payload/MyGame.app/MyGame\x00".encode('utf-8')
+    path = f"{guest_bundle_path()}/{APP_EXECUTABLE}\x00".encode('utf-8')
     if buf == 0:
         h.uc.mem_write(bufsize_ptr, struct.pack("<I", len(path)))
         return -1

@@ -4,9 +4,9 @@
 import struct
 from pathlib import Path
 from macho_runner import MachOBinary
+from game_config import unity_framework_path
 
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
-macho = MachOBinary(unity_path)
+macho = MachOBinary(unity_framework_path())
 
 # Let's search for the method name in __TEXT.__objc_methname
 target_meth = b"runUIApplicationMainWithArgc:argv:"

@@ -1,10 +1,11 @@
 import subprocess
 from pathlib import Path
 from macho_runner import MachOBinary
+from game_config import unity_framework_path
 
 CXXFILT = r"C:\Users\user\AppData\Local\Android\Sdk\ndk\28.2.13676358\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-cxxfilt.exe"
 
-b = MachOBinary(Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework"))
+b = MachOBinary(unity_framework_path())
 libcxx_bindings = []
 for bnd in b.bindings:
     if bnd.ordinal > 0 and bnd.ordinal <= len(b.dylibs):

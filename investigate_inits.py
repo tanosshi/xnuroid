@@ -7,9 +7,9 @@ from macho_runner import MachOBinary, ExecutionHarness, align_up
 import capstone
 import unicorn
 from unicorn import arm64_const as uc_arm64
+from game_config import unity_framework_path
 
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
-macho = MachOBinary(unity_path)
+macho = MachOBinary(unity_framework_path())
 cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 
 BASE_SLIDE = 0x200000000

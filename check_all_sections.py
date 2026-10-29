@@ -1,14 +1,15 @@
 import struct
 import capstone
+from game_config import app_executable_path, unity_framework_path
 
 cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 
 for bin_path in [
-    'MyGame-v1-7-2/Payload/MyGame.app/MyGame',
-    'MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework'
+    app_executable_path(),
+    unity_framework_path(),
 ]:
-    data = open(bin_path, 'rb').read()
-    print(f"\n=== Executable Sections in {bin_path.split('/')[-1]} ===")
+    data = bin_path.read_bytes()
+    print(f"\n=== Executable Sections in {bin_path.name} ===")
     
     offset = 32
     magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IIIIIIII', data, 0)

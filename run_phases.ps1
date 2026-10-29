@@ -9,6 +9,7 @@
 param(
     [string]$Ndk = "",
     [string]$Adb = "",
+    [string]$GameDir = "",
     [switch]$Push,
     [switch]$SkipBuild,
     [switch]$Quick   # skip the slow static scans; disassembly regions, xrefs and the device runs still happen
@@ -30,6 +31,18 @@ function Find-Adb {
     $p = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
     if (Test-Path $p) { return $p }
     throw "adb not found. Pass -Adb <path to adb.exe>."
+}
+function Get-GameRoot {
+    # Resolve the extracted-IPA folder, in order: -GameDir, LOADER_GAME_DIR, or
+    # the git-ignored game_config_local.py (GAME_ROOT = "...").
+    if ($GameDir) { return $GameDir }
+    if ($env:LOADER_GAME_DIR) { return $env:LOADER_GAME_DIR }
+    $local = Join-Path $PSScriptRoot "game_config_local.py"
+    if (Test-Path $local) {
+        $m = Select-String -Path $local -Pattern '^\s*GAME_ROOT\s*=\s*["'']([^"'']*)["'']' | Select-Object -First 1
+        if ($m) { return $m.Matches[0].Groups[1].Value }
+    }
+    return ""
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -54,7 +67,14 @@ if (-not $SkipBuild) {
 
 # ---- static inspection of the guest (no device needed): Unity entry points ----
 $localDataForScan = $null
-$fw = Get-ChildItem -Recurse -Filter UnityFramework -File -Path (Join-Path $PSScriptRoot "MyGame-v1-7-2") -ErrorAction SilentlyContinue | Select-Object -First 1
+$fw = $null
+$gameRoot = Get-GameRoot
+if ($gameRoot) {
+    $gamePath = Join-Path $PSScriptRoot $gameRoot
+    if (Test-Path $gamePath) {
+        $fw = Get-ChildItem -Recurse -Filter UnityFramework -File -Path $gamePath -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+}
 if ($fw) {
     $localDataForScan = Join-Path (Split-Path (Split-Path $fw.DirectoryName)) "Data"
     if (-not $Quick) {

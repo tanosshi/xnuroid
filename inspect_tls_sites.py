@@ -1,8 +1,9 @@
 from pathlib import Path
 import capstone
 from macho_runner import MachOBinary
+from game_config import unity_framework_path
 
-b = MachOBinary(Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework"))
+b = MachOBinary(unity_framework_path())
 
 seg_text = [seg for seg in b.segments if seg.name == "__TEXT"][0]
 text_bytes = b.data[seg_text.fileoff : seg_text.fileoff + seg_text.filesize]

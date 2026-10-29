@@ -6,8 +6,9 @@ from pathlib import Path
 from macho_runner import MachOBinary, ExecutionHarness
 import unicorn
 from unicorn import arm64_const as uc_arm64
+from game_config import unity_framework_path
 
-unity_path = Path("MyGame-v1-7-2/Payload/MyGame.app/Frameworks/UnityFramework.framework/UnityFramework")
+unity_path = unity_framework_path()
 if not unity_path.exists():
     print(f"{unity_path} not found")
     sys.exit(1)

@@ -16,6 +16,8 @@ import capstone
 import unicorn
 from unicorn import arm64_const as uc_arm64
 
+from game_config import APP_EXECUTABLE, app_executable_path, guest_bundle_path
+
 
 # Opcodes for classic dyld info
 BIND_OPCODE_MASK = 0xF0
@@ -431,10 +433,10 @@ class ExecutionHarness:
         if selector == "mainBundle":
             return 0x2000  # mock mainBundle instance
         elif selector == "bundlePath":
-            return self.allocate_cfstring("/Payload/MyGame.app")
+            return self.allocate_cfstring(guest_bundle_path())
         elif selector == "stringByAppendingString:":
             suffix = self.read_cfstring(arg1)
-            new_path = "/Payload/MyGame.app" + suffix
+            new_path = guest_bundle_path() + suffix
             if self.verbose:
                 print(f"         [App appended path: '{new_path}']")
             return self.allocate_cfstring(new_path)
@@ -524,7 +526,7 @@ class ExecutionHarness:
         print(f"\n[Execution] Starting ARM64 CPU emulation at {hex(start_addr)}...")
 
         # Setup argc/argv
-        prog_name_ptr = self.allocate_string("MyGame")
+        prog_name_ptr = self.allocate_string(APP_EXECUTABLE)
         argv_ptr = self.heap_ptr
         self.heap_ptr = align_up(self.heap_ptr + 16, 16)
         self.uc.mem_write(argv_ptr, struct.pack("<QQ", prog_name_ptr, 0))
@@ -562,7 +564,7 @@ class ExecutionHarness:
 
 
 def run():
-    app_binary_path = Path("MyGame-v1-7-2/Payload/MyGame.app/MyGame")
+    app_binary_path = app_executable_path()
     if not app_binary_path.exists():
         print(f"Error: {app_binary_path} not found.")
         sys.exit(1)
