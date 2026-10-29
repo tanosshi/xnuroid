@@ -52,6 +52,8 @@ struct Shader {
 
 // macros: the MTLCompileOptions preprocessor macros (name, value). clip_control: GL_EXT_clip_control is in use, so
 // clip-space depth stays [0,1].
-Shader translate(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control);
+// entry: the function to translate (MTLFunction name); empty = the first vertex/fragment function.
+Shader translate(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control,
+                 const std::string& entry = "");
 
 }  // namespace msl

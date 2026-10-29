@@ -48,7 +48,7 @@ inline bool is_stateful_class(const std::string& c) {
         "UIWindow", "UIView", "UIViewController", "UIImageView", "UIActivityIndicatorView", "UIScreenMode", "UIColor",
         "CALayer", "CAMetalLayer", "CAMetalDrawable", "CADisplayLink", "NSArray", "NSMutableArray", "NSDictionary",
         "NSMutableDictionary", "NSMapTable", "NSNumber", "NSRunLoop", "NSNotificationCenter", "NSUserDefaults",
-        "AVAudioSession", "NSAssertionHandler", "NSDate", "NSMutableSet", "NSSet", "NSURL", "NSError", "AVURLAsset",
+        "AVAudioSession", "NSAssertionHandler", "NSDate", "NSMutableSet", "NSSet", "NSURL", "NSError", "AVURLAsset", "UITouch", "UIEvent",
         "AVAssetResourceLoader"};
     return k.count(c) != 0;
 }
@@ -640,6 +640,23 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         return true;
     }
     if (c == "NSRunLoop" || c == "NSNotificationCenter") { frame.ret_x0 = 0; return true; }
+    if (c == "UITouch") {
+        if (sel == "locationInView:" || sel == "preciseLocationInView:") { objc_ret_rect(getd(st, "x", 0), getd(st, "y", 0), 0, 0); return true; }
+        if (sel == "previousLocationInView:" || sel == "precisePreviousLocationInView:") {
+            objc_ret_rect(getd(st, "px", 0), getd(st, "py", 0), 0, 0);
+            return true;
+        }
+        if (sel == "majorRadius") { objc_ret_double(20.0); return true; }
+        if (sel == "majorRadiusTolerance") { objc_ret_double(5.0); return true; }
+        if (sel == "force" || sel == "maximumPossibleForce" || sel == "azimuthAngleInView:") { objc_ret_double(0.0); return true; }
+        if (sel == "altitudeAngle") { objc_ret_double(1.5707963267948966); return true; }
+        if (sel == "timestamp") { objc_ret_double(getd(st, "timestamp", 0)); return true; }
+    }
+    if (c == "UIEvent") {
+        if (sel == "allTouches" || sel == "touchesForView:" || sel == "touchesForWindow:") { frame.ret_x0 = getp(st, "touches"); return true; }
+        if (sel == "type" || sel == "subtype") { frame.ret_x0 = 0; return true; }
+        if (sel == "timestamp") { objc_ret_double(getd(st, "timestamp", 0)); return true; }
+    }
     if (c == "NSURL") {
         std::string s;
         objc_string_value(getp(st, "absoluteString"), s);
@@ -1169,6 +1186,52 @@ static void fakeui_run_loop_once() {
     }
 }
 
+// LOADER_TOUCH="<frame>:<x>,<y>[,<frames held>];...": taps in screen pixels, delivered to the key window's root view
+// the way UIKit does (touchesBegan / touchesEnded with a UIEvent whose allTouches holds the UITouch).
+struct ScriptedTap { int frame, hold; double x, y; uint64_t touch = 0; };
+static std::vector<ScriptedTap> parse_touch_script() {
+    std::vector<ScriptedTap> out;
+    const char* s = getenv("LOADER_TOUCH");
+    while (s && *s) {
+        const char* semi = strchr(s, ';');
+        std::string item = semi ? std::string(s, semi) : std::string(s);
+        ScriptedTap t{0, 4, 0, 0};
+        if (sscanf(item.c_str(), "%d:%lf,%lf,%d", &t.frame, &t.x, &t.y, &t.hold) >= 3) out.push_back(t);
+        s = semi ? semi + 1 : nullptr;
+    }
+    return out;
+}
+static void deliver_scripted_touches(std::vector<ScriptedTap>& taps, int f) {
+    using namespace fakeui;
+    for (ScriptedTap& t : taps) {
+        bool begin = f == t.frame, end = f == t.frame + t.hold;
+        if (!begin && !end) continue;
+        FakeObjcObj* ks = g_key_window ? ui_state(g_key_window) : nullptr;
+        uint64_t root = ks ? getp(ks, "rootViewController") : 0;
+        uint64_t view = root ? send(root, "view") : 0;
+        if (!view) continue;
+        if (begin) t.touch = fake_make(8, "UITouch");
+        FakeObjcObj* ts = fake_lookup(t.touch);
+        if (!ts) continue;
+        double px = t.x / kScreenScale, py = t.y / kScreenScale;
+        setd(ts, "x", px); setd(ts, "y", py); setd(ts, "px", px); setd(ts, "py", py);
+        setd(ts, "timestamp", now_s());
+        ts->props["phase"] = begin ? 0 : 3;   // UITouchPhaseBegan / Ended
+        ts->props["tapCount"] = 1;
+        ts->props["view"] = view;
+        ts->props["window"] = g_key_window;
+        uint64_t set = fake_make(8, "NSSet");
+        fake_lookup(set)->items = {t.touch};
+        uint64_t ev = fake_make(8, "UIEvent");
+        FakeObjcObj* es = fake_lookup(ev);
+        es->props["touches"] = set;
+        setd(es, "timestamp", now_s());
+        printf("[TOUCH] %s (%.0f, %.0f) px at frame %d\n", begin ? "began" : "ended", t.x, t.y, f);
+        fflush(stdout);
+        send(view, begin ? "touchesBegan:withEvent:" : "touchesEnded:withEvent:", set, ev);
+    }
+}
+
 // LOADER_ENGINE=8: what UIApplicationMain does for the app delegate class, then the main run loop for `frames` ticks.
 static void fakeui_run_application(int frames) {
     using namespace fakeui;
@@ -1186,8 +1249,10 @@ static void fakeui_run_application(int frames) {
     send(ctrl, "applicationDidBecomeActive:", app);
     printf("[APP] run loop: %d ticks\n", frames); fflush(stdout);
     double worst = 0, t0 = now_s();
+    std::vector<ScriptedTap> taps = parse_touch_script();
     for (int f = 0; f < frames; ++f) {
         double a = now_s();
+        deliver_scripted_touches(taps, f);
         fakeui_run_loop_once();
         double ms = (now_s() - a) * 1e3;
         if (ms > worst) worst = ms;

@@ -357,7 +357,8 @@ struct Param {
 
 class Translator {
 public:
-    Translator(const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control) : clip_control_(clip_control) {
+    Translator(const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control, const std::string& entry)
+        : clip_control_(clip_control), entry_(entry) {
         for (const auto& m : macros) pre_.defines[m.first] = m.second;
         pre_.defines["__HAVE_FMA__"] = "1";
         pre_.defines["__METAL_VERSION__"] = "220";
@@ -376,6 +377,7 @@ public:
 private:
     Pre pre_;
     bool clip_control_;
+    std::string entry_;
     Toks toks_;
     std::string err_;
     std::map<std::string, Struct> structs_;
@@ -564,19 +566,24 @@ private:
             if (s == "struct") { if (!parse_struct(i)) return false; continue; }
             if (s == "constexpr" || s == "constant") { if (!parse_global_const(i)) return false; continue; }
             if (s == "vertex" || s == "fragment") {
-                vertex_ = s == "vertex";
                 size_t rt = next_sig(toks_, i + 1);
-                ret_type_ = toks_[rt].s;
                 size_t nm = next_sig(toks_, rt + 1);
                 size_t op = next_sig(toks_, nm + 1);
                 if (!is(toks_, op, "(")) return fail("entry point without parameter list");
                 size_t cp = match(toks_, op);
-                parse_params(op + 1, cp);
                 size_t ob = next_sig(toks_, cp + 1);
                 if (!is(toks_, ob, "{")) return fail("entry point without body");
-                body_b_ = ob + 1;
-                body_e_ = match(toks_, ob);
-                i = body_e_ + 1;
+                size_t cb = match(toks_, ob);
+                // a library can hold several entry points; translate the one the MTLFunction names
+                if ((entry_.empty() && !body_e_) || toks_[nm].s == entry_) {
+                    vertex_ = s == "vertex";
+                    ret_type_ = toks_[rt].s;
+                    params_.clear();
+                    parse_params(op + 1, cp);
+                    body_b_ = ob + 1;
+                    body_e_ = cb;
+                }
+                i = cb + 1;
                 continue;
             }
             if (s == "kernel") return fail("compute kernels are not supported");
@@ -944,8 +951,14 @@ private:
             // return output;  -> fix up clip space, plain return
             if (toks_[s].s == "return") {
                 size_t semi = s;
-                while (semi < body_e_ && toks_[semi].s != ";") ++semi;
-                out += vertex_ ? fixup() + "return;" : "return;";
+                int depth = 0;
+                for (; semi < body_e_; ++semi) {
+                    const std::string& x = toks_[semi].s;
+                    if (x == "(" || x == "{") ++depth;
+                    else if (x == ")" || x == "}") --depth;
+                    else if (x == ";" && depth == 0) break;
+                }
+                out += "{ " + return_value(next_sig(toks_, s + 1), semi) + (vertex_ ? fixup() : "") + "return; }";
                 i = semi + 1;
                 continue;
             }
@@ -990,6 +1003,30 @@ private:
             i = e;
         }
         return out;
+    }
+
+    // Assignments that stand in for `return <expr>;`: `output` (globals already written), an aggregate
+    // `(Struct){ .field = value, ... }`, or a plain value for a non-struct return type.
+    std::string return_value(size_t b, size_t e) {
+        if (b >= e || (is(toks_, b, "output") && next_sig(toks_, b + 1) >= e)) return "";
+        if (is(toks_, b, "(")) {
+            size_t cp = match(toks_, b);
+            size_t ob = next_sig(toks_, cp + 1);
+            if (is(toks_, ob, "{") && structs_.count(trim(join(toks_, b + 1, cp)))) {
+                std::string s;
+                size_t cb = match(toks_, ob);
+                for (auto [fb, fe] : split_args(toks_, ob + 1, cb)) {
+                    size_t d = next_sig(toks_, fb);
+                    if (!is(toks_, d, ".")) continue;
+                    size_t name = next_sig(toks_, d + 1), eq = next_sig(toks_, name + 1);
+                    if (!is(toks_, eq, "=")) continue;
+                    s += io_name(true, toks_[name].s) + " = " + trim(rewrite(eq + 1, fe)) + "; ";
+                }
+                return s;
+            }
+        }
+        if (!structs_.count(ret_type_)) return (vertex_ ? "gl_Position" : "o_result") + std::string(" = ") + trim(rewrite(b, e)) + "; ";
+        return "";
     }
 
     std::string fixup() {
@@ -1100,6 +1137,14 @@ private:
         auto decl_io = [&](const std::string& sname, bool out) -> bool {
             if (sname.empty()) return true;
             auto it = structs_.find(sname);
+            TypeInfo plain;
+            if (it == structs_.end() && out && type_info(sname, plain)) {   // `fragment half4 f(...)` / `vertex float4 v(...)`
+                if (!vertex_) {
+                    g << "layout(location = 0) out " << plain.glsl << " o_result;\n";
+                    sh.color_outputs.push_back(0);
+                }
+                return true;
+            }
             if (it == structs_.end()) return fail("missing struct " + sname);
             for (const Field& f : it->second.fields) {
                 TypeInfo ti;
@@ -1168,8 +1213,9 @@ private:
 
 }  // namespace
 
-Shader translate(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control) {
-    Translator t(macros, clip_control);
+Shader translate(const std::string& source, const std::vector<std::pair<std::string, std::string>>& macros, bool clip_control,
+                 const std::string& entry) {
+    Translator t(macros, clip_control, entry);
     return t.run(source);
 }
 

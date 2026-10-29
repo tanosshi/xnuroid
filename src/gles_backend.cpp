@@ -92,17 +92,17 @@ void publish() {
 }
 
 bool has_extension(const char* name) {
-    if (g_extensions.empty() && ensure_context()) {
+    // filled once; afterwards only read, so lookups from any thread are safe
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!ensure_context()) return;
         GLint n = 0;
         glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-        std::string all;
         for (GLint i = 0; i < n; ++i) {
-            all += reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
-            all += ' ';
+            g_extensions += reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
+            g_extensions += ' ';
         }
-        std::lock_guard<std::mutex> l(g_mu);
-        g_extensions = all;
-    }
+    });
     std::string key = std::string(name) + ' ';
     return g_extensions.find(key) != std::string::npos;
 }

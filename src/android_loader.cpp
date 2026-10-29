@@ -976,9 +976,34 @@ extern "C" void native_OSMemoryBarrier() {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
-// Memory allocator shims
+// Memory allocator shims. Darwin's malloc_size() answers 0 for memory malloc did not hand out, and Unity relies on
+// that (its malloc allocator's Contains() is `malloc_size(p) != 0`, probed with other allocators' pointers). Scudo's
+// malloc_usable_size() aborts on such pointers, so the blocks the guest gets from its malloc family are tracked.
+namespace guest_heap {
+constexpr size_t kShards = 64;
+struct Shard { std::mutex mu; std::unordered_set<uintptr_t> live; };
+inline Shard g_shards[kShards];
+inline Shard& shard(const void* p) { return g_shards[(reinterpret_cast<uintptr_t>(p) >> 4) % kShards]; }
+inline void add(void* p) { if (p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); s.live.insert(reinterpret_cast<uintptr_t>(p)); } }
+inline void remove(void* p) { if (p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); s.live.erase(reinterpret_cast<uintptr_t>(p)); } }
+inline bool owns(const void* p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); return s.live.count(reinterpret_cast<uintptr_t>(p)) != 0; }
+}  // namespace guest_heap
+extern "C" void* native_guest_malloc(size_t n) { void* p = malloc(n); guest_heap::add(p); return p; }
+extern "C" void* native_guest_calloc(size_t n, size_t m) { void* p = calloc(n, m); guest_heap::add(p); return p; }
+extern "C" void* native_guest_realloc(void* old, size_t n) {
+    if (old) guest_heap::remove(old);
+    void* p = realloc(old, n);
+    guest_heap::add(p ? p : (n ? old : nullptr));   // failed realloc keeps the old block
+    return p;
+}
+extern "C" void native_guest_free(void* p) { guest_heap::remove(p); free(p); }
+extern "C" int native_guest_posix_memalign(void** out, size_t align, size_t n) {
+    int rc = posix_memalign(out, align, n);
+    if (rc == 0) guest_heap::add(*out);
+    return rc;
+}
 extern "C" size_t native_malloc_size(const void* ptr) {
-    if (!ptr) return 0;
+    if (!ptr || !guest_heap::owns(ptr)) return 0;
     return malloc_usable_size(const_cast<void*>(ptr));
 }
 
@@ -2755,6 +2780,11 @@ static void init_custom_shims() {
 
     // Allocator & POSIX / Darwin memory shims
     g_custom_shims["_malloc_size"] = reinterpret_cast<void*>(&native_malloc_size);
+    g_custom_shims["_malloc"] = reinterpret_cast<void*>(&native_guest_malloc);
+    g_custom_shims["_calloc"] = reinterpret_cast<void*>(&native_guest_calloc);
+    g_custom_shims["_realloc"] = reinterpret_cast<void*>(&native_guest_realloc);
+    g_custom_shims["_free"] = reinterpret_cast<void*>(&native_guest_free);
+    g_custom_shims["_posix_memalign"] = reinterpret_cast<void*>(&native_guest_posix_memalign);
     g_custom_shims["_mach_task_self_"] = &g_mach_task_self_val;
     g_custom_shims["_mach_thread_self"] = reinterpret_cast<void*>(&native_mach_thread_self);
     g_custom_shims["_vm_page_size"] = &g_vm_page_size;

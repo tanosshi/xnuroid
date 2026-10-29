@@ -35,9 +35,14 @@ static FakeObjcObj* fake_lookup(uint64_t p) {
     auto it = g_fake_objc.find(reinterpret_cast<void*>(p));
     return it == g_fake_objc.end() ? nullptr : it->second;
 }
+// LOADER_FAKE_HANDLE_SIZE: bytes behind each fake object handle (debug aid for guest writes into fakes)
+static size_t fake_handle_size() {
+    static const size_t n = getenv("LOADER_FAKE_HANDLE_SIZE") ? strtoull(getenv("LOADER_FAKE_HANDLE_SIZE"), nullptr, 10) : 32;
+    return n;
+}
 static uint64_t fake_make(int kind, const std::string& s) {
     auto* o = new FakeObjcObj{kind, s};
-    void* handle = calloc(1, 32);   // a real, distinct, non-null address to hand to the guest
+    void* handle = calloc(1, fake_handle_size());   // a real, distinct, non-null address to hand to the guest
     std::lock_guard<std::mutex> l(g_fake_mu);
     g_fake_objc[handle] = o;
     return reinterpret_cast<uint64_t>(handle);

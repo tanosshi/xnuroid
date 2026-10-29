@@ -42,8 +42,9 @@ struct String {
         return is_long() ? l.size : static_cast<size_t>(s.size);
     }
 
+    // libc++ keeps the allocation size (capacity + 1 for the terminator) in the long-mode cap field.
     size_t capacity() const {
-        return is_long() ? (l.cap & ~LONG_FLAG) : SHORT_CAP;
+        return is_long() ? (l.cap & ~LONG_FLAG) - 1 : SHORT_CAP;
     }
 
     void init_empty() {
@@ -64,10 +65,11 @@ struct String {
         s.size = static_cast<uint8_t>(n);
     }
 
+    // cap: usable characters, excluding the terminator (the buffer holds cap + 1 bytes)
     void set_long(char* buf, size_t n, size_t cap) {
         l.data = buf;
         l.size = n;
-        l.cap = cap | LONG_FLAG;
+        l.cap = (cap + 1) | LONG_FLAG;
     }
 
     void assign(const char* str, size_t n) {

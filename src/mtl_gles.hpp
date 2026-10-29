@@ -17,6 +17,7 @@
 #include <map>
 
 #include "msl_glsl.hpp"
+#include "pvrtc.hpp"
 
 namespace mtlgl {
 
@@ -24,6 +25,8 @@ namespace mtlgl {
 struct Fmt {
     GLenum internal = 0, format = 0, type = 0;
     bool compressed = false, bgra = false, depth = false, stencil = false, integer = false;
+    int norm16 = 0;                  // 16-bit normalized source widened to 32-bit float (no GL_EXT_texture_norm16): 1 unorm, 2 snorm
+    int pvrtc = 0;                   // PVRTC1 source decoded to RGBA8 on upload: 4 or 2 bpp
     int bw = 1, bh = 1, bytes = 4;   // block size and bytes per block (pixel for uncompressed)
 };
 
@@ -36,6 +39,18 @@ inline bool format_of(uint64_t pf, Fmt& f) {
         case 12: return u(GL_R8_SNORM, GL_RED, GL_BYTE, 1);
         case 13: f.integer = true; return u(GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 1);
         case 14: f.integer = true; return u(GL_R8I, GL_RED_INTEGER, GL_BYTE, 1);
+        case 20: case 22: case 60: case 62: case 110: case 112: {   // R/RG/RGBA16 Unorm/Snorm
+            const int comps = pf < 60 ? 1 : pf < 110 ? 2 : 4;
+            const bool snorm = pf == 22 || pf == 62 || pf == 112;
+            static const GLenum fmt[] = {GL_RED, GL_RG, 0, GL_RGBA};
+            if (gles::has_extension("GL_EXT_texture_norm16")) {
+                static const GLenum un[] = {0x822A, 0x822C, 0, 0x805B}, sn[] = {0x8F98, 0x8F99, 0, 0x8F9B};
+                return u(snorm ? sn[comps - 1] : un[comps - 1], fmt[comps - 1], snorm ? GL_SHORT : GL_UNSIGNED_SHORT, 2 * comps);
+            }
+            static const GLenum fl[] = {GL_R32F, GL_RG32F, 0, GL_RGBA32F};
+            f.norm16 = snorm ? 2 : 1;
+            return u(fl[comps - 1], fmt[comps - 1], GL_FLOAT, 4 * comps);   // bytes = GL-side texel size
+        }
         case 23: f.integer = true; return u(GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT, 2);
         case 24: f.integer = true; return u(GL_R16I, GL_RED_INTEGER, GL_SHORT, 2);
         case 25: return u(GL_R16F, GL_RED, GL_HALF_FLOAT, 2);
@@ -104,6 +119,10 @@ inline bool format_of(uint64_t pf, Fmt& f) {
     bool srgb = false;
     if (pf >= 186 && pf <= 200) { k = static_cast<int>(pf - 186); srgb = true; }
     if (pf >= 204 && pf <= 218) k = static_cast<int>(pf - 204);
+    if (pf >= 160 && pf <= 167) {   // PVRTC RGB/RGBA 2/4 bpp (odd values sRGB)
+        f.pvrtc = (pf - 160) % 4 < 2 ? 2 : 4;
+        return u((pf & 1) ? GL_SRGB8_ALPHA8 : GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4);
+    }
     if (k >= 0 && astc[k][0]) {
         f.compressed = true;
         f.internal = srgb ? astc_srgb[k] : astc_ldr[k];
@@ -337,6 +356,20 @@ inline void upload(Tex* t, int level, int slice, int x, int y, int z, int w, int
     if (!t || !src || w <= 0 || h <= 0) return;
     glBindTexture(t->target, t->id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (t->f.pvrtc) {   // whole level, decoded on the CPU
+        const int bw = t->f.pvrtc == 2 ? 8 : 4;
+        size_t blocks = static_cast<size_t>(std::max(w, bw * 2) / bw) * static_cast<size_t>(std::max(h, 8) / 4);
+        std::vector<uint8_t> rgba;
+        if (x || y || !pvrtc::decode(src, blocks * 8, w, h, t->f.pvrtc == 2, rgba)) {
+            fprintf(stderr, "[MTLGL] PVRTC upload %dx%d at %d,%d not decoded\n", w, h, x, y);
+            return;
+        }
+        Fmt saved = t->f;
+        t->f.pvrtc = 0;
+        upload(t, level, slice, 0, 0, z, w, h, 1, rgba.data(), static_cast<size_t>(w) * 4, static_cast<size_t>(w) * 4 * h);
+        t->f = saved;
+        return;
+    }
     if (t->f.compressed) {
         int bx = (w + t->f.bw - 1) / t->f.bw, by = (h + t->f.bh - 1) / t->f.bh;
         size_t tight = static_cast<size_t>(bx) * t->f.bytes;
@@ -359,7 +392,28 @@ inline void upload(Tex* t, int level, int slice, int x, int y, int z, int w, int
     std::vector<uint8_t> swz;
     const uint8_t* p = src;
     size_t row = static_cast<size_t>(w) * t->f.bytes;
-    if (t->f.bgra) {
+    if (t->f.norm16) {   // widen 16-bit normalized texels to float
+        const size_t comps = static_cast<size_t>(t->f.bytes / 4), srow = static_cast<size_t>(w) * comps * 2;
+        if (bpr && bpr < srow) { fprintf(stderr, "[MTLGL] upload pf %llu: bytesPerRow %zu < %zu, skipped\n", static_cast<unsigned long long>(t->pf), bpr, srow); return; }
+        swz.resize(row * h * dz);
+        float* out = reinterpret_cast<float*>(swz.data());
+        for (int zz = 0; zz < dz; ++zz)
+            for (int r = 0; r < h; ++r) {
+                const uint8_t* s = src + zz * bpi + r * (bpr ? bpr : srow);
+                for (size_t c = 0; c < w * comps; ++c) {
+                    uint16_t v;
+                    std::memcpy(&v, s + 2 * c, 2);
+                    *out++ = t->f.norm16 == 2 ? std::max(-1.0f, static_cast<int16_t>(v) / 32767.0f) : v / 65535.0f;
+                }
+            }
+        p = swz.data();
+        bpr = row;
+        bpi = row * h;
+    } else if (bpr && bpr < row) {
+        fprintf(stderr, "[MTLGL] upload pf %llu %dx%d: bytesPerRow %zu < %zu, skipped\n", static_cast<unsigned long long>(t->pf), w, h, bpr, row);
+        return;
+    }
+    if (t->f.bgra && !t->f.norm16) {
         swz.resize(row * h * dz);
         for (int zz = 0; zz < dz; ++zz)
             for (int r = 0; r < h; ++r) {
@@ -545,9 +599,9 @@ inline Pipeline* make_pipeline(FakeObjcObj* desc) {
     std::string vsrc, fsrc;
     FakeObjcObj *vo = nullptr, *fo = nullptr;
     if (!source_of(vf, vsrc, vo)) { fprintf(stderr, "[MTLGL] pipeline without vertex function source\n"); return p; }
-    p->vs = msl::translate(vsrc, macros_of(vo), clip_control());
+    p->vs = msl::translate(vsrc, macros_of(vo), clip_control(), vf->s);
     bool have_fs = source_of(ff, fsrc, fo);
-    if (have_fs) p->fs = msl::translate(fsrc, macros_of(fo), clip_control());
+    if (have_fs) p->fs = msl::translate(fsrc, macros_of(fo), clip_control(), ff->s);
     else p->fs.ok = true, p->fs.glsl = "#version 320 es\nvoid main() {}\n";
     if (!p->vs.ok) { dump_failed_shader("vertex translation", vsrc, "", p->vs.error); return p; }
     if (!p->fs.ok) { dump_failed_shader("fragment translation", fsrc, "", p->fs.error); return p; }
