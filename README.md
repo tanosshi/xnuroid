@@ -96,20 +96,7 @@ variables instead. `run_phases.ps1` accepts the same folder through `-GameDir`.
 
 This produces `xnuroid_loader` in the repository root. It links EGL, GLESv3, zlib, and AAudio.
 
-### Build the Android app
-
-```bash
-./build_apk.sh
-./build_apk.sh install
-```
-
-The first command builds `build/xnuroid.apk`. The `install` command builds, installs, copies
-game files if missing, and launches the app.
-
-The APK package is `com.tanosshi.xnuroid`, the native library is `libxnuroid.so`, and the
-activity is `android.app.NativeActivity`. The install script pulls the device's
-`/system/lib64/libc++.so` and ships it as `libsysc++.so`, because an app linker namespace cannot
-open the system C++ library directly.
+For the Android app host (build and run), see the [Android app host](docs/android-app.md) document.
 
 > **Note:** `CMakeLists.txt` is stale. It builds only the host-side `macho-inspect` tool from
 > `src/host/main.cpp` and `src/host/chained_fixups.cpp`; it does not build either loader. Use the shell scripts.
@@ -132,39 +119,6 @@ adb shell /data/local/tmp/xnuroid_loader
 Override the bundle root with `LOADER_GAME_DIR`. The default writable container is
 `/data/local/tmp/sandbox`; override it with `LOADER_SANDBOX_DIR`.
 
-### Android app
-
-`./build_apk.sh install` installs the APK, copies `/data/local/tmp/game` into the app's internal
-files directory with `run-as` if needed, and starts the activity.
-
-The app uses this layout:
-
-| Path | Contents |
-| --- | --- |
-| `<internalDataPath>/game/` | `UnityFramework`, `Info.plist`, and `Data/` |
-| `<internalDataPath>/sandbox/` | Guest-visible `Documents`, `Library`, and `Caches` tree |
-| `<externalDataPath>/loader.env` | Optional `KEY=VALUE` environment overrides |
-| `<externalDataPath>/out.txt`, `err.txt` | Loader standard output and error |
-| `<externalDataPath>/exit.txt` | `EXIT=<code>` after the loader thread returns |
-
-Pull logs with:
-
-```bash
-adb pull /sdcard/Android/data/com.tanosshi.xnuroid/files/out.txt
-adb pull /sdcard/Android/data/com.tanosshi.xnuroid/files/err.txt
-```
-
-Example `loader.env`:
-
-```dotenv
-LOADER_FRAMES=300
-LOADER_FRAME_DIR=/sdcard/Android/data/com.tanosshi.xnuroid/files/frames
-LOADER_GL_TRACE=1
-```
-
-The app sets `LOADER_ENGINE=8`, `LOADER_FDE=all`, and a very large `LOADER_FRAMES` before reading
-`loader.env`, so values in that file override those defaults.
-
 ### Launch stages
 
 Without `LOADER_ENGINE`, the diagnostic path runs these stages:
@@ -182,49 +136,8 @@ With `LOADER_ENGINE` set, the headless sequence is skipped and the engine path r
 
 ## Environment variables
 
-| Variable | Meaning |
-| --- | --- |
-| `LOADER_GAME_DIR` | App bundle root. Default /data/local/tmp/game. |
-| `LOADER_TMP_DIR` | Temporary directory used by shims. |
-| `LOADER_SANDBOX_DIR` | Guest container root. Default /data/local/tmp/sandbox. |
-| `LOADER_LIBCXX` | Path to the Android libc++ used for the guest’s std::__1 ABI. |
-| `LOADER_ENGINE` | Enable engine mode. 1 no-graphics init, 2 startup helper first, 5 Unity runtime warmup, 6 graphics init, 7 first scene, 8 full app launch and run loop. Any value also enables nil-object behavior and GLES unless disabled. |
-| `LOADER_FRAMES` | Run-loop ticks for engine 8. CLI default 300; the APK sets a very large value. |
-| `LOADER_ENGINE_ARGS` | Extra engine command-line switches, space- or comma-separated. |
-| `LOADER_ENGINE_SKIP_1B304` | Skip the engine registration step at image+0x1b304. |
-| `LOADER_NO_OBJC_RT` | Do not register the guest Objective-C runtime. |
-| `LOADER_OBJC_NIL` | Enable nil-object behavior without entering engine mode. |
-| `LOADER_PEEK` | Comma-separated hex image offsets to print at startup. |
-| `LOADER_FDE` | Any non-empty value registers FDEs for all guest functions; all is conventional. |
-| `LOADER_FDE_ONLY` | File containing 0x... image offsets; register only containing functions. |
-| `LOADER_FDE_DUMP` | Log every registered FDE. |
-| `LOADER_EXCEPTION_TEST` | 1 runs culture-free throw tests; parse runs the Int32.Parse("abc") test. Also enables unwind tracing. |
-| `LOADER_TRACE_UNWIND` | Log calls to C++ exception/unwind imports. |
-| `LOADER_EXCEPTION_BENCH` | With exception test 1, run 100 timed throw/catch round trips. |
-| `LOADER_GLES` | 0 disables the GLES renderer even in engine mode. |
-| `LOADER_MSL_TEST` | Translate every <dir>/*.metal to GLSL, compile it, print a report, and exit. |
-| `LOADER_DUMP_MSL` | Write runtime MSL sources as <dir>/<n>.metal. |
-| `LOADER_FRAME_DIR` | Save presented frames as PNG files in this directory. |
-| `LOADER_FRAME_EVERY` | Save every Nth frame. Default 60. |
-| `LOADER_GL_TRACE` | Log render passes and draws for the first N presented frames. |
-| `LOADER_GL_TRACE_AT` | Log one specific presented frame. |
-| `LOADER_GL_SKIP_DRAW` | Drop the Nth draw of each pass (debug). |
-| `LOADER_GL_SOLID` | Force a solid magenta fragment color for shaders writing o_SV_Target0. |
-| `LOADER_DRAW_STATS` | Print draws per presented frame every 60 frames. |
-| `LOADER_LOG_PVRTC` | Log PVRTC decode timing. |
-| `LOADER_MEM_STATS` | Print live fake-object and GL texture memory every 600 frames. |
-| `LOADER_TOUCH` | Scripted taps: <frame>:<x>,<y>[,<frames held>];... in screen pixels. |
-| `LOADER_AUDIO` | 0 disables AAudio and discards rendered samples. |
-| `LOADER_AUDIO_WAV` | Record rendered audio to this WAV path. |
-| `LOADER_HAPTICS` | 0 disables vibration. |
-| `LOADER_LOG_THREADS` | Log thread creation and exit. |
-| `LOADER_LOG_BLOCKS` | Log block copies and invocations. |
-| `LOADER_WATCHDOG` | Start a watchdog that dumps all thread stacks after N seconds, then exits 124. |
-| `LOADER_WATCHDOG_COUNT` | Number of watchdog dumps. Default 1. |
-| `LOADER_POISON_STRICT` | Fault on the first access to an unresolved data import instead of logging and continuing. |
-| `LOADER_TRACE_DIRECT` | 1 logs the first calls per directly bound symbol, all logs every call, list logs the symbol list. |
-| `BISECT_NO_VARIADIC_SHIMS` | Disable variadic shims for A/B comparison. |
-| `LOADER_FAKE_HANDLE_SIZE` | Bytes allocated behind each fake object handle. Default 32. |
+See the [environment variables](docs/environment-variables.md) reference.
+
 ## Test harness
 run_matrix.txt defines device runs as name|environment. The current entries are the default run
 and an engine-7/FDE run.
@@ -237,14 +150,7 @@ powershell -ExecutionPolicy Bypass -File run_phases.ps1 -SkipBuild
 
 `-Push` uploads logs to a `device-logs` branch using a throwaway clone. `watch_runner.ps1` polls
 `main`, fast-forwards on new commits, and runs the same quick matrix.
-## Debugging
-- The signal handler covers SIGSEGV, SIGBUS, SIGABRT, and SIGILL. It prints a frame-pointer
-walk, classifies addresses as image/trampoline/loader/libc/libc++, and previews string arguments.
-- A ring buffer keeps the last 32 shim calls with registers and return addresses.
-- The watchdog sends SIGUSR2 to every thread to dump stacks when the engine hangs.
-- Unresolved data imports go to poison pages; LOADER_POISON_STRICT=1 turns the first touch into a
-fault instead of continuing.
-- FDE registration, GL traces, draw statistics, and frame PNGs can be enabled independently.
+
 ## Known limitations
 - One title, one device. This is not evidence of general iOS or Unity compatibility.
 - Partial Metal. The MSL-to-GLSL translator and Metal object model cover the paths this game
@@ -259,15 +165,3 @@ unresolved data imports read from poison pages.
 - No FairPlay decryption. The input executable must already be decrypted.
 - No arm64e or pointer authentication support. The tested guest is arm64.
 - The CLI path is diagnostic. The playable experience is the APK host.
-## Repository layout
-- tools/ — Python analysis and inspection scripts (`game_config.py`, `macho_runner.py`, `il2cpp_exports.py`, `compact_unwind.py`, …)
-- src/loader/ — `android_loader.cpp` (Mach-O loader, shims, engine stages, crash handling, IL2CPP tests), `trampolines.s`, `shim_types.hpp`, `apple_string.cpp`, `darwin_pthread.cpp`, `guest_fde.hpp`
-- src/objc/ — `objc_runtime.hpp`, `fake_foundation.hpp`, `fake_uikit.hpp` (guest Objective-C runtime and stateful Foundation/UIKit fakes)
-- src/gfx/ — `mtl_gles.hpp`, `gles_backend.*`, `msl_glsl.*` (Metal-on-GLES and MSL translation), `pvrtc.*`, `pvrtc_gpu.hpp` (PVRTC decoding)
-- src/platform/ — `android_app.cpp` (NativeActivity host, window, input, logging, JNI vibration), `audio_unit.cpp`, `haptics.cpp`
-- src/host/ — `main.cpp`, `chained_fixups.*` (host-side Mach-O inspector, macho-inspect)
-- tests/ — `fde_host_test.cpp`, plus `harness/` and `tls/` device ABI probes
-- build_cli.sh, build_apk.sh — authoritative loader builds
-- android/AndroidManifest.xml — NativeActivity manifest
-- run_phases.ps1, watch_runner.ps1, run_matrix.txt — device test harness
-- CMakeLists.txt — inspector-only build; not used for the loader
