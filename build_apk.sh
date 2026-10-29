@@ -14,7 +14,6 @@ CXX=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android31-cla
 CC=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android31-clang.cmd
 ADB=$SDK/platform-tools/adb.exe
 GLUE=$NDK/sources/android/native_app_glue
-PKG=com.tanosshi.xnuroid
 OUT=build/apk
 
 rm -rf "$OUT"
@@ -33,8 +32,12 @@ mkdir -p "$OUT/lib/arm64-v8a"
 if [ ! -f build/libsysc++.so ]; then "$ADB" pull /system/lib64/libc++.so build/libsysc++.so >/dev/null; fi
 cp build/libsysc++.so "$OUT/lib/arm64-v8a/libsysc++.so"
 
-"$BT/aapt2.exe" link -o build/base.apk --manifest android/AndroidManifest.xml -I "$PLATFORM" \
-    --min-sdk-version 31 --target-sdk-version 33
+# Package id, label and launcher icon come from the configured game's Info.plist (tools/game_config.py).
+rm -rf build/res build/res.zip
+PKG=$(python -I tools/apk_branding.py build/res android/AndroidManifest.xml build/AndroidManifest.xml)
+"$BT/aapt2.exe" compile --dir build/res -o build/res.zip
+"$BT/aapt2.exe" link -o build/base.apk --manifest build/AndroidManifest.xml -I "$PLATFORM" \
+    --min-sdk-version 31 --target-sdk-version 33 build/res.zip
 python -I - build/base.apk "$OUT" <<'EOF'
 import os, sys, zipfile
 apk, root = sys.argv[1], sys.argv[2]
