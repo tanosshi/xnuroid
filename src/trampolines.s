@@ -323,6 +323,8 @@ objc_fallback_asm:
     stp x6, x7, [sp, #64]
     stp d0, d1, [sp, #80]
     stp d2, d3, [sp, #96]
+    mov x0, x8                // indirect-result pointer (structs > 32 bytes, e.g. CGAffineTransform)
+    bl objc_set_in_x8
     bl objc_in_d_ptr          // x0 = thread-local double[4]: the message's d0-d3 arguments
     ldp d0, d1, [sp, #80]
     stp d0, d1, [x0]

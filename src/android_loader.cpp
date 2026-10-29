@@ -16,6 +16,8 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <mutex>
 #include <time.h>
 #include <stdarg.h>
 #include <dirent.h>
@@ -500,17 +502,36 @@ extern "C" void native_dyld_register_func_for_add_image(void (*func)(const void*
 extern "C" void native_dyld_register_func_for_remove_image(void (*func)(const void* mh, intptr_t vmaddr_slide)) {}
 
 // Apple Grand Central Dispatch (GCD) emulation
+// dispatch_semaphore_t is an opaque heap object here: a POSIX semaphore. Timeouts are dispatch_time() values, which
+// native_dispatch_time encodes as absolute CLOCK_MONOTONIC nanoseconds (DISPATCH_TIME_FOREVER = ~0).
 extern "C" void* native_dispatch_semaphore_create(long value) {
-    static uint64_t g_sem_id = 0x1000;
-    return reinterpret_cast<void*>(++g_sem_id);
+    if (value < 0) return nullptr;
+    auto* s = new sem_t;
+    sem_init(s, 0, static_cast<unsigned>(value));
+    return s;
 }
 
 extern "C" long native_dispatch_semaphore_wait(void* dsema, uint64_t timeout) {
-    return 0;
+    auto* s = static_cast<sem_t*>(dsema);
+    if (!s) return 0;
+    if (timeout == ~0ull) {
+        while (sem_wait(s) != 0 && errno == EINTR) {}
+        return 0;
+    }
+    timespec deadline{static_cast<time_t>(timeout / 1000000000ull), static_cast<long>(timeout % 1000000000ull)};
+    for (;;) {
+        if (sem_clockwait(s, CLOCK_MONOTONIC, &deadline) == 0) return 0;
+        if (errno != EINTR) return 1;   // timed out
+    }
 }
 
 extern "C" long native_dispatch_semaphore_signal(void* dsema) {
-    return 0;
+    auto* s = static_cast<sem_t*>(dsema);
+    if (!s) return 0;
+    int waiting = 0;
+    sem_getvalue(s, &waiting);
+    sem_post(s);
+    return waiting < 0 ? 1 : 0;   // non-zero when a waiter was woken
 }
 
 extern "C" void* native_dispatch_queue_create(const char* label, void* attr) {
@@ -800,10 +821,26 @@ extern "C" void native_block_object_dispose(const void* obj, int flags) { (void)
 extern "C" int native_kern_failure() { return 5; }
 extern "C" void* native_null() { return nullptr; }
 extern "C" void* native_dispatch_fake_handle() { return calloc(1, 64); }
-extern "C" uint64_t native_dispatch_time(uint64_t when, int64_t delta) { return when + static_cast<uint64_t>(delta); }
-extern "C" int native_cond_timedwait_relative_np(void*, void*, const timespec* rel) {
-    if (rel) { timespec t = *rel; nanosleep(&t, nullptr); }
-    return 60;  // Darwin ETIMEDOUT
+// dispatch_time: absolute CLOCK_MONOTONIC ns. DISPATCH_TIME_NOW (0) means "now"; DISPATCH_TIME_FOREVER stays ~0.
+extern "C" uint64_t native_dispatch_time(uint64_t when, int64_t delta) {
+    if (when == ~0ull) return ~0ull;
+    if (when == 0) {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        when = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+    }
+    return delta < 0 && static_cast<uint64_t>(-delta) > when ? 0 : when + static_cast<uint64_t>(delta);
+}
+extern "C" int native_cond_timedwait_relative_np(pthread_cond_t* cond, pthread_mutex_t* mutex, const timespec* rel) {
+    timespec abs;
+    clock_gettime(CLOCK_REALTIME, &abs);
+    if (rel) {
+        abs.tv_sec += rel->tv_sec;
+        abs.tv_nsec += rel->tv_nsec;
+        if (abs.tv_nsec >= 1000000000L) { abs.tv_sec += 1; abs.tv_nsec -= 1000000000L; }
+    }
+    int rc = pthread_cond_timedwait(cond, mutex, &abs);
+    return rc == ETIMEDOUT ? 60 : rc;   // Darwin ETIMEDOUT
 }
 // ObjC exception personality: C++ exceptions never need to be caught by ObjC frames; keep unwinding.
 extern "C" int native_objc_personality(int, int, uint64_t, void*, void*) { return 8; /* _URC_CONTINUE_UNWIND */ }
@@ -943,14 +980,36 @@ extern "C" const void* native_getsectbynamefromheader_64(const void* mhp_ptr, co
     return nullptr;
 }
 
-extern "C" int native_semaphore_create(uint32_t task, void** sem, int policy, int value) {
-    static uint64_t sem_id = 0x5000;
-    if (sem) *sem = reinterpret_cast<void*>(++sem_id);
+// Mach semaphores (Unity's PlatformSemaphore on Apple: job system and render-thread command queue). semaphore_t is a
+// 32-bit port name; it indexes a table of POSIX semaphores. Destroyed slots are kept so a late signal stays harmless.
+static std::mutex g_mach_sem_mu;
+static std::vector<sem_t*> g_mach_sems;
+static sem_t* mach_sem(uint32_t name) {
+    std::lock_guard<std::mutex> l(g_mach_sem_mu);
+    uint32_t i = name - 0x5000;
+    return name >= 0x5000 && i < g_mach_sems.size() ? g_mach_sems[i] : nullptr;
+}
+extern "C" int native_semaphore_create(uint32_t, uint32_t* sem, int, int value) {
+    auto* s = new sem_t;
+    sem_init(s, 0, static_cast<unsigned>(value < 0 ? 0 : value));
+    std::lock_guard<std::mutex> l(g_mach_sem_mu);
+    g_mach_sems.push_back(s);
+    if (sem) *sem = 0x5000 + static_cast<uint32_t>(g_mach_sems.size() - 1);
     return 0;
 }
-extern "C" int native_semaphore_destroy(uint32_t task, void* sem) { return 0; }
-extern "C" int native_semaphore_signal(void* sem) { return 0; }
-extern "C" int native_semaphore_wait(void* sem) { return 0; }
+extern "C" int native_semaphore_destroy(uint32_t, uint32_t sem) { return mach_sem(sem) ? 0 : 15; }   // KERN_INVALID_NAME
+extern "C" int native_semaphore_signal(uint32_t sem) {
+    sem_t* s = mach_sem(sem);
+    if (!s) return 15;
+    sem_post(s);
+    return 0;
+}
+extern "C" int native_semaphore_wait(uint32_t sem) {
+    sem_t* s = mach_sem(sem);
+    if (!s) return 15;
+    while (sem_wait(s) != 0 && errno == EINTR) {}
+    return 0;
+}
 
 extern "C" int native_mach_port_allocate(uint32_t task, int right, uint32_t* name) {
     static uint32_t g_port = 0x200;
@@ -1720,343 +1779,22 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
     frame.ret_x0 = frame.x[0];
 }
 
-// Minimal Foundation for engine mode: one fake NSBundle and heap-allocated fake NSStrings.
-// Pointers are tracked in a set (receivers can be arbitrary), so lookups never dereference unknown memory.
-static thread_local double g_objc_ret_d[4];
-static thread_local double g_objc_in_d[4];
-extern "C" double* objc_in_d_ptr() { return g_objc_in_d; }
-extern "C" double* objc_ret_d_ptr() { return g_objc_ret_d; }
-static void objc_ret_double(double v) { g_objc_ret_d[0] = v; }
-static void objc_ret_float(float v) { g_objc_ret_d[0] = 0; std::memcpy(&g_objc_ret_d[0], &v, sizeof v); }
-static void objc_ret_rect(double x, double y, double w, double h) { g_objc_ret_d[0] = x; g_objc_ret_d[1] = y; g_objc_ret_d[2] = w; g_objc_ret_d[3] = h; }
-
-struct FakeObjcObj {
-    int kind; std::string s;
-    std::unordered_map<std::string, uint64_t> props;   // Metal-style property bag: set<Name>: / <name>
-    void* mem = nullptr; size_t len = 0;               // MTLBuffer storage
-    std::vector<uint64_t> handlers;                    // command buffer completed/scheduled handler blocks
-};   // kind 1 = bundle, 2 = string
-static std::unordered_map<void*, FakeObjcObj*> g_fake_objc;
-static FakeObjcObj* fake_lookup(uint64_t p) {
-    auto it = g_fake_objc.find(reinterpret_cast<void*>(p));
-    return it == g_fake_objc.end() ? nullptr : it->second;
-}
-static uint64_t fake_make(int kind, const std::string& s) {
-    auto* o = new FakeObjcObj{kind, s};
-    void* handle = calloc(1, 32);   // a real, distinct, non-null address to hand to the guest
-    g_fake_objc[handle] = o;
-    return reinterpret_cast<uint64_t>(handle);
-}
-static const char* const kFakeAppDir = "/data/local/tmp/game";
-// Reads an NSString argument: one of our fake strings, or a compile-time @"..." literal (__NSConstantString:
-// isa, flags, char* data, length) living in the loaded guest image.
-static bool objc_string_value(uint64_t p, std::string& out) {
-    if (!p) return false;
-    if (FakeObjcObj* f = fake_lookup(p)) {
-        if (f->kind != 2) return false;
-        out = f->s;
-        return true;
-    }
-    uint64_t base = reinterpret_cast<uint64_t>(g_loaded_image_base);
-    uint64_t end = base + g_loaded_image_size;
-    if (p < base || p + 32 > end) return false;
-    uint64_t data = *reinterpret_cast<uint64_t*>(p + 16);
-    uint64_t len = *reinterpret_cast<uint64_t*>(p + 24);
-    if (data < base || data >= end || len > 4096) return false;
-    out.assign(reinterpret_cast<const char*>(data), static_cast<size_t>(len));
-    return true;
-}
-// kind 3 = generic fake Metal object (device, queue, buffer, texture, library, ...): capability queries say yes,
-// factory selectors (new*/make*) return another fake, everything else is nil/0.
-static uint64_t fake_metal_object() { return fake_make(3, "mtl"); }
-static FakeObjcObj* fake_metal_bag(uint64_t* handle_out = nullptr) {
-    uint64_t h = fake_make(3, "mtl");
-    if (handle_out) *handle_out = h;
-    return fake_lookup(h);
-}
-static std::string lower_first(const std::string& s) {
-    std::string r = s;
-    if (!r.empty() && r[0] >= 'A' && r[0] <= 'Z') r[0] = static_cast<char>(r[0] + 32);
-    return r;
-}
-static size_t colon_count(const std::string& s) { size_t n = 0; for (char c : s) n += c == ':'; return n; }
-static void run_block(uint64_t block, uint64_t arg) {
-    if (!block) return;
-    void* inv = *reinterpret_cast<void**>(block + 16);   // Block_layout.invoke
-    if (inv) reinterpret_cast<void (*)(uint64_t, uint64_t)>(inv)(block, arg);
-}
-// Metal objects are property bags: set<Name>: stores, <name> reads back, new*/make* create more bags, buffers own real
-// memory, descriptors carry their values into the textures made from them, command buffers fire their handlers.
-static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
-    FakeObjcObj* self = fake_lookup(frame.x[0]);
-    auto starts = [&](const char* p) { return sel.compare(0, std::strlen(p), p) == 0; };
-    const size_t colons = colon_count(sel);
-    const bool is_class = self && (self->kind == 7 || self->s.compare(0, 6, "class:") == 0);
-
-    // class-style constructors for descriptors
-    if (sel == "texture2DDescriptorWithPixelFormat:width:height:mipmapped:" || sel == "textureCubeDescriptorWithPixelFormat:size:mipmapped:" ||
-        sel == "textureBufferDescriptorWithPixelFormat:width:usage:") {
-        uint64_t h; FakeObjcObj* d = fake_metal_bag(&h);
-        d->props["pixelFormat"] = frame.x[2];
-        d->props["width"] = frame.x[3];
-        if (sel[7] == '2') { d->props["height"] = frame.x[4]; d->props["textureType"] = 2; d->props["mipmapLevelCount"] = frame.x[5] ? 1 + 10 : 1; }
-        else if (sel[7] == 'C') { d->props["height"] = frame.x[3]; d->props["textureType"] = 5; d->props["mipmapLevelCount"] = frame.x[4] ? 1 + 10 : 1; }
-        d->props["depth"] = 1; d->props["arrayLength"] = 1; d->props["sampleCount"] = 1;
-        frame.ret_x0 = h; return true;
-    }
-    if (self && !is_class && self->kind == 3) {
-        if (sel == "name") { frame.ret_x0 = fake_make(2, self->s == "device" ? "FakeGPU" : "fake"); return true; }
-        if (sel == "description") { frame.ret_x0 = fake_make(2, "FakeMetalObject"); return true; }
-        if (sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" || sel == "alloc" ||
-            sel == "allocWithZone:" || starts("init") || sel == "copyWithZone:") { frame.ret_x0 = frame.x[0]; return true; }
-        if (sel == "contents") { frame.ret_x0 = reinterpret_cast<uint64_t>(self->mem); return true; }
-        if (sel == "length") { frame.ret_x0 = self->len; return true; }
-        // buffers
-        if (sel == "newBufferWithLength:options:") {
-            uint64_t h; FakeObjcObj* b = fake_metal_bag(&h);
-            b->len = frame.x[2]; b->mem = calloc(1, b->len ? b->len : 1); b->props["storageMode"] = (frame.x[3] >> 4) & 0xF;
-            frame.ret_x0 = h; return true;
-        }
-        if (sel == "newBufferWithBytes:length:options:") {
-            uint64_t h; FakeObjcObj* b = fake_metal_bag(&h);
-            b->len = frame.x[3]; b->mem = calloc(1, b->len ? b->len : 1);
-            if (frame.x[2] && b->len) std::memcpy(b->mem, reinterpret_cast<const void*>(frame.x[2]), b->len);
-            frame.ret_x0 = h; return true;
-        }
-        if (sel == "newBufferWithBytesNoCopy:length:options:deallocator:") {
-            uint64_t h; FakeObjcObj* b = fake_metal_bag(&h);
-            b->len = frame.x[3]; b->mem = reinterpret_cast<void*>(frame.x[2]);
-            frame.ret_x0 = h; return true;
-        }
-        // textures made from a descriptor / another texture inherit its values
-        if (starts("newTextureWithDescriptor:") || starts("newTextureViewWithPixelFormat:")) {
-            uint64_t h; FakeObjcObj* t = fake_metal_bag(&h);
-            FakeObjcObj* src = starts("newTextureViewWithPixelFormat:") ? self : fake_lookup(frame.x[2]);
-            if (src) t->props = src->props;
-            if (starts("newTextureViewWithPixelFormat:")) t->props["pixelFormat"] = frame.x[2];
-            frame.ret_x0 = h; return true;
-        }
-        // command buffers
-        if (sel == "addCompletedHandler:" || sel == "addScheduledHandler:") { self->handlers.push_back(frame.x[2]); return true; }
-        if (sel == "commit" || sel == "waitUntilCompleted" || sel == "waitUntilScheduled") {
-            if (sel == "commit") {
-                std::vector<uint64_t> hs;
-                hs.swap(self->handlers);
-                for (uint64_t blk : hs) run_block(blk, frame.x[0]);
-            }
-            return true;
-        }
-        if (sel == "status") { frame.ret_x0 = 4; return true; }                        // MTLCommandBufferStatusCompleted
-        if (sel == "error") { frame.ret_x0 = 0; return true; }
-        if (sel == "objectAtIndexedSubscript:") {
-            std::string key = "#obj" + std::to_string(frame.x[2]);
-            auto it = self->props.find(key);
-            if (it == self->props.end()) { uint64_t h; fake_metal_bag(&h); it = self->props.emplace(key, h).first; }
-            frame.ret_x0 = it->second; return true;
-        }
-        if (sel == "setObject:atIndexedSubscript:") { self->props["#obj" + std::to_string(frame.x[3])] = frame.x[2]; return true; }
-        // property bag: setFoo: / foo
-        if (starts("set") && colons == 1) {
-            std::string key = lower_first(sel.substr(3, sel.size() - 4));
-            self->props[key] = frame.x[2];
-            uint64_t bits; std::memcpy(&bits, &g_objc_in_d[0], 8);
-            self->props[key + "#d"] = bits;
-            return true;
-        }
-        if (colons == 0) {
-            auto it = self->props.find(sel);
-            if (it != self->props.end()) {
-                frame.ret_x0 = it->second;
-                auto dt = self->props.find(sel + "#d");
-                if (dt != self->props.end()) { double d; std::memcpy(&d, &dt->second, 8); objc_ret_double(d); }
-                return true;
-            }
-            // object-valued properties are created on first read
-            static const char* const objprops[] = {"Descriptor", "Attachments", "Attachment", "Layouts", "Attributes", "Descriptors",
-                                                   "Buffers", "Layout", "Options"};
-            for (const char* suf : objprops) {
-                size_t n = std::strlen(suf);
-                if (sel.size() > n && sel.compare(sel.size() - n, n, suf) == 0) {
-                    uint64_t h; fake_metal_bag(&h);
-                    self->props[sel] = h; frame.ret_x0 = h; return true;
-                }
-            }
-        }
-    }
-    if (starts("supports") || sel == "isDepth24Stencil8PixelFormatSupported" || sel == "areProgrammableSamplePositionsSupported") {
-        frame.ret_x0 = 1; return true;
-    }
-    // descriptor classes: +new, +alloc, +xxxDescriptor, +renderPassDescriptor ...
-    if (is_class || (self == nullptr)) {
-        if (sel == "new" || sel == "alloc" || sel == "allocWithZone:" || sel.find("Descriptor") != std::string::npos ||
-            sel == "defaultCompileOptions" || sel == "renderPassDescriptor") {
-            uint64_t h; fake_metal_bag(&h); frame.ret_x0 = h; return true;
-        }
-    }
-    if (starts("new") || starts("make") || starts("heap") || sel == "device" || sel == "commandBuffer" ||
-        sel == "commandBufferWithUnretainedReferences" || sel == "blitCommandEncoder" ||
-        starts("renderCommandEncoderWith") || sel == "computeCommandEncoder" || sel == "parallelRenderCommandEncoderWithDescriptor:" ||
-        sel == "commandQueue" || sel == "nextDrawable" || sel == "texture" || sel == "drawable") {
-        uint64_t h; fake_metal_bag(&h);
-        if (self) { FakeObjcObj* n = fake_lookup(h); n->props["#parent"] = frame.x[0]; }
-        frame.ret_x0 = h; return true;
-    }
-    if (sel == "maxBufferLength" || sel == "recommendedMaxWorkingSetSize" || sel == "maxTextureSize") { frame.ret_x0 = 0x40000000ull; return true; }
-    if (sel == "registryID") { frame.ret_x0 = 1; return true; }
-    return false;
-}
-
-static bool fake_foundation(CallFrame& frame, const std::string& sel) {
-    FakeObjcObj* self = fake_lookup(frame.x[0]);
-    // --- foreign class objects (kind 7: _OBJC_CLASS_$_UIDevice, ...) ---
-    if (self && self->kind == 7) {
-        const std::string& cls = self->s;
-        if (cls.compare(0, 3, "MTL") == 0 && fake_metal_message(frame, sel)) return true;
-        if (sel == "stringWithFormat:") {   // variadic: keep the (unformatted) format string, enough for labels/logging
-            std::string f;
-            frame.ret_x0 = objc_string_value(frame.x[2], f) ? fake_make(2, f) : fake_make(2, "");
-            return true;
-        }
-        if (sel == "alloc" || sel == "allocWithZone:" || sel == "new") { frame.ret_x0 = fake_make(5, cls); return true; }
-        if (sel == "class" || sel == "self" || sel == "retain") { frame.ret_x0 = frame.x[0]; return true; }
-        if (sel == "instancesRespondToSelector:" || sel == "respondsToSelector:") {
-            std::string q;
-            const char* qs = reinterpret_cast<const char*>(frame.x[2]);
-            if (qs) q = qs;
-            // Only claim the selectors this loader actually emulates.
-            static const char* const yes[] = {"systemVersion", "currentDevice", "mainScreen", "sharedApplication", "processInfo",
-                                              "nativeScale", "maximumFramesPerSecond", "nativeBounds", nullptr};
-            bool ok = false;
-            for (const char* const* y = yes; *y; ++y) if (q == *y) ok = true;
-            frame.ret_x0 = ok;
-            return true;
-        }
-        if (sel == "isSubclassOfClass:" || sel == "isKindOfClass:") { frame.ret_x0 = 0; return true; }
-        if (sel == "name" || sel == "description") { frame.ret_x0 = fake_make(2, cls); return true; }
-        // fall through: class-level singletons such as +currentDevice are handled below
-    }
-    // --- UIKit / Foundation singletons (kind 6, name in s) ---
-    if (sel == "currentDevice" || sel == "mainScreen" || sel == "sharedApplication" || sel == "processInfo" ||
-        sel == "currentLocale" || sel == "preferredLanguages") {
-        static std::unordered_map<std::string, uint64_t> singles;
-        const char* nm = sel == "currentDevice" ? "UIDevice" : sel == "mainScreen" ? "UIScreen" :
-                         sel == "sharedApplication" ? "UIApplication" : sel == "processInfo" ? "NSProcessInfo" : "NSLocale";
-        auto it = singles.find(nm);
-        if (it == singles.end()) it = singles.emplace(nm, fake_make(6, nm)).first;
-        frame.ret_x0 = it->second;
-        return true;
-    }
-    if (self && self->kind == 6) {
-        const std::string& cls = self->s;
-        if (cls == "UIDevice") {
-            if (sel == "systemVersion") { frame.ret_x0 = fake_make(2, "16.0"); return true; }
-            if (sel == "systemName") { frame.ret_x0 = fake_make(2, "iOS"); return true; }
-            if (sel == "model" || sel == "localizedModel") { frame.ret_x0 = fake_make(2, "iPhone"); return true; }
-            if (sel == "name") { frame.ret_x0 = fake_make(2, "iPhone"); return true; }
-            if (sel == "identifierForVendor") { frame.ret_x0 = fake_make(5, "uuid"); return true; }
-            if (sel == "userInterfaceIdiom") { frame.ret_x0 = 0; return true; }       // UIUserInterfaceIdiomPhone
-            if (sel == "orientation") { frame.ret_x0 = 1; return true; }              // portrait
-            if (sel == "isMultitaskingSupported") { frame.ret_x0 = 1; return true; }
-            if (sel == "batteryLevel") { objc_ret_float(1.0f); return true; }
-            if (sel == "batteryState") { frame.ret_x0 = 2; return true; }
-        } else if (cls == "UIScreen") {
-            if (sel == "bounds" || sel == "applicationFrame") { objc_ret_rect(0, 0, 360, 780); return true; }
-            if (sel == "nativeBounds") { objc_ret_rect(0, 0, 1080, 2340); return true; }
-            if (sel == "scale" || sel == "nativeScale") { objc_ret_double(3.0); return true; }
-            if (sel == "maximumFramesPerSecond") { frame.ret_x0 = 60; return true; }
-            if (sel == "brightness") { objc_ret_double(0.5); return true; }
-        } else if (cls == "UIApplication") {
-            if (sel == "applicationState") { frame.ret_x0 = 0; return true; }           // active
-            if (sel == "statusBarOrientation") { frame.ret_x0 = 1; return true; }
-            if (sel == "isIdleTimerDisabled") { frame.ret_x0 = 0; return true; }
-        } else if (cls == "NSProcessInfo") {
-            if (sel == "physicalMemory") { frame.ret_x0 = 6ull << 30; return true; }
-            if (sel == "processorCount" || sel == "activeProcessorCount") { frame.ret_x0 = 8; return true; }
-            if (sel == "isLowPowerModeEnabled") { frame.ret_x0 = 0; return true; }
-            if (sel == "systemUptime") { objc_ret_double(1000.0); return true; }
-            if (sel == "processName") { frame.ret_x0 = fake_make(2, "UnityFramework"); return true; }
-        }
-        bool keep = sel == "retain" || sel == "autorelease" || sel == "self";
-        frame.ret_x0 = keep ? frame.x[0] : 0;
-        return true;
-    }
-    if (self && self->kind == 5) {      // generic foreign object (NSMutableArray, UIView, ...): inert, answers nil/0
-        bool keep = sel.compare(0, 4, "init") == 0 || sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" ||
-                    sel == "mutableCopy" || sel == "alloc";
-        frame.ret_x0 = keep ? frame.x[0] : 0;
-        return true;
-    }
-    if (self && self->kind == 3) {
-        if (fake_metal_message(frame, sel)) return true;
-        frame.ret_x0 = 0;
-        return true;
-    }
-    if (sel == "bundleWithPath:" || sel == "bundleForClass:" || sel == "bundleWithIdentifier:") {
-        std::string path;
-        if (objc_string_value(frame.x[2], path) && path.find("/System/Library/") != std::string::npos) {
-            fprintf(stderr, "[OBJC] framework bundle %s -> fake, load succeeds\n", path.c_str());
-            frame.ret_x0 = fake_make(4, path);   // kind 4 = Apple framework bundle: load succeeds
-            return true;
-        }
-    }
-    if (self && self->kind == 4) {
-        if (sel == "load") { frame.ret_x0 = 1; return true; }
-        if (sel == "isLoaded") { frame.ret_x0 = 1; return true; }
-        if (sel == "unload") { frame.ret_x0 = 0; return true; }
-        frame.ret_x0 = 0;
-        return true;
-    }
-    if (sel == "mainBundle") {
-        static uint64_t bundle = fake_make(1, kFakeAppDir);
-        frame.ret_x0 = bundle;
-        return true;
-    }
-    if (sel == "stringWithUTF8String:" || sel == "stringWithCString:encoding:") {
-        const char* c = reinterpret_cast<const char*>(frame.x[2]);
-        frame.ret_x0 = c ? fake_make(2, c) : 0;
-        return true;
-    }
-    if (self && self->kind == 1) {
-        if (sel == "bundlePath" || sel == "resourcePath" || sel == "executablePath" || sel == "privateFrameworksPath") {
-            frame.ret_x0 = fake_make(2, self->s);
-            return true;
-        }
-        if (sel == "bundleIdentifier") { frame.ret_x0 = fake_make(2, "com.fake.game"); return true; }
-    }
-    if (self && self->kind == 2) {
-        if (sel == "UTF8String" || sel == "cString" || sel == "fileSystemRepresentation" || sel == "lossyCString") {
-            frame.ret_x0 = reinterpret_cast<uint64_t>(self->s.c_str());
-            return true;
-        }
-        if (sel == "length") { frame.ret_x0 = self->s.size(); return true; }
-        if (sel == "stringByAppendingPathComponent:") {
-            std::string a;
-            frame.ret_x0 = objc_string_value(frame.x[2], a) ? fake_make(2, self->s + "/" + a) : 0;
-            return true;
-        }
-        if (sel == "isEqualToString:") {
-            std::string a;
-            frame.ret_x0 = objc_string_value(frame.x[2], a) && a == self->s;
-            return true;
-        }
-        if (sel == "description" || sel == "copy" || sel == "retain" || sel == "autorelease") { frame.ret_x0 = frame.x[0]; return true; }
-    }
-    return false;
-}
-
-extern "C" void* native_mtl_create_system_default_device() {
-    static uint64_t dev = fake_make(3, "device");
-    return reinterpret_cast<void*>(dev);
-}
+#include "fake_foundation.hpp"
+#include "fake_uikit.hpp"
 
 static void shim_objc_msgSend(CallFrame& frame, void*) {
     void* receiver = reinterpret_cast<void*>(frame.x[0]);
     const char* sel = reinterpret_cast<const char*>(frame.x[1]);
     static std::unordered_set<std::string> seen_selectors;
     static int call_seq = 0;
+    static std::mutex log_mu;
     std::string sel_str = sel ? sel : "null";
-    if (seen_selectors.find(sel_str) == seen_selectors.end()) {
-        seen_selectors.insert(sel_str);
+    bool first_use;
+    {
+        std::lock_guard<std::mutex> l(log_mu);
+        first_use = seen_selectors.insert(sel_str).second;
+    }
+    if (first_use) {
         FakeObjcObj* fo = fake_lookup(frame.x[0]);
         printf("[OBJC_DYNAMIC #%d] [%p %s]%s%s\n", ++call_seq, receiver, sel_str.c_str(), fo ? "  fake:" : "", fo ? (std::to_string(fo->kind) + ":" + fo->s).c_str() : "");
     }
@@ -2066,7 +1804,12 @@ static void shim_objc_msgSend(CallFrame& frame, void*) {
     if (nil_mode) {
         if (fake_foundation(frame, sel_str)) {
             static std::unordered_set<std::string> ret_seen;
-            if (ret_seen.insert(sel_str).second) printf("[OBJC_RET] %s -> %#llx\n", sel_str.c_str(), static_cast<unsigned long long>(frame.ret_x0));
+            bool first_ret;
+            {
+                std::lock_guard<std::mutex> l(log_mu);
+                first_ret = ret_seen.insert(sel_str).second;
+            }
+            if (first_ret) printf("[OBJC_RET] %s -> %#llx\n", sel_str.c_str(), static_cast<unsigned long long>(frame.ret_x0));
             return;
         }
         static const char* const keep_self[] = {"alloc", "allocWithZone:", "init", "new", "retain", "autorelease", "self",
@@ -2393,11 +2136,9 @@ void* native_cfstring_create_with_characters(void*, const uint16_t* chars, int64
 // NS functions
 void* native_nsclass_from_string(void* name) {
     std::string n;
-    objc_string_value(reinterpret_cast<uint64_t>(name), n);
-    static std::unordered_map<std::string, uint64_t> classes;
-    auto it = classes.find(n);
-    if (it == classes.end()) it = classes.emplace(n, fake_make(3, "class:" + n)).first;
-    return reinterpret_cast<void*>(it->second);
+    if (!objc_string_value(reinterpret_cast<uint64_t>(name), n) || n.empty()) return nullptr;
+    if (objcrt::GClass* gc = objcrt::find_class_by_name(n.c_str())) return reinterpret_cast<void*>(gc->addr);
+    return reinterpret_cast<void*>(fake_class_named(n));
 }
 void* native_ns_temp_dir() { return reinterpret_cast<void*>(fake_make(2, "/data/local/tmp/")); }
 void* native_ns_search_paths(uint64_t, uint64_t, int) { return nullptr; }
@@ -2591,18 +2332,19 @@ extern "C" uint64_t objc_fallback_c(uint64_t x0, uint64_t x1, uint64_t x2, uint6
             if (s == "initialize" || s == "load" || s == "release") return 0;
             if (s == "respondsToSelector:") return objcrt::lookup_imp(x0, reinterpret_cast<const char*>(x2)) != 0;
         } else {        // instance receiver
-            if (s.compare(0, 4, "init") == 0 || s == "retain" || s == "autorelease" || s == "self" || s == "copy" ||
-                s == "mutableCopy" || s == "copyWithZone:" || s == "retainAutorelease") return x0;
-            if (s == "release" || s == "dealloc" || s == "performSelector:") return 0;
             if (s == "class") return gc->addr;
             if (s == "isEqual:") return x0 == x2;
             if (s == "hash") return x0;
-            if (s == "isKindOfClass:" || s == "isMemberOfClass:") {
-                bool c2 = false;
-                objcrt::GClass* t = objcrt::guest_class_for_object(x2, &c2);
-                return t && c2 && objcrt::is_kind_of(gc, t);
-            }
+            if (s == "isKindOfClass:" || s == "isMemberOfClass:") return fakeui::is_kind_of(x0, x2);
             if (s == "respondsToSelector:") return objcrt::lookup_imp(x0, reinterpret_cast<const char*>(x2)) != 0;
+            if (s == "performSelector:") return fakeui::send_sel(x0, reinterpret_cast<const char*>(x2), 0);
+            if (s == "performSelector:withObject:") return fakeui::send_sel(x0, reinterpret_cast<const char*>(x2), x3);
+            // Subclasses of UIKit classes keep UIKit state (frame, layer, subviews...) in fake_uikit.hpp.
+            if (!fakeui::ui_state(x0)) {
+                if (s.compare(0, 4, "init") == 0 || s == "retain" || s == "autorelease" || s == "self" || s == "copy" ||
+                    s == "mutableCopy" || s == "copyWithZone:" || s == "retainAutorelease") return x0;
+                if (s == "release" || s == "dealloc") return 0;
+            }
         }
     }
     g_objc_ret_d[0] = g_objc_ret_d[1] = g_objc_ret_d[2] = g_objc_ret_d[3] = 0;
@@ -2617,7 +2359,8 @@ uint64_t native_objc_alloc(uint64_t cls) {
     bool is_cls = false;
     if (objcrt::GClass* gc = objcrt::guest_class_for_object(cls, &is_cls))
         if (is_cls) return objcrt::alloc_instance(gc);
-    return fake_make(5, "obj");
+    std::string name = fakeui::class_name_of_class(cls);
+    return name.empty() ? fake_make(5, "obj") : fakeui::alloc_for_class(name);
 }
 uint64_t native_objc_alloc_init(uint64_t cls) { return objc_send_noargs(native_objc_alloc(cls), "init"); }
 uint64_t native_objc_identity(uint64_t x) { return x; }
@@ -2630,22 +2373,42 @@ uint64_t native_objc_get_property(uint64_t self, void*, int64_t off, bool) { ret
 void native_objc_set_property(uint64_t self, void*, uint64_t v, int64_t off) { if (self) *reinterpret_cast<uint64_t*>(self + off) = v; }
 uint64_t native_objc_opt_class(uint64_t o) {
     bool is_cls = false;
-    objcrt::GClass* gc = objcrt::guest_class_for_object(o, &is_cls);
-    return gc ? gc->addr : 0;
+    if (objcrt::GClass* gc = objcrt::guest_class_for_object(o, &is_cls)) return gc->addr;
+    FakeObjcObj* f = fake_lookup(o);
+    if (!f) return 0;
+    if (f->kind == 7 || (f->kind == 3 && f->s.compare(0, 6, "class:") == 0)) return o;   // [Cls class] == Cls
+    if (f->kind == 2) return fake_class_named("NSString");
+    if (f->kind == 5 || f->kind == 6 || f->kind == 8) return fake_class_named(f->s);
+    return 0;
 }
-uint64_t native_objc_opt_is_kind_of(uint64_t o, uint64_t cls) {
-    bool oc = false, tc = false;
-    objcrt::GClass* gc = objcrt::guest_class_for_object(o, &oc);
-    objcrt::GClass* t = objcrt::guest_class_for_object(cls, &tc);
-    return gc && t && objcrt::is_kind_of(gc, t);
+uint64_t native_objc_opt_is_kind_of(uint64_t o, uint64_t cls) { return fakeui::is_kind_of(o, cls); }
+uint64_t native_class_replace_method(uint64_t cls, const char* sel, uint64_t imp, const char*) {
+    uint64_t old = objcrt::replace_method(cls, sel, imp);
+    fprintf(stderr, "[OBJC-RT] class_replaceMethod(%#llx, %s, image+%#llx)\n", static_cast<unsigned long long>(cls), sel ? sel : "?",
+            static_cast<unsigned long long>(imp - reinterpret_cast<uint64_t>(g_loaded_image_base)));
+    return old;
 }
+// @synchronized: one recursive mutex per object
+static std::recursive_mutex* objc_sync_mutex(uint64_t o) {
+    static std::mutex mu;
+    static std::unordered_map<uint64_t, std::recursive_mutex*> m;
+    std::lock_guard<std::mutex> l(mu);
+    auto& slot = m[o];
+    if (!slot) slot = new std::recursive_mutex();
+    return slot;
+}
+int native_objc_sync_enter(uint64_t o) { if (o) objc_sync_mutex(o)->lock(); return 0; }
+int native_objc_sync_exit(uint64_t o) { if (o) objc_sync_mutex(o)->unlock(); return 0; }
 uint64_t native_objc_opt_responds(uint64_t o, const char* sel) { return sel && objcrt::lookup_imp(o, sel) != 0; }
 uint64_t native_objc_get_class(const char* name) {
     if (!name) return 0;
     if (objcrt::GClass* gc = objcrt::find_class_by_name(name)) return gc->addr;
     return reinterpret_cast<uint64_t>(native_nsclass_from_string(reinterpret_cast<void*>(fake_make(2, name))));
 }
-uint64_t native_object_get_class(uint64_t o) { return native_objc_opt_class(o); }
+uint64_t native_object_get_class(uint64_t o) {
+    if (uint64_t isa = objcrt::isa_of(o)) return isa;
+    return native_objc_opt_class(o);
+}
 const char* native_sel_register(const char* n) { return n ? objcrt::intern(n) : nullptr; }
 void native_objc_copy_struct(void* dst, const void* src, size_t n, bool, bool) { if (dst && src) std::memcpy(dst, src, n); }
 }
@@ -2676,6 +2439,9 @@ static void register_objc_runtime_natives() {
     for (const char* n : {"_objc_getClass", "_objc_lookUpClass", "_objc_getRequiredClass"})
         reg(n, reinterpret_cast<void*>(&native_objc_get_class));
     reg("_object_getClass", reinterpret_cast<void*>(&native_object_get_class));
+    reg("_class_replaceMethod", reinterpret_cast<void*>(&native_class_replace_method));
+    reg("_objc_sync_enter", reinterpret_cast<void*>(&native_objc_sync_enter));
+    reg("_objc_sync_exit", reinterpret_cast<void*>(&native_objc_sync_exit));
     reg("_sel_registerName", reinterpret_cast<void*>(&native_sel_register));
     reg("_objc_copyStruct", reinterpret_cast<void*>(&native_objc_copy_struct));
 }
@@ -2867,7 +2633,7 @@ static void init_custom_shims() {
         reg("_dispatch_time", reinterpret_cast<void*>(&native_dispatch_time));
         reg("_dispatch_source_create", reinterpret_cast<void*>(&native_dispatch_fake_handle));
         for (const char* n : {"_dispatch_source_cancel", "_dispatch_source_set_event_handler", "_dispatch_source_set_timer",
-                              "_class_replaceMethod", "_imp_implementationWithBlock", "_object_getClass"})
+                              "_imp_implementationWithBlock"})
             reg(n, reinterpret_cast<void*>(&native_null));
         for (const char* n : {"_mach_msg", "_mach_make_memory_entry_64", "_mach_port_move_member", "_mach_port_request_notification",
                               "_task_get_exception_ports", "_task_swap_exception_ports", "_thread_get_exception_ports",
@@ -2941,9 +2707,9 @@ static void init_custom_shims() {
     g_custom_shims["_vm_allocate"] = reinterpret_cast<void*>(&native_vm_allocate);
     g_custom_shims["_vm_deallocate"] = reinterpret_cast<void*>(&native_vm_deallocate);
 
-    // Dynamic ObjC message dispatch
-    g_custom_shims["_objc_msgSend"] = allocate_trampoline(shim_objc_msgSend, "_objc_msgSend");
-    g_custom_shims["_objc_msgSendSuper2"] = allocate_trampoline(shim_objc_msgSend, "_objc_msgSendSuper2");
+    // Dynamic ObjC message dispatch; engine mode already bound the guest-runtime dispatchers, which must win
+    g_custom_shims.emplace("_objc_msgSend", allocate_trampoline(shim_objc_msgSend, "_objc_msgSend"));
+    g_custom_shims.emplace("_objc_msgSendSuper2", allocate_trampoline(shim_objc_msgSend, "_objc_msgSendSuper2"));
 
     // Data symbols
     g_custom_shims["___stack_chk_guard"] = &g_stack_chk_guard_val;
@@ -2998,8 +2764,8 @@ static void* resolve_symbol(const std::string& name) {
         if (cit != s_dummy_classes.end()) return cit->second;
         void* cls;
         if (getenv("LOADER_ENGINE")) {   // engine mode: a named fake class object that messages can be answered for
-            size_t skip = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? 14 : 18;
-            cls = reinterpret_cast<void*>(fake_make(7, name.substr(skip)));
+            cls = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? reinterpret_cast<void*>(fake_class_named(name.substr(14)))
+                                                         : reinterpret_cast<void*>(fake_make(7, name.substr(18)));
         } else {
             cls = calloc(1, 128);
         }
@@ -3064,8 +2830,8 @@ static void* resolve_symbol(const std::string& name) {
         (name.rfind("_OBJC_CLASS_$_", 0) == 0 || name.rfind("_OBJC_METACLASS_$_", 0) == 0)) {
         // Engine mode: Objective-C class references to frameworks we do not have become fake class objects
         // (kind 7) instead of poison pages, so +class messages are answered rather than faulting.
-        size_t skip = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? 14 : 18;
-        void* obj = reinterpret_cast<void*>(fake_make(7, name.substr(skip)));
+        void* obj = name.rfind("_OBJC_CLASS_$_", 0) == 0 ? reinterpret_cast<void*>(fake_class_named(name.substr(14)))
+                                                          : reinterpret_cast<void*>(fake_make(7, name.substr(18)));
         g_resolved_cache[name] = obj;
         return obj;
     }
@@ -3887,6 +3653,13 @@ int main(int argc, char** argv) {
             printf("[E0] bundle path cache (image+0x2b428c8) was %p; seeding \"/data/local/tmp/game\"\n", static_cast<void*>(*bundle_cache));
             *bundle_cache = strdup("/data/local/tmp/game");
         }
+        if (atoi(eng) >= 8) {
+            // The app launch itself: -[UnityAppController application:didFinishLaunchingWithOptions:] runs engine init,
+            // view/display setup and startUnity: (queued by applicationDidBecomeActive:), then the display link ticks.
+            const char* fr = getenv("LOADER_FRAMES");
+            fakeui_run_application(fr ? atoi(fr) : 300);
+            return 0;
+        }
         printf("[E2] UnityInitApplicationNoGraphics(\"/data/local/tmp/game\") image+0x7cc3d4...\n"); fflush(stdout);
         reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))("/data/local/tmp/game");
         printf("[E2] returned: engine init without graphics completed\n"); fflush(stdout);
@@ -3912,39 +3685,6 @@ int main(int argc, char** argv) {
             printf("[E4] load application / first scene image+0x7cc6cc...\n"); fflush(stdout);
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cc6cc))();
             printf("[E4] returned\n"); fflush(stdout);
-        }
-        if (atoi(eng) >= 8) {
-            // -[UnityAppController repaint] (image+0x16e3c) minus its UIKit messages: UnityDeliverUIEvents (image+0x7cccac),
-            // then UnityRepaint (image+0x7cc818) unless UnityIsPaused (image+0x7ccba0). LOADER_FRAMES sets the tick count.
-            typedef int (*is_paused_fn)();
-            const char* fr = getenv("LOADER_FRAMES");
-            int frames = fr ? atoi(fr) : 120;
-            auto deliver_events = reinterpret_cast<engine_pre_fn>(get_fn(0x7cccac));
-            auto is_paused = reinterpret_cast<is_paused_fn>(get_fn(0x7ccba0));
-            auto repaint = reinterpret_cast<engine_pre_fn>(get_fn(0x7cc818));
-            printf("[E5] player loop: %d ticks of UnityRepaint image+0x7cc818\n", frames); fflush(stdout);
-            struct timespec t0, t1;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            double worst_ms = 0;
-            for (int f = 0; f < frames; ++f) {
-                struct timespec a, b;
-                clock_gettime(CLOCK_MONOTONIC, &a);
-                deliver_events();
-                bool paused = is_paused() != 0;
-                if (!paused) repaint();
-                clock_gettime(CLOCK_MONOTONIC, &b);
-                double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
-                if (ms > worst_ms) worst_ms = ms;
-                if (f < 3 || (f + 1) % 30 == 0 || paused)
-                    printf("[E5] tick %d%s %.2f ms\n", f + 1, paused ? " (paused, skipped)" : "", ms);
-                fflush(stdout);
-                // pace to ~60 Hz so time-based engine logic sees realistic frame deltas
-                if (ms < 16.6) usleep(static_cast<useconds_t>((16.6 - ms) * 1000));
-            }
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            printf("[E5] %d ticks done in %.1f s, worst tick %.2f ms\n", frames,
-                   (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, worst_ms);
-            fflush(stdout);
         }
         return 0;
     }

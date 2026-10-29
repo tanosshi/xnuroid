@@ -244,4 +244,36 @@ inline bool is_kind_of(GClass* c, GClass* target) {
     return false;
 }
 
+// Name of the first class outside the image in c's superclass chain ("UIView" for UnityView), or "" for root classes.
+inline std::string foreign_base(const GClass* c) {
+    for (; c; c = c->super) {
+        if (c->super) continue;
+        const std::string& f = c->foreign_super;
+        for (const char* pre : {"_OBJC_CLASS_$_", "_OBJC_METACLASS_$_"})
+            if (f.compare(0, std::strlen(pre), pre) == 0) return f.substr(std::strlen(pre));
+        return "";
+    }
+    return "";
+}
+
+// class_replaceMethod on a guest class or metaclass (cls is the class_t address). Returns the previous IMP.
+inline uint64_t replace_method(uint64_t cls, const char* sel, uint64_t imp) {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto it = g_by_addr.find(cls);
+    if (it == g_by_addr.end() || !sel) return 0;
+    uint64_t& slot = it->second->methods[intern_locked(sel)];
+    uint64_t old = slot;
+    slot = imp;
+    return old;
+}
+
+// object_getClass: an instance's class, or a class object's metaclass.
+inline uint64_t isa_of(uint64_t obj) {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto it = g_by_addr.find(obj);
+    if (it != g_by_addr.end()) return it->second->meta ? it->second->meta->addr : 0;
+    if (g_instances.count(obj)) return rd64(obj) & 0x00007fffffffffffull;
+    return 0;
+}
+
 }  // namespace objcrt
