@@ -106,7 +106,6 @@ if ($fw) {
 # ---- deploy ----
 & $adb devices | Tee-Object -FilePath (Join-Path $logs "adb_devices.txt")
 & $adb push xnuroid_loader /data/local/tmp/xnuroid_loader | Out-Null
-& $adb push throw_frames.txt /data/local/tmp/throw_frames.txt | Out-Null
 & $adb shell chmod 755 /data/local/tmp/xnuroid_loader
 
 # ---- sync game data: push files that exist in the IPA's Data folder but are missing on the phone ----
