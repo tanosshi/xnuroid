@@ -2233,7 +2233,33 @@ void* native_ns_temp_dir() {
     const char* t = getenv("LOADER_TMP_DIR");
     return reinterpret_cast<void*>(fake_make(2, t ? t : "/data/local/tmp/"));
 }
-void* native_ns_search_paths(uint64_t, uint64_t, int) { return nullptr; }
+// The app's writable container (Documents, Library, Library/Caches, ...). LOADER_SANDBOX_DIR overrides the default.
+static std::string sandbox_path(const char* sub) {
+    static const std::string root = getenv("LOADER_SANDBOX_DIR") ? getenv("LOADER_SANDBOX_DIR") : "/data/local/tmp/sandbox";
+    std::string p = root;
+    mkdir(p.c_str(), 0755);
+    for (const char* s = sub; s && *s;) {   // create each component of sub
+        const char* slash = strchr(s, '/');
+        p += "/" + std::string(s, slash ? static_cast<size_t>(slash - s) : strlen(s));
+        mkdir(p.c_str(), 0755);
+        s = slash ? slash + 1 : nullptr;
+    }
+    return p;
+}
+// NSSearchPathForDirectoriesInDomains(directory, domainMask, expandTilde) for the user domain.
+void* native_ns_search_paths(uint64_t directory, uint64_t, int) {
+    const char* sub = nullptr;
+    switch (directory) {
+        case 9: sub = "Documents"; break;                           // NSDocumentDirectory
+        case 5: sub = "Library"; break;                             // NSLibraryDirectory
+        case 13: sub = "Library/Caches"; break;                     // NSCachesDirectory
+        case 14: sub = "Library/Application Support"; break;        // NSApplicationSupportDirectory
+        case 15: sub = "Downloads"; break;                          // NSDownloadsDirectory
+        default: break;
+    }
+    if (!sub) return reinterpret_cast<void*>(fakeui::new_array({}));
+    return reinterpret_cast<void*>(fakeui::new_array({fake_make(2, sandbox_path(sub))}));
+}
 void* native_ns_uncaught_handler_get() { return nullptr; }
 void native_ns_uncaught_handler_set(void*) {}
 void native_chkstk_darwin() {}
@@ -3759,7 +3785,10 @@ extern "C" int loader_main(int argc, char** argv) {
             // view/display setup and startUnity: (queued by applicationDidBecomeActive:), then the display link ticks.
             const char* fr = getenv("LOADER_FRAMES");
             fakeui_run_application(fr ? atoi(fr) : 300);
-            return 0;
+            // engine threads are still running; static destructors must not run under them
+            fflush(stdout);
+            fflush(stderr);
+            _exit(0);
         }
         printf("[E2] UnityInitApplicationNoGraphics(\"%s\") image+0x7cc3d4...\n", game_dir()); fflush(stdout);
         reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))(game_dir());

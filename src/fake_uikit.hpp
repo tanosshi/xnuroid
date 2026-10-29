@@ -362,7 +362,14 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
             static std::unordered_map<std::string, uint64_t> made;
             std::lock_guard<std::mutex> l(mu);
             auto it = made.find(cls);
-            if (it == made.end()) it = made.emplace(cls, fake_make(8, cls)).first;
+            if (it == made.end()) {
+                it = made.emplace(cls, fake_make(8, cls)).first;
+                if (cls == "NSUserDefaults") {   // the global-domain values iOS always provides
+                    FakeObjcObj* d = fake_lookup(it->second);
+                    d->items = {fake_make(2, "AppleLanguages"), fake_make(2, "AppleLocale")};
+                    d->values = {new_array({fake_make(2, "en-US")}), fake_make(2, "en_US")};
+                }
+            }
             frame.ret_x0 = it->second;
             return true;
         }
