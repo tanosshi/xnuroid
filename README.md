@@ -1,6 +1,6 @@
-# xnudroid
+# xnuroid
 
-xnudroid runs a decrypted iOS arm64 Mach-O: a Unity IL2CPP game inside a normal Android arm64
+xnuroid runs a decrypted iOS arm64 Mach-O: a Unity IL2CPP game inside a normal Android arm64
 process. The iOS image is mapped, rebound, and executed natively. Calls into Darwin libc, dyld, Mach,
 pthread, Foundation, UIKit, Metal, and AudioUnit are handled by assembly trampolines, shims, fake
 objects, or translation layers.
