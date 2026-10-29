@@ -666,7 +666,7 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         }
         if (sel == "loadValuesAsynchronouslyForKeys:completionHandler:") {
             std::lock_guard<std::mutex> l(g_loop_mu);
-            g_delayed.push_back({frame.x[0], nullptr, frame.x[3], now_s()});
+            g_delayed.push_back({frame.x[0], nullptr, reinterpret_cast<uint64_t>(heap_block_copy(reinterpret_cast<void*>(frame.x[3]))), now_s()});
             return true;
         }
         if (sel == "statusOfValueForKey:error:") {
@@ -1133,7 +1133,16 @@ static void fakeui_run_loop_once() {
         links = g_display_links;
     }
     for (const DelayedPerform& d : due) {
-        if (!d.sel) { run_block(d.arg, 0); continue; }   // queued completion block
+        if (!d.sel) {   // queued block (dispatch_async, completion handlers)
+            static const bool log = getenv("LOADER_LOG_BLOCKS") != nullptr;
+            if (log) {
+                uint64_t inv = d.arg ? *reinterpret_cast<uint64_t*>(d.arg + 16) : 0;
+                printf("[UI] block invoke image+%#llx\n", static_cast<unsigned long long>(inv - reinterpret_cast<uint64_t>(g_loaded_image_base)));
+                fflush(stdout);
+            }
+            run_block(d.arg, 0);
+            continue;
+        }
         printf("[UI] delayed perform -[%#llx %s]\n", static_cast<unsigned long long>(d.target), d.sel);
         fflush(stdout);
         send_sel(d.target, d.sel, d.arg);

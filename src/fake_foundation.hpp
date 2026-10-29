@@ -161,7 +161,7 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
             frame.ret_x0 = h; return true;
         }
         // command buffers
-        if (sel == "addCompletedHandler:" || sel == "addScheduledHandler:") { self->handlers.push_back(frame.x[2]); return true; }
+        if (sel == "addCompletedHandler:" || sel == "addScheduledHandler:") { self->handlers.push_back(reinterpret_cast<uint64_t>(heap_block_copy(reinterpret_cast<void*>(frame.x[2])))); return true; }
         if (sel == "commit" || sel == "waitUntilCompleted" || sel == "waitUntilScheduled") {
             if (sel == "commit") {
                 std::vector<uint64_t> hs;

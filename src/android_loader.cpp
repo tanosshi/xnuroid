@@ -559,11 +559,12 @@ extern "C" void* native_dispatch_get_global_queue(long identifier, unsigned long
 static void* heap_block_copy(void* block) {
     if (!block) return nullptr;
     int32_t flags = *reinterpret_cast<int32_t*>(static_cast<uint8_t*>(block) + 8);
-    if (flags & (1 << 28)) return block;   // BLOCK_IS_GLOBAL
+    if (flags & ((1 << 28) | (1 << 24))) return block;   // BLOCK_IS_GLOBAL, or already on the heap (BLOCK_NEEDS_FREE)
     uint64_t* desc = *reinterpret_cast<uint64_t**>(static_cast<uint8_t*>(block) + 24);
     size_t size = desc ? static_cast<size_t>(desc[1]) : 32;
     void* copy = malloc(size < 32 ? 32 : size);
     std::memcpy(copy, block, size);
+    *reinterpret_cast<int32_t*>(static_cast<uint8_t*>(copy) + 8) |= 1 << 24;
     if (desc && (flags & (1 << 25)) && desc[2])   // BLOCK_HAS_COPY_DISPOSE: retain captured objects/__block vars
         reinterpret_cast<void (*)(void*, void*)>(desc[2])(copy, block);
     return copy;
@@ -851,7 +852,33 @@ extern "C" void native_assert_rtn(const char* func, const char* file, int line, 
     fflush(stderr);
     abort();
 }
-extern "C" void native_block_object_assign(void* dst, const void* src, int flags) { (void)flags; *static_cast<const void**>(dst) = src; }
+static void* heap_block_copy(void* block);
+// Captured-variable copy for block copy helpers. Flags: 3 object, 7 block, 8 __block byref, 128 byref caller.
+// Byref layout: isa, forwarding, int flags, int size, [keep, dispose when flags has 1<<25], variables...
+extern "C" void native_block_object_assign(void* dst, const void* src, int flags) {
+    void** out = static_cast<void**>(dst);
+    if ((flags & 128) || !src) { *out = const_cast<void*>(src); return; }
+    if ((flags & 0x1f) == 7) { *out = heap_block_copy(const_cast<void*>(src)); return; }
+    if ((flags & 0x1f) == 8) {
+        auto* byref = static_cast<uint8_t*>(const_cast<void*>(src));
+        uint8_t* fwd = *reinterpret_cast<uint8_t**>(byref + 8);
+        int32_t bflags = *reinterpret_cast<int32_t*>(fwd + 16);
+        if (bflags & (1 << 24)) { *out = fwd; return; }   // already moved to the heap
+        int32_t size = *reinterpret_cast<int32_t*>(byref + 20);
+        auto* copy = static_cast<uint8_t*>(malloc(size < 32 ? 32 : size));
+        std::memcpy(copy, byref, size);
+        *reinterpret_cast<uint8_t**>(copy + 8) = copy;
+        *reinterpret_cast<uint8_t**>(byref + 8) = copy;
+        *reinterpret_cast<int32_t*>(copy + 16) |= 1 << 24;
+        if (bflags & (1 << 25)) {
+            auto keep = *reinterpret_cast<void (**)(void*, void*)>(byref + 24);
+            if (keep) keep(copy, byref);
+        }
+        *out = copy;
+        return;
+    }
+    *out = const_cast<void*>(src);
+}
 extern "C" void native_block_object_dispose(const void* obj, int flags) { (void)obj; (void)flags; }
 // Mach / exception-port / crash-reporter calls: report KERN_FAILURE (5) so the caller takes its error path.
 extern "C" int native_kern_failure() { return 5; }
@@ -2461,11 +2488,12 @@ static void register_objc_runtime_natives() {
     for (const char* n : {"_objc_alloc_init", "_objc_opt_new"}) reg(n, reinterpret_cast<void*>(&native_objc_alloc_init));
     for (const char* n : {"_objc_retain", "_objc_retainAutoreleasedReturnValue", "_objc_retainAutorelease",
                           "_objc_retainAutoreleaseReturnValue", "_objc_autorelease", "_objc_autoreleaseReturnValue",
-                          "_objc_unsafeClaimAutoreleasedReturnValue", "_objc_retainBlock", "__Block_copy"})
+                          "_objc_unsafeClaimAutoreleasedReturnValue"})
         reg(n, reinterpret_cast<void*>(&native_objc_identity));
     for (const char* n : {"_objc_release", "_objc_destroyWeak", "__Block_release", "_objc_enumerationMutation"})
         reg(n, reinterpret_cast<void*>(&native_objc_noop));
     reg("_objc_storeStrong", reinterpret_cast<void*>(&native_objc_store_strong));
+    for (const char* n : {"_objc_retainBlock", "__Block_copy"}) reg(n, reinterpret_cast<void*>(&heap_block_copy));
     for (const char* n : {"_objc_loadWeakRetained", "_objc_loadWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_load_weak));
     for (const char* n : {"_objc_storeWeak", "_objc_initWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_store_weak));
     for (const char* n : {"_objc_copyWeak", "_objc_moveWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_copy_weak));
