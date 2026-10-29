@@ -1596,47 +1596,118 @@ static void shim_mach_absolute_time(CallFrame& frame, void*) {
     frame.ret_x0 = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 }
 
+// Darwin sysctl answers for the emulated device (iPhone 12 Pro Max on iOS 16.0, matching the fake UIDevice).
+// kind: 's' = NUL-terminated string, 'i' = int32, 'q' = int64, 'z' = zero-filled struct of `size` bytes,
+// 'b' = struct timeval of the host boot time.
+struct DarwinSysctl { const char* name; int mib0, mib1; char kind; const char* s; int64_t v; size_t size; };
+static const DarwinSysctl kDarwinSysctls[] = {
+    {"hw.machine", 6, 1, 's', "iPhone13,4", 0, 0},
+    {"hw.model", 6, 2, 's', "D54pAP", 0, 0},
+    {"hw.ncpu", 6, 3, 'i', nullptr, 8, 0},
+    {"hw.byteorder", 6, 4, 'i', nullptr, 1234, 0},
+    {"hw.physmem", 6, 5, 'i', nullptr, 0x7fffffff, 0},
+    {"hw.pagesize", 6, 7, 'q', nullptr, 4096, 0},   // host page size, same as _vm_page_size
+    {"hw.cpufrequency", 6, 15, 'q', nullptr, 3000000000LL, 0},
+    {"hw.cachelinesize", 6, 16, 'q', nullptr, 64, 0},
+    {"hw.l1icachesize", 6, 17, 'q', nullptr, 65536, 0},
+    {"hw.l1dcachesize", 6, 18, 'q', nullptr, 65536, 0},
+    {"hw.l2cachesize", 6, 20, 'q', nullptr, 4194304, 0},
+    {"hw.memsize", 6, 24, 'q', nullptr, 6LL * 1024 * 1024 * 1024, 0},
+    {"hw.availcpu", 6, 25, 'i', nullptr, 8, 0},
+    {"hw.physicalcpu", -1, -1, 'i', nullptr, 8, 0},
+    {"hw.physicalcpu_max", -1, -1, 'i', nullptr, 8, 0},
+    {"hw.logicalcpu", -1, -1, 'i', nullptr, 8, 0},
+    {"hw.logicalcpu_max", -1, -1, 'i', nullptr, 8, 0},
+    {"hw.activecpu", -1, -1, 'i', nullptr, 8, 0},
+    {"hw.cputype", -1, -1, 'i', nullptr, 0x0100000c, 0},
+    {"hw.cpusubtype", -1, -1, 'i', nullptr, 2, 0},
+    {"hw.optional.neon", -1, -1, 'i', nullptr, 1, 0},
+    {"hw.optional.floatingpoint", -1, -1, 'i', nullptr, 1, 0},
+    {"hw.optional.armv8_crc32", -1, -1, 'i', nullptr, 1, 0},
+    {"kern.ostype", 1, 1, 's', "Darwin", 0, 0},
+    {"kern.osrelease", 1, 2, 's', "22.0.0", 0, 0},
+    {"kern.version", 1, 4, 's', "Darwin Kernel Version 22.0.0", 0, 0},
+    {"kern.hostname", 1, 10, 's', "iPhone", 0, 0},
+    {"kern.osversion", 1, 65, 's', "20A362", 0, 0},
+    {"kern.proc", 1, 14, 'z', nullptr, 0, 648},   // struct kinfo_proc; all-zero = not traced
+    {"kern.boottime", 1, 21, 'b', nullptr, 0, 0},
+};
+
+// Size query (oldp == NULL) reports the needed length; a short buffer fails with ENOMEM like Darwin.
+static int darwin_sysctl_answer(const DarwinSysctl& e, void* oldp, size_t* oldlenp) {
+    if (!oldlenp) return oldp ? (errno = EINVAL, -1) : 0;
+    char tmp[16];
+    const void* src = tmp;
+    size_t len;
+    switch (e.kind) {
+        case 's': src = e.s; len = std::strlen(e.s) + 1; break;
+        case 'i': { int32_t v = static_cast<int32_t>(e.v); std::memcpy(tmp, &v, 4); len = 4; break; }
+        case 'q': std::memcpy(tmp, &e.v, 8); len = 8; break;
+        case 'b': {   // Darwin arm64 timeval: int64 tv_sec, int32 tv_usec, 4 bytes padding
+            struct timespec rt, bt;
+            clock_gettime(CLOCK_REALTIME, &rt);
+            clock_gettime(CLOCK_BOOTTIME, &bt);
+            int64_t ns = (rt.tv_sec - bt.tv_sec) * 1000000000LL + (rt.tv_nsec - bt.tv_nsec);
+            int64_t sec = ns / 1000000000LL;
+            int32_t usec = static_cast<int32_t>((ns % 1000000000LL) / 1000);
+            std::memset(tmp, 0, 16);
+            std::memcpy(tmp, &sec, 8);
+            std::memcpy(tmp + 8, &usec, 4);
+            len = 16;
+            break;
+        }
+        default: src = nullptr; len = e.size; break;
+    }
+    if (!oldp) { *oldlenp = len; return 0; }
+    if (*oldlenp < len) {
+        // Darwin accepts a 4-byte buffer for 64-bit integer nodes and truncates
+        if (e.kind == 'q' && *oldlenp == 4) { int32_t v = static_cast<int32_t>(e.v); std::memcpy(oldp, &v, 4); return 0; }
+        *oldlenp = len;
+        errno = ENOMEM;
+        return -1;
+    }
+    if (src) std::memcpy(oldp, src, len); else std::memset(oldp, 0, len);
+    *oldlenp = len;
+    return 0;
+}
+
 static void shim_sysctl(CallFrame& frame, void*) {
     int* name = reinterpret_cast<int*>(frame.x[0]);
     unsigned int namelen = static_cast<unsigned int>(frame.x[1]);
     void* oldp = reinterpret_cast<void*>(frame.x[2]);
     size_t* oldlenp = reinterpret_cast<size_t*>(frame.x[3]);
-
     if (name && namelen >= 2) {
-        if (name[0] == 6 /* CTL_HW */) {
-            if (name[1] == 3 /* HW_NCPU */ || name[1] == 7 /* HW_AVAILCPU */) {
-                if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
-                    *reinterpret_cast<int*>(oldp) = 8;
-                    *oldlenp = sizeof(int);
-                }
-            } else if (name[1] == 24 /* HW_MEMSIZE */) {
-                if (oldp && oldlenp && *oldlenp >= sizeof(uint64_t)) {
-                    *reinterpret_cast<uint64_t*>(oldp) = 8ULL * 1024 * 1024 * 1024;
-                    *oldlenp = sizeof(uint64_t);
-                }
-            } else if (name[1] == 4 /* HW_PAGESIZE */) {
-                if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
-                    *reinterpret_cast<int*>(oldp) = 4096;
-                    *oldlenp = sizeof(int);
-                }
+        for (const DarwinSysctl& e : kDarwinSysctls) {
+            if (e.mib0 == name[0] && e.mib1 == name[1]) {
+                frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(darwin_sysctl_answer(e, oldp, oldlenp)));
+                return;
             }
         }
     }
-    frame.ret_x0 = 0;
+    fprintf(stderr, "[SHIM] sysctl({%d,%d}, len %u) -> ENOENT\n", name && namelen > 0 ? name[0] : -1,
+            name && namelen > 1 ? name[1] : -1, namelen);
+    errno = ENOENT;
+    frame.ret_x0 = static_cast<uint64_t>(-1);
 }
 
 static void shim_sysctlbyname(CallFrame& frame, void*) {
     const char* name = reinterpret_cast<const char*>(frame.x[0]);
     void* oldp = reinterpret_cast<void*>(frame.x[1]);
     size_t* oldlenp = reinterpret_cast<size_t*>(frame.x[2]);
-    printf("[SHIM] sysctlbyname(\"%s\")\n", name ? name : "null");
-    if (name && std::strcmp(name, "hw.ncpu") == 0) {
-        if (oldp && oldlenp && *oldlenp >= sizeof(int)) {
-            *reinterpret_cast<int*>(oldp) = 8;
-            *oldlenp = sizeof(int);
+    if (name) {
+        for (const DarwinSysctl& e : kDarwinSysctls) {
+            if (std::strcmp(e.name, name) == 0) {
+                int rc = darwin_sysctl_answer(e, oldp, oldlenp);
+                printf("[SHIM] sysctlbyname(\"%s\", %s) -> %d len=%zu\n", name, oldp ? "read" : "size", rc,
+                       oldlenp ? *oldlenp : 0);
+                frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(rc));
+                return;
+            }
         }
     }
-    frame.ret_x0 = 0;
+    fprintf(stderr, "[SHIM] sysctlbyname(\"%s\") -> ENOENT\n", name ? name : "null");
+    errno = ENOENT;
+    frame.ret_x0 = static_cast<uint64_t>(-1);
 }
 
 static void shim_objc_stub(CallFrame& frame, void* ctx) {
@@ -3841,6 +3912,39 @@ int main(int argc, char** argv) {
             printf("[E4] load application / first scene image+0x7cc6cc...\n"); fflush(stdout);
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cc6cc))();
             printf("[E4] returned\n"); fflush(stdout);
+        }
+        if (atoi(eng) >= 8) {
+            // -[UnityAppController repaint] (image+0x16e3c) minus its UIKit messages: UnityDeliverUIEvents (image+0x7cccac),
+            // then UnityRepaint (image+0x7cc818) unless UnityIsPaused (image+0x7ccba0). LOADER_FRAMES sets the tick count.
+            typedef int (*is_paused_fn)();
+            const char* fr = getenv("LOADER_FRAMES");
+            int frames = fr ? atoi(fr) : 120;
+            auto deliver_events = reinterpret_cast<engine_pre_fn>(get_fn(0x7cccac));
+            auto is_paused = reinterpret_cast<is_paused_fn>(get_fn(0x7ccba0));
+            auto repaint = reinterpret_cast<engine_pre_fn>(get_fn(0x7cc818));
+            printf("[E5] player loop: %d ticks of UnityRepaint image+0x7cc818\n", frames); fflush(stdout);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            double worst_ms = 0;
+            for (int f = 0; f < frames; ++f) {
+                struct timespec a, b;
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                deliver_events();
+                bool paused = is_paused() != 0;
+                if (!paused) repaint();
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+                if (ms > worst_ms) worst_ms = ms;
+                if (f < 3 || (f + 1) % 30 == 0 || paused)
+                    printf("[E5] tick %d%s %.2f ms\n", f + 1, paused ? " (paused, skipped)" : "", ms);
+                fflush(stdout);
+                // pace to ~60 Hz so time-based engine logic sees realistic frame deltas
+                if (ms < 16.6) usleep(static_cast<useconds_t>((16.6 - ms) * 1000));
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            printf("[E5] %d ticks done in %.1f s, worst tick %.2f ms\n", frames,
+                   (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, worst_ms);
+            fflush(stdout);
         }
         return 0;
     }
