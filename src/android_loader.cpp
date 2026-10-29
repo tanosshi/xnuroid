@@ -456,8 +456,18 @@ extern "C" int native_pthread_key_delete(pthread_key_t key) {
     return 0;
 }
 
+// Root of the app bundle on the device (UnityFramework, Info.plist, Data/). LOADER_GAME_DIR overrides the default.
+static const char* game_dir() {
+    static const std::string d = getenv("LOADER_GAME_DIR") ? getenv("LOADER_GAME_DIR") : "/data/local/tmp/game";
+    return d.c_str();
+}
+static const std::string& game_binary_path() {
+    static const std::string p = std::string(game_dir()) + "/UnityFramework";
+    return p;
+}
+
 extern "C" int native_NSGetExecutablePath(char* buf, uint32_t* bufsize) {
-    const char* path = "/data/local/tmp/game/UnityFramework";
+    const char* path = game_binary_path().c_str();
     uint32_t len = static_cast<uint32_t>(std::strlen(path));
     if (!buf || !bufsize || *bufsize < len + 1) {
         if (bufsize) *bufsize = len + 1;
@@ -489,7 +499,7 @@ extern "C" intptr_t native_dyld_get_image_vmaddr_slide(uint32_t image_index) {
 }
 
 extern "C" const char* native_dyld_get_image_name(uint32_t image_index) {
-    if (image_index == 0) return "/data/local/tmp/game/UnityFramework";
+    if (image_index == 0) return game_binary_path().c_str();
     return nullptr;
 }
 
@@ -568,8 +578,9 @@ static void* guest_thread_tramp(void* p) {
 
 // ---------------------------------------------------------------------------
 // Mach thread emulation (engine mode). IL2CPP's Boehm GC stops the world on Apple platforms with task_threads /
-// thread_suspend / thread_get_state / thread_resume. Here a thread's "port" is its tid; suspend is a SIGUSR1 whose
-// handler records the interrupted registers and parks the thread until resume.
+// thread_suspend / thread_get_state / thread_resume. Here a thread's "port" is its tid; suspend is a realtime signal
+// whose handler records the interrupted registers and parks the thread until resume. Not SIGUSR1: app processes
+// inherit it blocked from zygote (ART's signal catcher owns it), so a suspend would never be delivered.
 // ---------------------------------------------------------------------------
 #include <semaphore.h>
 #include <sys/syscall.h>
@@ -588,6 +599,7 @@ static std::mutex g_mt_mu;
 static std::vector<MachThread*> g_mt;
 static thread_local MachThread* t_mach_self = nullptr;
 static bool g_mt_signal_installed = false;
+static int mach_suspend_signal() { return SIGRTMIN + 3; }
 
 static void mach_suspend_handler(int, siginfo_t*, void* ctx) {
     MachThread* me = t_mach_self;
@@ -609,13 +621,17 @@ static MachThread* mach_register_current() {
     m->pt = pthread_self();
     sem_init(&m->resume, 0, 0);
     t_mach_self = m;
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, mach_suspend_signal());
+    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
     std::lock_guard<std::mutex> l(g_mt_mu);
     if (!g_mt_signal_installed) {
         struct sigaction sa{};
         sa.sa_flags = SA_SIGINFO | SA_RESTART;
         sa.sa_sigaction = mach_suspend_handler;
         sigemptyset(&sa.sa_mask);
-        sigaction(SIGUSR1, &sa, nullptr);
+        sigaction(mach_suspend_signal(), &sa, nullptr);
         g_mt_signal_installed = true;
     }
     g_mt.push_back(m);
@@ -664,9 +680,9 @@ int native_thread_suspend(uint32_t port) {
         signal_it = (m->suspend_count++ == 0);
     }
     if (!signal_it) return 0;
-    syscall(SYS_tgkill, getpid(), m->tid, SIGUSR1);
+    syscall(SYS_tgkill, getpid(), m->tid, mach_suspend_signal());
     for (int i = 0; i < 40000 && !m->suspended; ++i) usleep(50);   // up to 2 s
-    if (!m->suspended) fprintf(stderr, "[MACH] thread_suspend(port=%u): thread did not acknowledge SIGUSR1 within 2 s\n", port);
+    if (!m->suspended) fprintf(stderr, "[MACH] thread_suspend(port=%u): thread did not acknowledge the suspend signal within 2 s\n", port);
     return m->suspended ? 0 : 5;
 }
 int native_thread_resume(uint32_t port) {
@@ -1287,9 +1303,9 @@ static std::string remap_game_path(const char* path) {
     if (p.find("Data/") != std::string::npos || p.find("Managed/") != std::string::npos) {
         size_t idx = p.find("Data/");
         if (idx != std::string::npos) {
-            p = "/data/local/tmp/game/" + p.substr(idx);
+            p = std::string(game_dir()) + "/" + p.substr(idx);
         } else {
-            p = "/data/local/tmp/game/Data/" + p;
+            p = std::string(game_dir()) + "/Data/" + p;
         }
     }
     return p;
@@ -2140,7 +2156,10 @@ void* native_nsclass_from_string(void* name) {
     if (objcrt::GClass* gc = objcrt::find_class_by_name(n.c_str())) return reinterpret_cast<void*>(gc->addr);
     return reinterpret_cast<void*>(fake_class_named(n));
 }
-void* native_ns_temp_dir() { return reinterpret_cast<void*>(fake_make(2, "/data/local/tmp/")); }
+void* native_ns_temp_dir() {
+    const char* t = getenv("LOADER_TMP_DIR");
+    return reinterpret_cast<void*>(fake_make(2, t ? t : "/data/local/tmp/"));
+}
 void* native_ns_search_paths(uint64_t, uint64_t, int) { return nullptr; }
 void* native_ns_uncaught_handler_get() { return nullptr; }
 void native_ns_uncaught_handler_set(void*) {}
@@ -3059,7 +3078,7 @@ static void unwinder_probe(uint64_t guest_pc_a, uint64_t guest_pc_b) {
     }
 }
 
-int main(int argc, char** argv) {
+extern "C" int loader_main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
@@ -3088,7 +3107,9 @@ int main(int argc, char** argv) {
            tpidr, tsd_addr, (long)g_tsd_tprel_diff, (unsigned long)g_tsd_tprel_diff);
 
     // Load system libc++.so (which uses std::__1 ABI on Android)
-    g_libcxx_handle = dlopen("/system/lib64/libc++.so", RTLD_NOW | RTLD_GLOBAL);
+    // An app's linker namespace cannot open /system/lib64/libc++.so; the APK ships a copy (LOADER_LIBCXX).
+    if (const char* lc = getenv("LOADER_LIBCXX")) g_libcxx_handle = dlopen(lc, RTLD_NOW | RTLD_GLOBAL);
+    if (!g_libcxx_handle) g_libcxx_handle = dlopen("/system/lib64/libc++.so", RTLD_NOW | RTLD_GLOBAL);
     if (!g_libcxx_handle) {
         printf("[-] dlopen /system/lib64/libc++.so failed: %s\n", dlerror());
     } else {
@@ -3096,7 +3117,7 @@ int main(int argc, char** argv) {
     }
 
     // 3. Open UnityFramework binary
-    const char* bin_path = "/data/local/tmp/game/UnityFramework";
+    const char* bin_path = game_binary_path().c_str();
     int fd = open(bin_path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "[-] Failed to open %s: %s\n", bin_path, strerror(errno));
@@ -3650,8 +3671,8 @@ int main(int argc, char** argv) {
         // and the engine never needs [[NSBundle mainBundle] bundlePath].
         {
             char** bundle_cache = reinterpret_cast<char**>(get_fn(0x2b428c8));
-            printf("[E0] bundle path cache (image+0x2b428c8) was %p; seeding \"/data/local/tmp/game\"\n", static_cast<void*>(*bundle_cache));
-            *bundle_cache = strdup("/data/local/tmp/game");
+            printf("[E0] bundle path cache (image+0x2b428c8) was %p; seeding \"%s\"\n", static_cast<void*>(*bundle_cache), game_dir());
+            *bundle_cache = strdup(game_dir());
         }
         if (atoi(eng) >= 8) {
             // The app launch itself: -[UnityAppController application:didFinishLaunchingWithOptions:] runs engine init,
@@ -3660,8 +3681,8 @@ int main(int argc, char** argv) {
             fakeui_run_application(fr ? atoi(fr) : 300);
             return 0;
         }
-        printf("[E2] UnityInitApplicationNoGraphics(\"/data/local/tmp/game\") image+0x7cc3d4...\n"); fflush(stdout);
-        reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))("/data/local/tmp/game");
+        printf("[E2] UnityInitApplicationNoGraphics(\"%s\") image+0x7cc3d4...\n", game_dir()); fflush(stdout);
+        reinterpret_cast<engine_init_fn>(get_fn(0x7cc3d4))(game_dir());
         printf("[E2] returned: engine init without graphics completed\n"); fflush(stdout);
         if (atoi(eng) >= 6) {
             // startUnity's next step: graphics init at image+0x7cc5c4. It asks image+0x170dc for the rendering API and
@@ -3694,8 +3715,9 @@ int main(int argc, char** argv) {
     printf("[1/5] Registering log callback...\n");
     il2cpp_register_log_callback(il2cpp_log_callback);
 
-    printf("[2/5] Setting data dir: /data/local/tmp/game/Data...\n");
-    il2cpp_set_data_dir("/data/local/tmp/game/Data");
+    std::string data_dir = std::string(game_dir()) + "/Data";
+    printf("[2/5] Setting data dir: %s...\n", data_dir.c_str());
+    il2cpp_set_data_dir(data_dir.c_str());
 
     printf("[3/5] Calling _il2cpp_init(\"UnityRootDomain\")...\n");
     int init_rc = il2cpp_init("UnityRootDomain");
@@ -3967,3 +3989,7 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
+#ifndef LOADER_LIBRARY
+int main(int argc, char** argv) { return loader_main(argc, argv); }
+#endif

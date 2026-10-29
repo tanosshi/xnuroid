@@ -52,7 +52,6 @@ static uint64_t fake_class_named(const std::string& name) {
     if (it == classes.end()) it = classes.emplace(name, fake_make(7, name)).first;
     return it->second;
 }
-static const char* const kFakeAppDir = "/data/local/tmp/game";
 // Reads an NSString argument: one of our fake strings, or a compile-time @"..." literal (__NSConstantString:
 // isa, flags, char* data, length) living in the loaded guest image.
 static bool objc_string_value(uint64_t p, std::string& out) {
@@ -331,7 +330,7 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
         return true;
     }
     if (sel == "mainBundle") {
-        static uint64_t bundle = fake_make(1, kFakeAppDir);
+        static uint64_t bundle = fake_make(1, game_dir());
         frame.ret_x0 = bundle;
         return true;
     }

@@ -833,7 +833,7 @@ inline uint64_t info_dictionary() {
     static std::once_flag once;
     static uint64_t dict = 0;
     std::call_once(once, [] {
-        std::string path = std::string(kFakeAppDir) + "/Info.plist";
+        std::string path = std::string(game_dir()) + "/Info.plist";
         std::vector<uint8_t> data;
         if (FILE* fp = fopen(path.c_str(), "rb")) {
             uint8_t buf[4096];
@@ -912,7 +912,7 @@ inline bool bundle_message(CallFrame& frame, const std::string& sel) {
         std::string name, type;
         objc_string_value(frame.x[2], name);
         objc_string_value(frame.x[3], type);
-        std::string base = std::string(kFakeAppDir) + "/" + name;
+        std::string base = std::string(game_dir()) + "/" + name;
         std::string p = type.empty() ? base : base + "." + type;
         if (access(p.c_str(), F_OK) != 0 && type == "nib") p = base + ".storyboardc";
         frame.ret_x0 = access(p.c_str(), F_OK) == 0 ? fake_make(2, p) : 0;
