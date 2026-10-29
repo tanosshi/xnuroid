@@ -18,6 +18,7 @@
 
 #include "msl_glsl.hpp"
 #include "pvrtc.hpp"
+#include "pvrtc_gpu.hpp"
 
 namespace mtlgl {
 
@@ -357,11 +358,24 @@ inline void upload(Tex* t, int level, int slice, int x, int y, int z, int w, int
     if (!t || !src || w <= 0 || h <= 0) return;
     glBindTexture(t->target, t->id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (t->f.pvrtc) {   // whole level, decoded on the CPU
+    // PVRTC: whole levels. 4 bpp decodes on the GPU; 2 bpp, sRGB or no compute support decode on the CPU.
+    if (t->f.pvrtc == 4 && t->f.internal == GL_RGBA8 && !x && !y) {
+        while (glGetError() != GL_NO_ERROR) {}
+        glBindTexture(t->target, 0);
+        if (pvrtc_gpu_decode(t->id, t->target, level, slice, src, w, h)) return;
+    }
+    if (t->f.pvrtc) {
         const int bw = t->f.pvrtc == 2 ? 8 : 4;
         size_t blocks = static_cast<size_t>(std::max(w, bw * 2) / bw) * static_cast<size_t>(std::max(h, 8) / 4);
         std::vector<uint8_t> rgba;
-        if (x || y || !pvrtc::decode(src, blocks * 8, w, h, t->f.pvrtc == 2, rgba)) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        bool decoded = !x && !y && pvrtc::decode(src, blocks * 8, w, h, t->f.pvrtc == 2, rgba);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        static const bool log_times = getenv("LOADER_LOG_PVRTC") != nullptr;
+        if (log_times)
+            fprintf(stderr, "[MTLGL] PVRTC %dx%d level %d: %.1f ms\n", w, h, level, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+        if (!decoded) {
             fprintf(stderr, "[MTLGL] PVRTC upload %dx%d at %d,%d not decoded\n", w, h, x, y);
             return;
         }
