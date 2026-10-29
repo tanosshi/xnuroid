@@ -914,17 +914,6 @@ extern "C" uint64_t native_dispatch_time(uint64_t when, int64_t delta) {
     }
     return delta < 0 && static_cast<uint64_t>(-delta) > when ? 0 : when + static_cast<uint64_t>(delta);
 }
-extern "C" int native_cond_timedwait_relative_np(pthread_cond_t* cond, pthread_mutex_t* mutex, const timespec* rel) {
-    timespec abs;
-    clock_gettime(CLOCK_REALTIME, &abs);
-    if (rel) {
-        abs.tv_sec += rel->tv_sec;
-        abs.tv_nsec += rel->tv_nsec;
-        if (abs.tv_nsec >= 1000000000L) { abs.tv_sec += 1; abs.tv_nsec -= 1000000000L; }
-    }
-    int rc = pthread_cond_timedwait(cond, mutex, &abs);
-    return rc == ETIMEDOUT ? 60 : rc;   // Darwin ETIMEDOUT
-}
 // ObjC exception personality: C++ exceptions never need to be caught by ObjC frames; keep unwinding.
 extern "C" int native_objc_personality(int, int, uint64_t, void*, void*) { return 8; /* _URC_CONTINUE_UNWIND */ }
 extern "C" void native_dispatch_retain(void* obj) {}
@@ -1086,37 +1075,6 @@ extern "C" const void* native_getsectbynamefromheader_64(const void* mhp_ptr, co
         cur += cmdsize;
     }
     return nullptr;
-}
-
-// Mach semaphores (Unity's PlatformSemaphore on Apple: job system and render-thread command queue). semaphore_t is a
-// 32-bit port name; it indexes a table of POSIX semaphores. Destroyed slots are kept so a late signal stays harmless.
-static std::mutex g_mach_sem_mu;
-static std::vector<sem_t*> g_mach_sems;
-static sem_t* mach_sem(uint32_t name) {
-    std::lock_guard<std::mutex> l(g_mach_sem_mu);
-    uint32_t i = name - 0x5000;
-    return name >= 0x5000 && i < g_mach_sems.size() ? g_mach_sems[i] : nullptr;
-}
-extern "C" int native_semaphore_create(uint32_t, uint32_t* sem, int, int value) {
-    auto* s = new sem_t;
-    sem_init(s, 0, static_cast<unsigned>(value < 0 ? 0 : value));
-    std::lock_guard<std::mutex> l(g_mach_sem_mu);
-    g_mach_sems.push_back(s);
-    if (sem) *sem = 0x5000 + static_cast<uint32_t>(g_mach_sems.size() - 1);
-    return 0;
-}
-extern "C" int native_semaphore_destroy(uint32_t, uint32_t sem) { return mach_sem(sem) ? 0 : 15; }   // KERN_INVALID_NAME
-extern "C" int native_semaphore_signal(uint32_t sem) {
-    sem_t* s = mach_sem(sem);
-    if (!s) return 15;
-    sem_post(s);
-    return 0;
-}
-extern "C" int native_semaphore_wait(uint32_t sem) {
-    sem_t* s = mach_sem(sem);
-    if (!s) return 15;
-    while (sem_wait(s) != 0 && errno == EINTR) {}
-    return 0;
 }
 
 extern "C" int native_mach_port_allocate(uint32_t task, int right, uint32_t* name) {
@@ -1633,25 +1591,6 @@ extern "C" void* native_darwin_readdir(DIR* d) {
     o.d_reclen = static_cast<uint16_t>(sizeof(DarwinDirent));
     return &o;
 }
-
-// Darwin: NORMAL=0 ERRORCHECK=1 RECURSIVE=2. bionic: NORMAL=0 RECURSIVE=1 ERRORCHECK=2.
-extern "C" int native_pthread_mutexattr_settype(pthread_mutexattr_t* a, int t) {
-    int m = (t == 1) ? PTHREAD_MUTEX_ERRORCHECK : (t == 2) ? PTHREAD_MUTEX_RECURSIVE : PTHREAD_MUTEX_NORMAL;
-    return pthread_mutexattr_settype(a, m);
-}
-extern "C" int native_pthread_mutexattr_setprotocol(pthread_mutexattr_t*, int) { return 0; }
-// Darwin PTHREAD_CREATE_JOINABLE 1 / DETACHED 2 (bionic 0 / 1).
-extern "C" int native_pthread_attr_setdetachstate(pthread_attr_t* a, int s) {
-    return pthread_attr_setdetachstate(a, s == 2 ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE);
-}
-// Darwin SCHED_OTHER 1 / FIFO 4 / RR 2. Real-time policies are refused for unprivileged Android processes and
-// native_pthread_create_logged drops them anyway, so the request is accepted and recorded as SCHED_OTHER.
-extern "C" int native_pthread_attr_setschedpolicy(pthread_attr_t* a, int p) {
-    if (p != 1 && p != 2 && p != 4) return EINVAL;
-    pthread_attr_setschedpolicy(a, SCHED_OTHER);
-    return 0;
-}
-extern "C" int native_pthread_attr_setschedparam(pthread_attr_t*, const void*) { return 0; }
 
 // Darwin struct stat64 layout for arm64 (144 bytes = 0x90):
 //   +0x00: st_dev       (int32_t)
@@ -2590,11 +2529,6 @@ static void init_custom_shims() {
     g_custom_shims["_qsort_r"] = reinterpret_cast<void*>(&native_darwin_qsort_r);
     g_custom_shims["_readdir"] = reinterpret_cast<void*>(&native_darwin_readdir);
     g_custom_shims["_readdir$INODE64"] = reinterpret_cast<void*>(&native_darwin_readdir);
-    g_custom_shims["_pthread_mutexattr_settype"] = reinterpret_cast<void*>(&native_pthread_mutexattr_settype);
-    g_custom_shims["_pthread_mutexattr_setprotocol"] = reinterpret_cast<void*>(&native_pthread_mutexattr_setprotocol);
-    g_custom_shims["_pthread_attr_setdetachstate"] = reinterpret_cast<void*>(&native_pthread_attr_setdetachstate);
-    g_custom_shims["_pthread_attr_setschedpolicy"] = reinterpret_cast<void*>(&native_pthread_attr_setschedpolicy);
-    g_custom_shims["_pthread_attr_setschedparam"] = reinterpret_cast<void*>(&native_pthread_attr_setschedparam);
 
     // Darwin variadics (args on the stack) -> CallFrame shims building an AAPCS64 va_list
     g_custom_shims["_printf"] = allocate_trampoline(shim_printf, "_printf");
@@ -2694,7 +2628,6 @@ static void init_custom_shims() {
                               "_thread_resume", "_thread_suspend", "_vm_map", "_vm_read_overwrite", "_exception_raise",
                               "_exception_raise_state", "_exception_raise_state_identity"})
             reg(n, reinterpret_cast<void*>(&native_kern_failure));
-        reg("_pthread_cond_timedwait_relative_np", reinterpret_cast<void*>(&native_cond_timedwait_relative_np));
     }
     g_custom_shims["_dispatch_retain"] = reinterpret_cast<void*>(&native_dispatch_retain);
     g_custom_shims["_dispatch_resume"] = reinterpret_cast<void*>(&native_dispatch_resume);
@@ -2754,10 +2687,6 @@ static void init_custom_shims() {
     g_custom_shims["_pthread_setname_np"] = reinterpret_cast<void*>(&native_pthread_setname_np);
     g_custom_shims["_pthread_mach_thread_np"] = reinterpret_cast<void*>(&native_pthread_mach_thread_np);
     g_custom_shims["_getsectbynamefromheader_64"] = reinterpret_cast<void*>(&native_getsectbynamefromheader_64);
-    g_custom_shims["_semaphore_create"] = reinterpret_cast<void*>(&native_semaphore_create);
-    g_custom_shims["_semaphore_destroy"] = reinterpret_cast<void*>(&native_semaphore_destroy);
-    g_custom_shims["_semaphore_signal"] = reinterpret_cast<void*>(&native_semaphore_signal);
-    g_custom_shims["_semaphore_wait"] = reinterpret_cast<void*>(&native_semaphore_wait);
     g_custom_shims["_mach_port_allocate"] = reinterpret_cast<void*>(&native_mach_port_allocate);
     g_custom_shims["_mach_port_deallocate"] = reinterpret_cast<void*>(&native_mach_port_deallocate);
     g_custom_shims["_mach_port_insert_right"] = reinterpret_cast<void*>(&native_mach_port_insert_right);
@@ -2802,6 +2731,8 @@ static void init_custom_shims() {
     // Apple-ABI std::string shims
     extern void register_apple_string_shims(std::unordered_map<std::string, void*>& shims);
     register_apple_string_shims(g_custom_shims);
+    extern void register_darwin_pthread_shims(std::unordered_map<std::string, void*>& shims);
+    register_darwin_pthread_shims(g_custom_shims);
 }
 
 // Resolver for dyld bindings

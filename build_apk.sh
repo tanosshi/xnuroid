@@ -23,7 +23,7 @@ mkdir -p "$OUT/lib/arm64-v8a"
 "$CXX" -std=c++17 -O3 -fPIC -fvisibility=hidden -c src/pvrtc.cpp -o build/pvrtc_apk.o
 "$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY -I"$GLUE" \
     src/android_loader.cpp src/apple_string.cpp src/trampolines.s src/gles_backend.cpp src/msl_glsl.cpp src/audio_unit.cpp \
-    src/haptics.cpp src/android_app.cpp build/native_app_glue.o build/pvrtc_apk.o \
+    src/haptics.cpp src/darwin_pthread.cpp src/android_app.cpp build/native_app_glue.o build/pvrtc_apk.o \
     -u ANativeActivity_onCreate -static-libstdc++ -landroid -llog -lEGL -lGLESv3 -lz -laaudio -ldl \
     -o "$OUT/lib/arm64-v8a/libxnuroid.so"
 
