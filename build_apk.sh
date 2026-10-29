@@ -33,11 +33,12 @@ if [ ! -f build/libsysc++.so ]; then "$ADB" pull /system/lib64/libc++.so build/l
 cp build/libsysc++.so "$OUT/lib/arm64-v8a/libsysc++.so"
 
 # Package id, label and launcher icon come from the configured game's Info.plist (tools/game_config.py).
-rm -rf build/res build/res.zip
+rm -rf build/res build/res.zip build/static_res.zip
 PKG=$(python -I tools/apk_branding.py build/res android/AndroidManifest.xml build/AndroidManifest.xml)
 "$BT/aapt2.exe" compile --dir build/res -o build/res.zip
+"$BT/aapt2.exe" compile --dir android/res -o build/static_res.zip
 "$BT/aapt2.exe" link -o build/base.apk --manifest build/AndroidManifest.xml -I "$PLATFORM" \
-    --min-sdk-version 31 --target-sdk-version 33 build/res.zip
+    --min-sdk-version 31 --target-sdk-version 33 build/res.zip build/static_res.zip
 python -I - build/base.apk "$OUT" <<'EOF'
 import os, sys, zipfile
 apk, root = sys.argv[1], sys.argv[2]

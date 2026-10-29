@@ -12,7 +12,7 @@
         android:hasCode="false"
         android:extractNativeLibs="true"
         android:debuggable="true"
-        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        android:theme="@style/Theme.Xnuroid">
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
@@ -20,6 +20,7 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
             android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="xnuroid" />
+            <meta-data android:name="android.app.func_name" android:value="xnuroid_on_create" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

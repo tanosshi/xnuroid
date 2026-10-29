@@ -27,6 +27,15 @@ converts Apple's CgBI PNG format to a standard PNG, and wraps it in an adaptive 
 is `xnuroid`, the package is `com.xnuroid.loader`, and the system default icon is used. Changing
 games therefore installs a separate app instead of replacing the previous one.
 
+## Display
+
+The activity draws edge to edge, including under the camera cutout, and hides the status and
+navigation bars until the user swipes from the screen edge. The guest screen is 360 points wide at
+scale 3, and its height follows the window's aspect ratio when the engine starts. The host reports
+the system bars, the display cutout, and the mandatory gesture areas to the game as
+`safeAreaInsets`. Unity's `Screen.safeArea` then keeps the HUD clear of those areas, as it would on an
+iPhone with a notch.
+
 ## Running
 
 `./build_apk.sh install` installs the APK, copies `/data/local/tmp/game` into the app's internal

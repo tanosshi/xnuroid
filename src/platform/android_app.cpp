@@ -25,6 +25,8 @@
 extern "C" int loader_main(int argc, char** argv);
 extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp
 extern "C" void host_set_vibrate_hook(void (*hook)(int ms, int amplitude));  // haptics.cpp
+extern "C" void host_set_screen_size(int width_px, int height_px);           // screen_metrics.hpp
+extern "C" void host_set_safe_area(int top_px, int left_px, int bottom_px, int right_px, int width_px);
 
 namespace {
 
@@ -164,12 +166,77 @@ void setup_vibrator(android_app* app) {
     host_set_vibrate_hook(jni_vibrate);
 }
 
+// UI thread: hides the system bars (a swipe shows them transiently) and reports their full extent, the display cutout
+// and the mandatory gesture areas (the home-indicator analogue) to the guest as safe-area insets. Root insets exist
+// once the window is attached, i.e. by the first focus.
+void apply_system_ui(ANativeActivity* activity) {
+    JNIEnv* env = activity->env;
+    if (env->PushLocalFrame(16) != JNI_OK) return;
+    auto failed = [env] {
+        if (!env->ExceptionCheck()) return false;
+        env->ExceptionClear();
+        return true;
+    };
+    [&] {
+        jclass window_class = env->FindClass("android/view/Window");
+        jclass type_class = env->FindClass("android/view/WindowInsets$Type");
+        jclass controller_class = env->FindClass("android/view/WindowInsetsController");
+        jclass view_class = env->FindClass("android/view/View");
+        jclass insets_class = env->FindClass("android/view/WindowInsets");
+        jclass rect_class = env->FindClass("android/graphics/Insets");
+        if (failed()) return;
+        jobject window = env->CallObjectMethod(activity->clazz,
+            env->GetMethodID(env->GetObjectClass(activity->clazz), "getWindow", "()Landroid/view/Window;"));
+        jint bars = env->CallStaticIntMethod(type_class, env->GetStaticMethodID(type_class, "systemBars", "()I"));
+        jint cutout = env->CallStaticIntMethod(type_class, env->GetStaticMethodID(type_class, "displayCutout", "()I"));
+        jint gestures = env->CallStaticIntMethod(type_class, env->GetStaticMethodID(type_class, "mandatorySystemGestures", "()I"));
+        if (failed() || !window) return;
+        jobject controller = env->CallObjectMethod(window,
+            env->GetMethodID(window_class, "getInsetsController", "()Landroid/view/WindowInsetsController;"));
+        if (failed()) return;
+        if (controller) {
+            constexpr jint kShowTransientBarsBySwipe = 2;
+            env->CallVoidMethod(controller, env->GetMethodID(controller_class, "setSystemBarsBehavior", "(I)V"), kShowTransientBarsBySwipe);
+            env->CallVoidMethod(controller, env->GetMethodID(controller_class, "hide", "(I)V"), bars);
+            if (failed()) return;
+        }
+        jobject decor = env->CallObjectMethod(window, env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;"));
+        if (failed() || !decor) return;
+        jobject root = env->CallObjectMethod(decor, env->GetMethodID(view_class, "getRootWindowInsets", "()Landroid/view/WindowInsets;"));
+        if (failed() || !root) return;
+        jobject unsafe = env->CallObjectMethod(root,
+            env->GetMethodID(insets_class, "getInsetsIgnoringVisibility", "(I)Landroid/graphics/Insets;"), bars | cutout);
+        jobject gesture = env->CallObjectMethod(root, env->GetMethodID(insets_class, "getInsets", "(I)Landroid/graphics/Insets;"), gestures);
+        if (failed() || !unsafe || !gesture) return;
+        jobject inset = env->CallStaticObjectMethod(rect_class,
+            env->GetStaticMethodID(rect_class, "max", "(Landroid/graphics/Insets;Landroid/graphics/Insets;)Landroid/graphics/Insets;"), unsafe, gesture);
+        jint width = env->CallIntMethod(decor, env->GetMethodID(view_class, "getWidth", "()I"));
+        if (failed() || !inset) return;
+        auto side = [&](const char* name) { return env->GetIntField(inset, env->GetFieldID(rect_class, name, "I")); };
+        const jint top = side("top"), left = side("left"), bottom = side("bottom"), right = side("right");
+        if (failed()) return;
+        host_set_safe_area(top, left, bottom, right, width);
+        __android_log_print(ANDROID_LOG_INFO, kTag, "safe area px top=%d left=%d bottom=%d right=%d of width %d",
+                            top, left, bottom, right, width);
+    }();
+    env->PopLocalFrame(nullptr);
+}
+
+void (*g_glue_focus_changed)(ANativeActivity*, int) = nullptr;
+void on_focus_changed(ANativeActivity* activity, int focused) {
+    if (focused) apply_system_ui(activity);
+    g_glue_focus_changed(activity, focused);
+}
+
 void on_app_cmd(android_app* app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             if (app->window) {
                 g_window = app->window;
-                if (!g_loader_started) show_boot_frame(app->window);   // the renderer owns the window afterwards
+                if (!g_loader_started) {   // the guest screen is fixed once the engine starts; the renderer owns the window
+                    host_set_screen_size(ANativeWindow_getWidth(app->window), ANativeWindow_getHeight(app->window));
+                    show_boot_frame(app->window);
+                }
                 start_loader();
             }
             break;
@@ -203,6 +270,14 @@ void configure(android_app* app) {
 
 // The window the renderer presents to (null while the activity has no surface).
 extern "C" ANativeWindow* host_window() { return g_window.load(); }
+
+// Activity entry point (android.app.func_name): the glue's ANativeActivity_onCreate plus UI-thread system-bar handling.
+extern "C" JNIEXPORT void xnuroid_on_create(ANativeActivity* activity, void* saved_state, size_t saved_state_size) {
+    ANativeActivity_onCreate(activity, saved_state, saved_state_size);
+    g_glue_focus_changed = activity->callbacks->onWindowFocusChanged;
+    activity->callbacks->onWindowFocusChanged = on_focus_changed;
+    apply_system_ui(activity);
+}
 
 void android_main(android_app* app) {
     app->onAppCmd = on_app_cmd;
