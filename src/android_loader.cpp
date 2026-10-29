@@ -555,8 +555,27 @@ extern "C" void* native_dispatch_get_global_queue(long identifier, unsigned long
     return reinterpret_cast<void*>(g_gqueue);
 }
 
-extern "C" void native_dispatch_async(void* queue, void* block) {}
-extern "C" void native_dispatch_sync(void* queue, void (*work)(void*)) { if (work) work(nullptr); }
+// Block_layout: isa, int flags, int reserved, invoke, descriptor{reserved, size, copy_helper, dispose_helper}
+static void* heap_block_copy(void* block) {
+    if (!block) return nullptr;
+    int32_t flags = *reinterpret_cast<int32_t*>(static_cast<uint8_t*>(block) + 8);
+    if (flags & (1 << 28)) return block;   // BLOCK_IS_GLOBAL
+    uint64_t* desc = *reinterpret_cast<uint64_t**>(static_cast<uint8_t*>(block) + 24);
+    size_t size = desc ? static_cast<size_t>(desc[1]) : 32;
+    void* copy = malloc(size < 32 ? 32 : size);
+    std::memcpy(copy, block, size);
+    if (desc && (flags & (1 << 25)) && desc[2])   // BLOCK_HAS_COPY_DISPOSE: retain captured objects/__block vars
+        reinterpret_cast<void (*)(void*, void*)>(desc[2])(copy, block);
+    return copy;
+}
+extern "C" void native_dispatch_run_on_main(void* block);   // fake_uikit.hpp run loop
+// Every queue is served by the main run loop: work runs in submission order on the engine's main thread.
+extern "C" void native_dispatch_async(void* queue, void* block) { native_dispatch_run_on_main(heap_block_copy(block)); }
+extern "C" void native_dispatch_sync(void* queue, void* block) {
+    if (!block) return;
+    auto invoke = *reinterpret_cast<void (**)(void*)>(static_cast<uint8_t*>(block) + 16);
+    if (invoke) invoke(block);
+}
 extern "C" void native_dispatch_release(void* obj) {}
 
 // Engine-mode pthread_create wrapper: logs the result and the lifetime of every guest thread.

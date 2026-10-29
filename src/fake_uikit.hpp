@@ -48,7 +48,8 @@ inline bool is_stateful_class(const std::string& c) {
         "UIWindow", "UIView", "UIViewController", "UIImageView", "UIActivityIndicatorView", "UIScreenMode", "UIColor",
         "CALayer", "CAMetalLayer", "CAMetalDrawable", "CADisplayLink", "NSArray", "NSMutableArray", "NSDictionary",
         "NSMutableDictionary", "NSMapTable", "NSNumber", "NSRunLoop", "NSNotificationCenter", "NSUserDefaults",
-        "AVAudioSession", "NSAssertionHandler", "NSDate", "NSMutableSet", "NSSet"};
+        "AVAudioSession", "NSAssertionHandler", "NSDate", "NSMutableSet", "NSSet", "NSURL", "NSError", "AVURLAsset",
+        "AVAssetResourceLoader"};
     return k.count(c) != 0;
 }
 inline const char* parent_class(const std::string& c) {
@@ -367,6 +368,21 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
         }
     }
     if (cls == "NSDate" && sel.compare(0, 4, "date") == 0) { frame.ret_x0 = fake_make(8, "NSDate"); return true; }
+    if (cls == "NSURL" && (sel == "URLWithString:" || sel == "fileURLWithPath:" || sel == "fileURLWithPath:isDirectory:")) {
+        uint64_t h = fake_make(8, "NSURL");
+        std::string s;
+        objc_string_value(frame.x[2], s);
+        if (sel != "URLWithString:" && s.compare(0, 7, "file://") != 0) s = "file://" + s;
+        fake_lookup(h)->props["absoluteString"] = fake_make(2, s);
+        frame.ret_x0 = h;
+        return true;
+    }
+    if (cls == "AVURLAsset" && sel == "URLAssetWithURL:options:") {
+        uint64_t h = fake_make(8, "AVURLAsset");
+        fake_lookup(h)->props["URL"] = frame.x[2];
+        frame.ret_x0 = h;
+        return true;
+    }
     if (cls == "UIColor" && (sel.size() > 5 && sel.compare(sel.size() - 5, 5, "Color") == 0)) { frame.ret_x0 = fake_make(8, "UIColor"); return true; }
     if (cls == "UIColor" && sel.compare(0, 9, "colorWith") == 0) { frame.ret_x0 = fake_make(8, "UIColor"); return true; }
     return false;
@@ -624,6 +640,50 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         return true;
     }
     if (c == "NSRunLoop" || c == "NSNotificationCenter") { frame.ret_x0 = 0; return true; }
+    if (c == "NSURL") {
+        std::string s;
+        objc_string_value(getp(st, "absoluteString"), s);
+        if (sel == "isFileURL") { frame.ret_x0 = s.compare(0, 7, "file://") == 0; return true; }
+        if (sel == "path") { frame.ret_x0 = fake_make(2, s.compare(0, 7, "file://") == 0 ? s.substr(7) : s); return true; }
+        if (sel == "scheme") { size_t c2 = s.find(':'); frame.ret_x0 = fake_make(2, c2 == std::string::npos ? "" : s.substr(0, c2)); return true; }
+    }
+    // AVFoundation without a decoder: assets finish loading as "failed", like a device that cannot play the format.
+    if (c == "AVURLAsset") {
+        if (sel == "initWithURL:options:") {
+            st->props["URL"] = frame.x[2];
+            std::string u;
+            FakeObjcObj* url = fake_lookup(frame.x[2]);
+            if (url) objc_string_value(getp(url, "absoluteString"), u);
+            printf("[AV] AVURLAsset %s\n", u.c_str());
+            fflush(stdout);
+            frame.ret_x0 = frame.x[0];
+            return true;
+        }
+        if (sel == "resourceLoader") {
+            if (!getp(st, "resourceLoader")) st->props["resourceLoader"] = fake_make(8, "AVAssetResourceLoader");
+            frame.ret_x0 = getp(st, "resourceLoader");
+            return true;
+        }
+        if (sel == "loadValuesAsynchronouslyForKeys:completionHandler:") {
+            std::lock_guard<std::mutex> l(g_loop_mu);
+            g_delayed.push_back({frame.x[0], nullptr, frame.x[3], now_s()});
+            return true;
+        }
+        if (sel == "statusOfValueForKey:error:") {
+            if (frame.x[3]) {
+                uint64_t err = fake_make(8, "NSError");
+                FakeObjcObj* e = fake_lookup(err);
+                e->props["code"] = static_cast<uint64_t>(-11828);   // AVErrorFileFormatNotRecognized
+                e->props["localizedDescription"] = fake_make(2, "Cannot Open");
+                e->props["localizedFailureReason"] = fake_make(2, "No video decoder in this runtime");
+                *reinterpret_cast<uint64_t*>(frame.x[3]) = err;
+            }
+            frame.ret_x0 = 3;   // AVKeyValueStatusFailed
+            return true;
+        }
+        if (sel == "tracks" || sel == "tracksWithMediaType:") { frame.ret_x0 = new_array({}); return true; }
+        if (sel == "isPlayable") { frame.ret_x0 = 0; return true; }
+    }
     (void)in;
     return false;
 }
@@ -1044,6 +1104,13 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
     return true;
 }
 
+// dispatch_async target: the block runs on the next run loop pass (main thread).
+extern "C" void native_dispatch_run_on_main(void* block) {
+    if (!block) return;
+    std::lock_guard<std::mutex> l(fakeui::g_loop_mu);
+    fakeui::g_delayed.push_back({0, nullptr, reinterpret_cast<uint64_t>(block), 0});
+}
+
 // One pass of the main run loop: due delayed performs, the first appearance of the key window's root view controller,
 // pending layout, then every display link (CADisplayLink fires on vsync; the caller paces ticks at 60 Hz).
 static void fakeui_run_loop_once() {
@@ -1066,7 +1133,8 @@ static void fakeui_run_loop_once() {
         links = g_display_links;
     }
     for (const DelayedPerform& d : due) {
-        printf("[UI] delayed perform -[%#llx %s]\n", static_cast<unsigned long long>(d.target), d.sel ? d.sel : "?");
+        if (!d.sel) { run_block(d.arg, 0); continue; }   // queued completion block
+        printf("[UI] delayed perform -[%#llx %s]\n", static_cast<unsigned long long>(d.target), d.sel);
         fflush(stdout);
         send_sel(d.target, d.sel, d.arg);
     }
