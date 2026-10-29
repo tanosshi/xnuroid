@@ -8,6 +8,7 @@ static thread_local double g_objc_ret_d[4];
 static thread_local double g_objc_in_d[4];
 extern "C" double* objc_in_d_ptr() { return g_objc_in_d; }
 extern "C" double* objc_ret_d_ptr() { return g_objc_ret_d; }
+static std::atomic<uint64_t> g_draws_this_frame{0};   // LOADER_DRAW_STATS
 static thread_local uint64_t g_objc_in_x8;   // indirect-result pointer of the message being answered
 extern "C" void objc_set_in_x8(uint64_t v) { g_objc_in_x8 = v; }
 static void objc_ret_double(double v) { g_objc_ret_d[0] = v; }
@@ -96,6 +97,22 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
     auto starts = [&](const char* p) { return sel.compare(0, std::strlen(p), p) == 0; };
     const size_t colons = colon_count(sel);
     const bool is_class = self && (self->kind == 7 || self->s.compare(0, 6, "class:") == 0);
+
+    // LOADER_DUMP_MSL=<dir>: write every runtime-compiled Metal Shading Language source to <dir>/<n>.metal
+    if (sel == "newLibraryWithSource:options:error:") {
+        static const char* dir = getenv("LOADER_DUMP_MSL");
+        static std::atomic<int> n{0};
+        std::string src;
+        if (dir && objc_string_value(frame.x[2], src)) {
+            std::string path = std::string(dir) + "/" + std::to_string(n++) + ".metal";
+            if (FILE* fp = fopen(path.c_str(), "wb")) { fwrite(src.data(), 1, src.size(), fp); fclose(fp); }
+        }
+    }
+    // LOADER_DRAW_STATS=1: draws per presented frame, every 60 presents
+    if (sel.compare(0, 4, "draw") == 0 && sel.find("Primitives") != std::string::npos) {
+        static const bool on = getenv("LOADER_DRAW_STATS") != nullptr;
+        if (on) ++g_draws_this_frame;
+    }
 
     // class-style constructors for descriptors
     if (sel == "texture2DDescriptorWithPixelFormat:width:height:mipmapped:" || sel == "textureCubeDescriptorWithPixelFormat:size:mipmapped:" ||

@@ -131,7 +131,10 @@ inline bool is_kind_of(uint64_t o, uint64_t cls) {
     return false;
 }
 
-inline uint64_t alloc_for_class(const std::string& cls) { return fake_make(is_stateful_class(cls) ? 8 : 5, cls); }
+inline uint64_t alloc_for_class(const std::string& cls) {
+    if (cls == "NSString" || cls == "NSMutableString") return fake_make(2, "");
+    return fake_make(is_stateful_class(cls) ? 8 : 5, cls);
+}
 
 inline uint64_t new_array(const std::vector<uint64_t>& items) {
     uint64_t h = fake_make(8, "NSArray");
@@ -294,7 +297,7 @@ inline uint64_t next_drawable(uint64_t layer, FakeObjcObj* ls) {
 inline bool class_message(CallFrame& frame, const std::string& cls, const std::string& sel) {
     const double* in = g_objc_in_d;
     if (sel == "alloc" || sel == "allocWithZone:" || sel == "new") {
-        if (!is_stateful_class(cls)) return false;
+        if (!is_stateful_class(cls) && cls != "NSString" && cls != "NSMutableString") return false;
         frame.ret_x0 = alloc_for_class(cls);
         return true;
     }
@@ -849,8 +852,28 @@ inline uint64_t info_dictionary() {
 }
 
 inline bool string_message(CallFrame& frame, FakeObjcObj* s, const std::string& sel) {
-    const std::string& v = s->s;
     std::string a;
+    // initializers fill the string allocated by +[NSString alloc]
+    if (sel == "initWithBytes:length:encoding:" || sel == "initWithBytesNoCopy:length:encoding:freeWhenDone:") {
+        const char* b = reinterpret_cast<const char*>(frame.x[2]);
+        s->s.assign(b ? b : "", b ? frame.x[3] : 0);
+        frame.ret_x0 = frame.x[0];
+        return true;
+    }
+    if (sel == "initWithUTF8String:" || sel == "initWithCString:encoding:") {
+        const char* c = reinterpret_cast<const char*>(frame.x[2]);
+        s->s = c ? c : "";
+        frame.ret_x0 = c ? frame.x[0] : 0;
+        return true;
+    }
+    if (sel == "initWithString:" || sel == "initWithFormat:") {
+        objc_string_value(frame.x[2], s->s);
+        frame.ret_x0 = frame.x[0];
+        return true;
+    }
+    if (sel == "init") { frame.ret_x0 = frame.x[0]; return true; }
+    if (sel == "appendString:") { if (objc_string_value(frame.x[2], a)) s->s += a; return true; }
+    const std::string& v = s->s;
     if (sel == "stringByDeletingPathExtension") {
         size_t slash = v.rfind('/'), dot = v.rfind('.');
         frame.ret_x0 = fake_make(2, dot != std::string::npos && (slash == std::string::npos || dot > slash) ? v.substr(0, dot) : v);
@@ -942,7 +965,13 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
         return true;
     }
     if (sel == "presentDrawable:" || sel == "presentDrawable:afterMinimumDuration:" || sel == "presentDrawable:atTime:") {
-        ++g_presents;
+        uint64_t n = ++g_presents;
+        static const bool stats = getenv("LOADER_DRAW_STATS") != nullptr;
+        if (stats && n % 60 == 0) {
+            printf("[GFX] presents %llu: %.1f draws/frame over last 60\n", static_cast<unsigned long long>(n),
+                   g_draws_this_frame.exchange(0) / 60.0);
+            fflush(stdout);
+        }
         frame.ret_x0 = 0;
         return true;
     }
