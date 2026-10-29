@@ -1862,7 +1862,14 @@ static void shim_objc_msgSend(CallFrame& frame, void*) {
     // enumeration ends, lookups miss, bundles are absent) except the retain/alloc family, which hands back the receiver.
     static const bool nil_mode = getenv("LOADER_ENGINE") != nullptr || getenv("LOADER_OBJC_NIL") != nullptr;
     if (nil_mode) {
-        if (fake_foundation(frame, sel_str)) {
+        fake_life_check(frame, sel_str);
+        size_t mark = t_created.size();
+        ++t_msg_depth;
+        bool handled = fake_foundation(frame, sel_str);
+        --t_msg_depth;
+        if (handled) fake_autorelease_fresh(frame.ret_x0, mark, sel_str);
+        t_created.resize(mark);
+        if (handled) {
             static std::unordered_set<std::string> ret_seen;
             bool first_ret;
             {
@@ -2173,8 +2180,9 @@ static void dump_direct_bound_list() {
 #include <thread>
 
 extern "C" {
-void* native_cf_retain(void* o) { return o; }
-void native_cf_release(void*) {}
+void* native_cf_retain(void* o) { fake_retain(reinterpret_cast<uint64_t>(o)); return o; }
+void native_cf_release(void* o) { fake_release(reinterpret_cast<uint64_t>(o)); }
+void native_cf_noop(void*) {}
 int64_t native_cfstring_get_length(void* s) { std::string v; return objc_string_value(reinterpret_cast<uint64_t>(s), v) ? static_cast<int64_t>(v.size()) : 0; }
 int native_cfstring_get_cstring(void* s, char* buf, int64_t size, uint32_t) {
     std::string v;
@@ -2353,12 +2361,9 @@ uint64_t native_objc_alloc(uint64_t cls) {
 uint64_t native_objc_alloc_init(uint64_t cls) { return objc_send_noargs(native_objc_alloc(cls), "init"); }
 uint64_t native_objc_identity(uint64_t x) { return x; }
 void native_objc_noop() {}
-void native_objc_store_strong(uint64_t* addr, uint64_t v) { if (addr) *addr = v; }
 uint64_t native_objc_load_weak(uint64_t* addr) { return addr ? *addr : 0; }
 uint64_t native_objc_store_weak(uint64_t* addr, uint64_t v) { if (addr) *addr = v; return v; }
 void native_objc_copy_weak(uint64_t* to, uint64_t* from) { if (to) *to = from ? *from : 0; }
-uint64_t native_objc_get_property(uint64_t self, void*, int64_t off, bool) { return self ? *reinterpret_cast<uint64_t*>(self + off) : 0; }
-void native_objc_set_property(uint64_t self, void*, uint64_t v, int64_t off) { if (self) *reinterpret_cast<uint64_t*>(self + off) = v; }
 uint64_t native_objc_opt_class(uint64_t o) {
     bool is_cls = false;
     if (objcrt::GClass* gc = objcrt::guest_class_for_object(o, &is_cls)) return gc->addr;
@@ -2407,15 +2412,20 @@ static void register_objc_runtime_natives() {
     reg("_objc_msgSendSuper2", reinterpret_cast<void*>(&objc_msgSendSuper2_guest));
     for (const char* n : {"_objc_alloc", "_objc_allocWithZone"}) reg(n, reinterpret_cast<void*>(&native_objc_alloc));
     for (const char* n : {"_objc_alloc_init", "_objc_opt_new"}) reg(n, reinterpret_cast<void*>(&native_objc_alloc_init));
-    for (const char* n : {"_objc_retain", "_objc_retainAutoreleasedReturnValue", "_objc_retainAutorelease",
-                          "_objc_retainAutoreleaseReturnValue", "_objc_autorelease", "_objc_autoreleaseReturnValue",
-                          "_objc_unsafeClaimAutoreleasedReturnValue"})
-        reg(n, reinterpret_cast<void*>(&native_objc_identity));
-    for (const char* n : {"_objc_release", "_objc_destroyWeak", "__Block_release", "_objc_enumerationMutation"})
+    for (const char* n : {"_objc_retain", "_objc_retainAutoreleasedReturnValue"}) reg(n, reinterpret_cast<void*>(&native_objc_retain));
+    for (const char* n : {"_objc_retainAutorelease", "_objc_retainAutoreleaseReturnValue"})
+        reg(n, reinterpret_cast<void*>(&native_objc_retain_autorelease));
+    for (const char* n : {"_objc_autorelease", "_objc_autoreleaseReturnValue"}) reg(n, reinterpret_cast<void*>(&native_objc_autorelease));
+    reg("_objc_unsafeClaimAutoreleasedReturnValue", reinterpret_cast<void*>(&native_objc_identity));
+    reg("_objc_release", reinterpret_cast<void*>(&native_objc_release));
+    reg("_objc_autoreleasePoolPush", reinterpret_cast<void*>(&native_objc_pool_push));
+    reg("_objc_autoreleasePoolPop", reinterpret_cast<void*>(&native_objc_pool_pop));
+    for (const char* n : {"_objc_destroyWeak", "__Block_release", "_objc_enumerationMutation"})
         reg(n, reinterpret_cast<void*>(&native_objc_noop));
     reg("_objc_storeStrong", reinterpret_cast<void*>(&native_objc_store_strong));
     for (const char* n : {"_objc_retainBlock", "__Block_copy"}) reg(n, reinterpret_cast<void*>(&heap_block_copy));
-    for (const char* n : {"_objc_loadWeakRetained", "_objc_loadWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_load_weak));
+    reg("_objc_loadWeakRetained", reinterpret_cast<void*>(&native_objc_load_weak_retained));
+    reg("_objc_loadWeak", reinterpret_cast<void*>(&native_objc_load_weak));
     for (const char* n : {"_objc_storeWeak", "_objc_initWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_store_weak));
     for (const char* n : {"_objc_copyWeak", "_objc_moveWeak"}) reg(n, reinterpret_cast<void*>(&native_objc_copy_weak));
     reg("_objc_getProperty", reinterpret_cast<void*>(&native_objc_get_property));
@@ -2446,7 +2456,7 @@ static void register_darwin_framework_stubs() {
     reg("_CFArrayCreateMutable", reinterpret_cast<void*>(&native_cfarray_create_mutable));
     for (const char* n : {"_CFArrayAppendValue", "_CFWriteStreamOpen", "_CFStreamCreateBoundPair", "_CGColorRelease",
                           "_CGColorSpaceRelease", "_CVBufferRelease"})
-        reg(n, reinterpret_cast<void*>(&native_cf_release));
+        reg(n, reinterpret_cast<void*>(&native_cf_noop));
     for (const char* n : {"_CFDataCreateWithBytesNoCopy", "_CFDataGetBytePtr", "_CFDictionaryGetValue",
                           "_CFURLGetFileSystemRepresentation", "_CFUUIDCreate",
                           "_CFUUIDCreateFromUUIDBytes", "_CFUUIDCreateString", "_CFNumberGetValue",

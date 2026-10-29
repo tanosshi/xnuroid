@@ -16,6 +16,11 @@ using Send0 = uint64_t (*)(uint64_t, const char*);
 using Send1 = uint64_t (*)(uint64_t, const char*, uint64_t);
 using Send2 = uint64_t (*)(uint64_t, const char*, uint64_t, uint64_t);
 using SendRect = uint64_t (*)(uint64_t, const char*, double, double, double, double);
+
+// user_defaults.hpp
+inline uint64_t standard_defaults();
+inline bool defaults_message(CallFrame& frame, FakeObjcObj* d, const std::string& sel);
+inline void defaults_flush(bool force);
 inline uint64_t send(uint64_t o, const char* s) { return reinterpret_cast<Send0>(&objc_msgSend_guest)(o, objcrt::intern(s)); }
 inline uint64_t send(uint64_t o, const char* s, uint64_t a) { return reinterpret_cast<Send1>(&objc_msgSend_guest)(o, objcrt::intern(s), a); }
 inline uint64_t send(uint64_t o, const char* s, uint64_t a, uint64_t b) {
@@ -142,6 +147,7 @@ inline uint64_t alloc_for_class(const std::string& cls) {
 inline uint64_t new_array(const std::vector<uint64_t>& items) {
     uint64_t h = fake_make(8, "NSArray");
     fake_lookup(h)->items = items;
+    for (uint64_t i : items) fake_retain(i);
     return h;
 }
 
@@ -320,7 +326,10 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
             FakeObjcObj* d = fake_lookup(h);
             const uint64_t* vals = reinterpret_cast<const uint64_t*>(frame.x[2]);
             const uint64_t* keys = reinterpret_cast<const uint64_t*>(frame.x[3]);
-            for (uint64_t i = 0; vals && keys && i < frame.x[4]; ++i) { d->items.push_back(keys[i]); d->values.push_back(vals[i]); }
+            for (uint64_t i = 0; vals && keys && i < frame.x[4]; ++i) {
+                d->items.push_back(keys[i]); d->values.push_back(vals[i]);
+                fake_retain(keys[i]); fake_retain(vals[i]);
+            }
             frame.ret_x0 = h;
             return true;
         }
@@ -336,6 +345,7 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
         double v = fp ? in[0] : static_cast<double>(static_cast<int64_t>(frame.x[2]));
         if (sel == "numberWithFloat:") { float f; std::memcpy(&f, &in[0], 4); v = f; }
         if (sel == "numberWithBool:") v = (frame.x[2] & 0xff) ? 1 : 0;
+        if (fp) n->props["#real"] = 1;
         n->props["value"] = fp ? static_cast<uint64_t>(static_cast<int64_t>(v)) : frame.x[2];
         setd(n, "value", v);
         frame.ret_x0 = h;
@@ -357,21 +367,15 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
     // Singletons
     static const std::pair<const char*, const char*> singles[] = {
         {"NSRunLoop", "currentRunLoop"}, {"NSRunLoop", "mainRunLoop"}, {"NSNotificationCenter", "defaultCenter"},
-        {"NSUserDefaults", "standardUserDefaults"}, {"AVAudioSession", "sharedInstance"}, {"NSAssertionHandler", "currentHandler"}};
+        {"AVAudioSession", "sharedInstance"}, {"NSAssertionHandler", "currentHandler"}};
+    if (cls == "NSUserDefaults" && sel == "standardUserDefaults") { frame.ret_x0 = standard_defaults(); return true; }
     for (const auto& s : singles) {
         if (cls == s.first && sel == s.second) {
             static std::mutex mu;
             static std::unordered_map<std::string, uint64_t> made;
             std::lock_guard<std::mutex> l(mu);
             auto it = made.find(cls);
-            if (it == made.end()) {
-                it = made.emplace(cls, fake_make(8, cls)).first;
-                if (cls == "NSUserDefaults") {   // the global-domain values iOS always provides
-                    FakeObjcObj* d = fake_lookup(it->second);
-                    d->items = {fake_make(2, "AppleLanguages"), fake_make(2, "AppleLocale")};
-                    d->values = {new_array({fake_make(2, "en-US")}), fake_make(2, "en_US")};
-                }
-            }
+            if (it == made.end()) it = made.emplace(cls, fake_make(8, cls)).first;
             frame.ret_x0 = it->second;
             return true;
         }
@@ -389,6 +393,7 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
     if (cls == "AVURLAsset" && sel == "URLAssetWithURL:options:") {
         uint64_t h = fake_make(8, "AVURLAsset");
         fake_lookup(h)->props["URL"] = frame.x[2];
+        fake_retain(frame.x[2]);
         frame.ret_x0 = h;
         return true;
     }
@@ -414,6 +419,7 @@ inline bool container_message(CallFrame& frame, FakeObjcObj* o, const std::strin
     if (sel == "init" || sel == "initWithCapacity:" || sel == "copy" || sel == "mutableCopy") { frame.ret_x0 = frame.x[0]; return true; }
     if (sel == "removeAllObjects") { o->items.clear(); o->values.clear(); ++o->mutations; return true; }
     if (dict) {
+        if (c == "NSUserDefaults" && defaults_message(frame, o, sel)) return true;
         if (sel == "objectForKey:" || sel == "objectForKeyedSubscript:" || sel == "valueForKey:") {
             long i = find_key(o, frame.x[2]);
             frame.ret_x0 = i < 0 ? 0 : o->values[i];
@@ -425,8 +431,10 @@ inline bool container_message(CallFrame& frame, FakeObjcObj* o, const std::strin
                 if (i >= 0) { o->items.erase(o->items.begin() + i); o->values.erase(o->values.begin() + i); }
             } else if (i < 0) {
                 o->items.push_back(frame.x[3]); o->values.push_back(frame.x[2]);
+                fake_retain(frame.x[3]); fake_retain(frame.x[2]);
             } else {
                 o->values[i] = frame.x[2];
+                fake_retain(frame.x[2]);
             }
             ++o->mutations;
             return true;
@@ -443,7 +451,6 @@ inline bool container_message(CallFrame& frame, FakeObjcObj* o, const std::strin
             frame.ret_x0 = i < 0 ? 0 : send(o->values[i], sel == "boolForKey:" ? "boolValue" : "integerValue");
             return true;
         }
-        if (sel == "synchronize") { frame.ret_x0 = 1; return true; }
         return false;
     }
     if (sel == "objectAtIndex:" || sel == "objectAtIndexedSubscript:") {
@@ -452,7 +459,7 @@ inline bool container_message(CallFrame& frame, FakeObjcObj* o, const std::strin
     }
     if (sel == "firstObject") { frame.ret_x0 = o->items.empty() ? 0 : o->items.front(); return true; }
     if (sel == "lastObject") { frame.ret_x0 = o->items.empty() ? 0 : o->items.back(); return true; }
-    if (sel == "addObject:") { if (frame.x[2]) { o->items.push_back(frame.x[2]); ++o->mutations; } return true; }
+    if (sel == "addObject:") { if (frame.x[2]) { o->items.push_back(frame.x[2]); fake_retain(frame.x[2]); ++o->mutations; } return true; }
     if (sel == "removeObject:") {
         o->items.erase(std::remove(o->items.begin(), o->items.end(), frame.x[2]), o->items.end());
         ++o->mutations;
@@ -618,6 +625,14 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
         if (sel == "floatValue") { objc_ret_float(static_cast<float>(v)); return true; }
         if (sel == "doubleValue") { objc_ret_double(v); return true; }
         if (sel == "boolValue") { frame.ret_x0 = v != 0; return true; }
+        if (sel == "objCType") { frame.ret_x0 = reinterpret_cast<uint64_t>(getp(st, "#real") ? "d" : "q"); return true; }
+        if (sel == "stringValue" || sel == "description") {
+            char buf[40];
+            if (getp(st, "#real")) snprintf(buf, sizeof buf, "%.17g", v);
+            else snprintf(buf, sizeof buf, "%lld", static_cast<long long>(static_cast<int64_t>(getp(st, "value"))));
+            frame.ret_x0 = fake_make(2, buf);
+            return true;
+        }
         if (sel.size() > 5 && sel.compare(sel.size() - 5, 5, "Value") == 0) { frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(v)); return true; }
     }
     if (c == "UIScreenMode") {
@@ -702,6 +717,7 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
     if (c == "AVURLAsset") {
         if (sel == "initWithURL:options:") {
             st->props["URL"] = frame.x[2];
+            fake_retain(frame.x[2]);
             std::string u;
             FakeObjcObj* url = fake_lookup(frame.x[2]);
             if (url) objc_string_value(getp(url, "absoluteString"), u);
@@ -830,6 +846,8 @@ private:
                 }
                 FakeObjcObj* o = fake_lookup(h);
                 if (hi == 0xD) { o->items = keys; o->values = vals; } else { o->items = vals; }
+                for (uint64_t k : keys) fake_retain(k);
+                for (uint64_t v : vals) fake_retain(v);
                 return h;
             }
             default:
@@ -909,7 +927,12 @@ private:
         if (tag == "string") return fake_make(2, text_until("string"));
         if (tag == "string/") return fake_make(2, "");
         if (tag == "integer") { int64_t v = strtoll(text_until("integer").c_str(), nullptr, 10); return number(static_cast<double>(v), static_cast<uint64_t>(v)); }
-        if (tag == "real") { double v = strtod(text_until("real").c_str(), nullptr); return number(v, static_cast<uint64_t>(static_cast<int64_t>(v))); }
+        if (tag == "real") {
+            double v = strtod(text_until("real").c_str(), nullptr);
+            uint64_t h = number(v, static_cast<uint64_t>(static_cast<int64_t>(v)));
+            fake_lookup(h)->props["#real"] = 1;
+            return h;
+        }
         if (tag == "data" || tag == "date") { text_until(tag); return 0; }
         if (tag == "array/" || tag == "dict/") return fake_make(8, tag == "dict/" ? "NSDictionary" : "NSArray");
         if (tag != "array" && tag != "dict") return 0;
@@ -930,9 +953,9 @@ private:
         FakeObjcObj* o = fake_lookup(h);
         if (dict) {
             for (size_t i = 0; i < keys.size() && i < vals.size(); ++i)
-                if (vals[i]) { o->items.push_back(keys[i]); o->values.push_back(vals[i]); }
+                if (vals[i]) { o->items.push_back(keys[i]); o->values.push_back(vals[i]); fake_retain(keys[i]); fake_retain(vals[i]); }
         } else {
-            for (uint64_t v : vals) if (v) o->items.push_back(v);
+            for (uint64_t v : vals) if (v) { o->items.push_back(v); fake_retain(v); }
         }
         return h;
     }
@@ -998,6 +1021,20 @@ inline bool string_message(CallFrame& frame, FakeObjcObj* s, const std::string& 
     if (sel == "lastPathComponent") { size_t sl = v.rfind('/'); frame.ret_x0 = fake_make(2, sl == std::string::npos ? v : v.substr(sl + 1)); return true; }
     if (sel == "stringByDeletingLastPathComponent") { size_t sl = v.rfind('/'); frame.ret_x0 = fake_make(2, sl == std::string::npos ? "" : v.substr(0, sl)); return true; }
     if (sel == "stringByAppendingString:") { objc_string_value(frame.x[2], a); frame.ret_x0 = fake_make(2, v + a); return true; }
+    if (sel == "stringByReplacingOccurrencesOfString:withString:") {   // PlayerPrefs keys go through this
+        std::string with, out;
+        objc_string_value(frame.x[3], with);
+        if (!objc_string_value(frame.x[2], a) || a.empty()) { frame.ret_x0 = fake_make(2, v); return true; }
+        for (size_t p = 0;;) {
+            size_t hit = v.find(a, p);
+            out.append(v, p, hit == std::string::npos ? std::string::npos : hit - p);
+            if (hit == std::string::npos) break;
+            out += with;
+            p = hit + a.size();
+        }
+        frame.ret_x0 = fake_make(2, out);
+        return true;
+    }
     if (sel == "hasPrefix:") { frame.ret_x0 = objc_string_value(frame.x[2], a) && v.compare(0, a.size(), a) == 0; return true; }
     if (sel == "hasSuffix:") {
         frame.ret_x0 = objc_string_value(frame.x[2], a) && v.size() >= a.size() && v.compare(v.size() - a.size(), a.size(), a) == 0;
@@ -1062,6 +1099,8 @@ inline bool transform_message(CallFrame& frame, FakeObjcObj* st, const std::stri
 }
 
 }  // namespace fakeui
+
+#include "user_defaults.hpp"
 
 static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
     using namespace fakeui;
@@ -1140,6 +1179,7 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
     if (sel.compare(0, 3, "set") == 0 && sel.size() > 4 && colons == 1) {
         std::string key = lower_first(sel.substr(3, sel.size() - 4));
         st->props[key] = frame.x[2];
+        fake_retain(frame.x[2]);
         setd(st, key, in[0]);
         frame.ret_x0 = 0;
         return true;
@@ -1256,6 +1296,7 @@ static void send_touch(uint64_t touch, int phase, double x, double y) {
     ts->props["window"] = g_key_window;
     uint64_t set = fake_make(8, "NSSet");
     fake_lookup(set)->items = {touch};
+    fake_retain(touch);
     uint64_t ev = fake_make(8, "UIEvent");
     FakeObjcObj* es = fake_lookup(ev);
     es->props["touches"] = set;
@@ -1327,7 +1368,10 @@ static void fakeui_run_application(int frames) {
         double a = now_s();
         deliver_scripted_touches(taps, f);
         deliver_host_touches();
+        uint64_t pool = fake_pool_push();
         fakeui_run_loop_once();
+        fake_pool_pop(pool);
+        fakeui::defaults_flush(false);
         double ms = (now_s() - a) * 1e3;
         if (ms > worst) worst = ms;
         if (f < 3 || (f + 1) % 60 == 0)

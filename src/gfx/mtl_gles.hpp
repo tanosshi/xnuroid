@@ -194,6 +194,17 @@ struct Encoder {
 };
 
 inline std::mutex g_gl_mu;
+// FakeObjcObj::gltype: what props["#gl"] points to
+constexpr uint8_t kGlTexture = 1, kGlSampler = 2, kGlPipeline = 3, kGlDepthStencil = 4, kGlEncoder = 5;
+inline std::atomic<int64_t> g_texture_bytes{0};
+inline int64_t texture_bytes(const Tex* t) {
+    int64_t texels = 0;
+    for (int l = 0; l < t->levels; ++l) texels += static_cast<int64_t>(std::max(1, t->w >> l)) * std::max(1, t->h >> l);
+    int64_t faces = t->target == GL_TEXTURE_CUBE_MAP ? 6 : t->target == GL_TEXTURE_CUBE_MAP_ARRAY ? 6 * t->layers : t->layers;
+    int64_t depth = t->target == GL_TEXTURE_3D ? t->d : 1;
+    int64_t bpp = t->f.compressed ? 1 : t->f.bytes;   // compressed formats: about one byte per texel (ASTC 4x4/ETC2 RGBA)
+    return texels * faces * depth * bpp * t->samples;
+}
 inline uint64_t g_frame_no = 0;
 // LOADER_GL_TRACE=<n>: log render passes and draws for the first n presented frames.
 inline bool tracing() {
@@ -349,6 +360,8 @@ inline Tex* texture(FakeObjcObj* o) {
     if (err) fprintf(stderr, "[MTLGL] texture pf %llu %dx%dx%d levels %d target 0x%x: GL error 0x%x\n",
                      static_cast<unsigned long long>(t->pf), t->w, t->h, t->d, t->levels, t->target, err);
     o->props["#gl"] = reinterpret_cast<uint64_t>(t);
+    o->gltype = kGlTexture;
+    g_texture_bytes += texture_bytes(t);
     gles::publish();
     return t;
 }
@@ -1047,6 +1060,43 @@ inline void commit(FakeObjcObj* cb) {
     if (!drawable) { glFlush(); return; }
     cb->props.erase("#present");
     uint64_t n = ++g_frame_no;
+    ++g_present_count;
+    fake_reap_graves();
+    static const bool mem_stats = getenv("LOADER_MEM_STATS") != nullptr;
+    if (mem_stats && n % 600 == 0) {
+        size_t live;
+        {
+            std::lock_guard<std::mutex> l(g_fake_mu);
+            live = g_fake_objc.size();
+        }
+        printf("[MEM] frame %llu: %zu live fakes, %.1f MB GL textures\n", static_cast<unsigned long long>(n), live, g_texture_bytes.load() / 1048576.0);
+        std::map<std::string, size_t> by;
+        std::vector<std::pair<int64_t, std::string>> big;
+        {
+            std::lock_guard<std::mutex> l(g_fake_mu);
+            for (auto& kv : g_fake_objc) {
+                FakeObjcObj* o = kv.second;
+                std::string k = std::to_string(o->kind) + ":" + (o->s.size() > 24 ? o->s.substr(0, 24) : o->s);
+                if (fake_life_debug()) {
+                    std::lock_guard<std::mutex> g(g_grave_mu);
+                    auto b = g_fake_born.find(reinterpret_cast<uint64_t>(kv.first));
+                    if (b != g_fake_born.end()) k += " <" + b->second;
+                }
+                ++by[k];
+                if (o->gltype == kGlTexture)
+                    if (Tex* t = reinterpret_cast<Tex*>(prop(o, "#gl", 0)))
+                        big.push_back({texture_bytes(t), std::to_string(t->w) + "x" + std::to_string(t->h) + "x" + std::to_string(t->layers) +
+                                                         " L" + std::to_string(t->levels) + " fmt" + std::to_string(prop(o, "pixelFormat", 0))});
+            }
+        }
+        std::vector<std::pair<size_t, std::string>> top;
+        for (auto& kv : by) top.push_back({kv.second, kv.first});
+        std::sort(top.rbegin(), top.rend());
+        for (size_t i = 0; i < top.size() && i < 8; ++i) printf("[MEM]   %6zu %s\n", top[i].first, top[i].second.c_str());
+        std::sort(big.rbegin(), big.rend());
+        for (size_t i = 0; i < big.size() && i < 6; ++i) printf("[MEM]   tex %.1f MB %s\n", big[i].first / 1048576.0, big[i].second.c_str());
+        fflush(stdout);
+    }
     static const char* dir = getenv("LOADER_FRAME_DIR");
     static const uint64_t every = getenv("LOADER_FRAME_EVERY") ? strtoull(getenv("LOADER_FRAME_EVERY"), nullptr, 10) : 60;
     if (dir && every && n % every == 0) {
@@ -1067,6 +1117,40 @@ inline void commit(FakeObjcObj* cb) {
 
 }  // namespace mtlgl
 
+// Frees the GL object of a dead Metal object (called from fake_reap_graves on the presenting thread).
+static void mtl_gles_destroy(FakeObjcObj* o) {
+    using namespace mtlgl;
+    auto it = o->props.find("#gl");
+    if (it == o->props.end() || !it->second || !o->gltype) return;
+    void* p = reinterpret_cast<void*>(it->second);
+    const bool gl = tgl().init;
+    switch (o->gltype) {
+        case kGlTexture: {
+            auto* t = static_cast<Tex*>(p);
+            g_texture_bytes -= texture_bytes(t);
+            if (gl) glDeleteTextures(1, &t->id);
+            delete t;
+            break;
+        }
+        case kGlSampler: {
+            auto* s = static_cast<Sampler*>(p);
+            if (gl) glDeleteSamplers(1, &s->id);
+            delete s;
+            break;
+        }
+        case kGlPipeline: {
+            auto* pl = static_cast<Pipeline*>(p);
+            if (gl && pl->prog) glDeleteProgram(pl->prog);
+            delete pl;
+            break;
+        }
+        case kGlDepthStencil: delete static_cast<DepthStencil*>(p); break;
+        case kGlEncoder: delete static_cast<Encoder*>(p); break;
+        default: break;
+    }
+    o->props.erase(it);
+}
+
 // Metal messages with a real GL meaning. Returns false to fall through to the property bag behaviour.
 static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcObj* self) {
     using namespace mtlgl;
@@ -1080,6 +1164,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         FakeObjcObj* t = fake_metal_bag(&h);
         if (FakeObjcObj* d = fake_lookup(frame.x[2])) t->props = d->props;
         t->props.erase("#gl");
+        fake_retain_owned_props(t);
         frame.ret_x0 = h;
         return true;
     }
@@ -1088,8 +1173,9 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         FakeObjcObj* t = fake_metal_bag(&h);
         t->props = self->props;
         t->props.erase("#gl");
+        fake_retain_owned_props(t);
         t->props["pixelFormat"] = frame.x[2];
-        t->props["#viewOf"] = frame.x[0];
+        fake_set_prop(t, "#viewOf", frame.x[0]);
         frame.ret_x0 = h;
         return true;
     }
@@ -1098,6 +1184,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         FakeObjcObj* s = fake_metal_bag(&h);
         std::lock_guard<std::mutex> l(g_gl_mu);
         s->props["#gl"] = reinterpret_cast<uint64_t>(make_sampler(fake_lookup(frame.x[2])));
+        s->gltype = kGlSampler;
         frame.ret_x0 = h;
         return true;
     }
@@ -1105,6 +1192,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         uint64_t h;
         FakeObjcObj* s = fake_metal_bag(&h);
         s->props["#gl"] = reinterpret_cast<uint64_t>(make_depth_stencil(fake_lookup(frame.x[2])));
+        s->gltype = kGlDepthStencil;
         frame.ret_x0 = h;
         return true;
     }
@@ -1112,7 +1200,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         uint64_t h;
         FakeObjcObj* lib = fake_metal_bag(&h);
         objc_string_value(frame.x[2], lib->s);
-        lib->props["#options"] = frame.x[3];
+        fake_set_prop(lib, "#options", frame.x[3]);
         if (frame.x[4]) *reinterpret_cast<uint64_t*>(frame.x[4]) = 0;
         frame.ret_x0 = h;
         return true;
@@ -1121,8 +1209,8 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         uint64_t h;
         FakeObjcObj* fn = fake_metal_bag(&h);
         objc_string_value(frame.x[2], fn->s);
-        fn->props["#library"] = frame.x[0];
-        fn->props["name"] = frame.x[2];
+        fake_set_prop(fn, "#library", frame.x[0]);
+        fake_set_prop(fn, "name", frame.x[2]);
         frame.ret_x0 = h;
         return true;
     }
@@ -1132,6 +1220,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         {
             std::lock_guard<std::mutex> l(g_gl_mu);
             ps->props["#gl"] = reinterpret_cast<uint64_t>(make_pipeline(fake_lookup(frame.x[2])));
+            ps->gltype = kGlPipeline;
         }
         if (sel == "newRenderPipelineStateWithDescriptor:completionHandler:") { run_block(frame.x[3], h); frame.ret_x0 = 0; return true; }
         size_t colons = colon_count(sel);
@@ -1179,6 +1268,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         FakeObjcObj* enc = fake_metal_bag(&h);
         auto* e = new Encoder();
         enc->props["#gl"] = reinterpret_cast<uint64_t>(e);
+        enc->gltype = kGlEncoder;
         enc->props["#parent"] = frame.x[0];
         begin_pass(e, fake_lookup(frame.x[2]));
         frame.ret_x0 = h;

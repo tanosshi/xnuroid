@@ -26,6 +26,12 @@ struct FakeObjcObj {
     std::vector<uint64_t> values;                      // NSDictionary/NSMapTable values (parallel to items)
     unsigned long mutations = 0;                       // fast-enumeration mutation counter
     double rect[4] = {0, 0, 0, 0};                     // UIView frame (origin, size) / CGSize in rect[2..3]
+    // Lifetime (Metal objects, kind 3): Cocoa reference counting; at zero the object is destroyed a few frames later.
+    std::atomic<int> refs{1};
+    bool parent_owned = false;   // created as a property of another object, which holds its reference
+    bool borrowed_mem = false;   // mem belongs to the guest (newBufferWithBytesNoCopy:)
+    uint8_t gltype = 0;          // what props["#gl"] points to (mtl_gles.hpp)
+    bool counted = false;        // a non-Metal object under retain/release (strings handed out +0)
 };
 // Render and job threads send messages too, so the registry is locked; objects themselves are per-thread in practice.
 static std::mutex g_fake_mu;
@@ -40,11 +46,17 @@ static size_t fake_handle_size() {
     static const size_t n = getenv("LOADER_FAKE_HANDLE_SIZE") ? strtoull(getenv("LOADER_FAKE_HANDLE_SIZE"), nullptr, 10) : 32;
     return n;
 }
+// Objects created while one message is answered (shim_objc_msgSend decides which of them it returns +0).
+static thread_local std::vector<uint64_t> t_created;
+static thread_local int t_msg_depth = 0;
 static uint64_t fake_make(int kind, const std::string& s) {
     auto* o = new FakeObjcObj{kind, s};
     void* handle = calloc(1, fake_handle_size());   // a real, distinct, non-null address to hand to the guest
-    std::lock_guard<std::mutex> l(g_fake_mu);
-    g_fake_objc[handle] = o;
+    {
+        std::lock_guard<std::mutex> l(g_fake_mu);
+        g_fake_objc[handle] = o;
+    }
+    if (t_msg_depth) t_created.push_back(reinterpret_cast<uint64_t>(handle));
     return reinterpret_cast<uint64_t>(handle);
 }
 // One kind-7 class object per foreign class name, shared by NSClassFromString, objc_getClass and the bound
@@ -82,6 +94,133 @@ static FakeObjcObj* fake_metal_bag(uint64_t* handle_out = nullptr) {
     uint64_t h = fake_make(3, "mtl");
     if (handle_out) *handle_out = h;
     return fake_lookup(h);
+}
+
+// ---- lifetime of Metal objects ----
+// Retain/release/autorelease follow Cocoa rules for kind-3 objects and for strings returned +0; other fakes are immortal. A property holds a
+// reference to its value when the key is public or one of the internal owning keys below.
+static void mtl_gles_destroy(FakeObjcObj* o);   // mtl_gles.hpp: frees the GL object behind props["#gl"]
+static bool owning_key(const std::string& k) {
+    if (k.empty() || (k.size() > 2 && k.compare(k.size() - 2, 2, "#d") == 0)) return false;
+    if (k[0] != '#') return true;
+    return k.compare(0, 4, "#obj") == 0 || k == "#viewOf" || k == "#library" || k == "#options";
+}
+static FakeObjcObj* fake_counted(uint64_t h) {
+    FakeObjcObj* o = h ? fake_lookup(h) : nullptr;
+    return o && (o->kind == 3 || o->counted) ? o : nullptr;
+}
+// Every fake keeps a count, so references taken before an object becomes counted (native stores while the message
+// that creates it is still running) are not lost; only counted objects and Metal objects die at zero.
+static void fake_retain(uint64_t h) {
+    if (FakeObjcObj* o = h ? fake_lookup(h) : nullptr) o->refs.fetch_add(1);
+}
+struct Grave { FakeObjcObj* obj; void* handle; uint64_t frame; };
+// LOADER_FAKE_LIFE: remember dead Metal objects so later messages to them are reported (shim_objc_msgSend).
+static bool fake_life_debug() { static const bool on = getenv("LOADER_FAKE_LIFE") != nullptr; return on; }
+static std::unordered_map<uint64_t, std::string> g_fake_born, g_fake_dead;
+static std::mutex g_grave_mu;
+static std::vector<Grave> g_graves;
+static std::atomic<uint64_t> g_present_count{0};   // advanced per presented frame (mtl_gles.hpp)
+static void fake_release(uint64_t h) {
+    FakeObjcObj* o = h ? fake_lookup(h) : nullptr;
+    if (!o || o->refs.fetch_sub(1) != 1 || (o->kind != 3 && !o->counted)) return;
+    // dead: unreachable through the registry at once, memory and GL objects freed a few frames later, since
+    // encoders still running on other threads may hold raw pointers
+    {
+        std::lock_guard<std::mutex> l(g_fake_mu);
+        g_fake_objc.erase(reinterpret_cast<void*>(h));
+    }
+    std::vector<uint64_t> children;
+    for (auto& kv : o->props)
+        if (owning_key(kv.first)) children.push_back(kv.second);
+    if (o->kind != 3) {
+        children.insert(children.end(), o->items.begin(), o->items.end());
+        children.insert(children.end(), o->values.begin(), o->values.end());
+    }
+    {
+        std::lock_guard<std::mutex> l(g_grave_mu);
+        g_graves.push_back({o, reinterpret_cast<void*>(h), g_present_count.load()});
+        if (fake_life_debug()) g_fake_dead[h] = (g_fake_born.count(h) ? g_fake_born[h] : std::string("?")) + " \"" + o->s.substr(0, 60) + "\"";
+    }
+    for (uint64_t c : children) fake_release(c);
+}
+// Called once per presented frame by the renderer (a thread with a GL context).
+static void fake_reap_graves() {
+    std::vector<Grave> due;
+    {
+        std::lock_guard<std::mutex> l(g_grave_mu);
+        uint64_t now = g_present_count.load();
+        for (size_t i = 0; i < g_graves.size();) {
+            if (now >= g_graves[i].frame + 3) { due.push_back(g_graves[i]); g_graves[i] = g_graves.back(); g_graves.pop_back(); }
+            else ++i;
+        }
+    }
+    for (Grave& g : due) {
+        mtl_gles_destroy(g.obj);
+        if (g.obj->mem && !g.obj->borrowed_mem) free(g.obj->mem);
+        delete g.obj;
+        if (!fake_life_debug()) free(g.handle);   // kept while debugging so a dead address is never reused
+    }
+}
+// Values copied wholesale from another bag (descriptor -> object) get their own references.
+static void fake_retain_owned_props(FakeObjcObj* o) {
+    for (auto& kv : o->props)
+        if (owning_key(kv.first)) fake_retain(kv.second);
+}
+// Stores an object-valued property, holding a reference to the new value and dropping the old one.
+static void fake_set_prop(FakeObjcObj* o, const std::string& key, uint64_t value) {
+    uint64_t old = 0;
+    auto it = o->props.find(key);
+    if (it != o->props.end()) old = it->second;
+    if (old == value) return;
+    bool own = owning_key(key);
+    if (own) fake_retain(value);
+    o->props[key] = value;
+    if (own && old) fake_release(old);
+}
+
+// Autorelease pools, per thread. A pool token is the stack height at push (+1 so it is never 0).
+static thread_local std::vector<uint64_t> t_autorelease;
+static void fake_autorelease(uint64_t h) {
+    if (fake_counted(h)) t_autorelease.push_back(h);
+}
+static uint64_t fake_pool_push() { return t_autorelease.size() + 1; }
+static void fake_pool_pop(uint64_t token) {
+    size_t keep = token ? static_cast<size_t>(token - 1) : 0;
+    while (t_autorelease.size() > keep) {
+        uint64_t h = t_autorelease.back();
+        t_autorelease.pop_back();
+        fake_release(h);
+    }
+}
+// Cocoa method families that return +1 (owned) results; everything else returns +0 (autoreleased).
+static bool returns_retained(const std::string& sel) {
+    for (const char* fam : {"alloc", "new", "copy", "mutableCopy", "init"}) {
+        size_t n = std::strlen(fam);
+        if (sel.compare(0, n, fam) == 0 && (sel.size() == n || !std::islower(static_cast<unsigned char>(sel[n])))) return true;
+    }
+    return false;
+}
+// A Metal object or string made while answering a +0 selector is owned by the current autorelease pool, unless a
+// parent holds it. Strings returned +1 stay immortal: the native stores below did not always retain them.
+// +0 class factories of NSArray/NSDictionary/NSSet/NSNumber; their results are never cached by this loader.
+static bool collection_factory(const std::string& sel) {
+    if (sel == "set") return true;
+    for (const char* p : {"array", "dictionary", "setWith", "numberWith"}) {
+        size_t n = std::strlen(p);
+        if (sel.compare(0, n, p) == 0 && (sel.size() == n || sel[n] == ':' || std::isupper(static_cast<unsigned char>(sel[n])))) return true;
+    }
+    return false;
+}
+static void fake_autorelease_fresh(uint64_t ret, size_t mark, const std::string& sel) {
+    if (!ret || t_created.size() == mark) return;
+    if (std::find(t_created.begin() + mark, t_created.end(), ret) == t_created.end()) return;
+    FakeObjcObj* o = fake_lookup(ret);
+    if (!o) return;
+    if (fake_life_debug()) { std::lock_guard<std::mutex> l(g_grave_mu); g_fake_born[ret] = sel; }
+    if ((o->kind == 2 || (o->kind == 8 && collection_factory(sel))) && !o->parent_owned && !returns_retained(sel)) o->counted = true;
+    if (!o->counted && o->kind != 3) return;
+    if (!o->parent_owned && !returns_retained(sel)) fake_autorelease(ret);
 }
 static std::string lower_first(const std::string& s) {
     std::string r = s;
@@ -136,8 +275,11 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
     if (self && !is_class && self->kind == 3) {
         if (sel == "name") { frame.ret_x0 = fake_make(2, self->s == "device" ? "FakeGPU" : "fake"); return true; }
         if (sel == "description") { frame.ret_x0 = fake_make(2, "FakeMetalObject"); return true; }
-        if (sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" || sel == "alloc" ||
-            sel == "allocWithZone:" || starts("init") || sel == "copyWithZone:") { frame.ret_x0 = frame.x[0]; return true; }
+        if (sel == "retain") { fake_retain(frame.x[0]); frame.ret_x0 = frame.x[0]; return true; }
+        if (sel == "release") { fake_release(frame.x[0]); frame.ret_x0 = 0; return true; }
+        if (sel == "autorelease") { fake_autorelease(frame.x[0]); frame.ret_x0 = frame.x[0]; return true; }
+        if (sel == "copy" || sel == "copyWithZone:" || sel == "mutableCopy") { fake_retain(frame.x[0]); frame.ret_x0 = frame.x[0]; return true; }   // shared, +1
+        if (sel == "self" || sel == "alloc" || sel == "allocWithZone:" || starts("init")) { frame.ret_x0 = frame.x[0]; return true; }
         if (sel == "contents") { frame.ret_x0 = reinterpret_cast<uint64_t>(self->mem); return true; }
         if (sel == "length") { frame.ret_x0 = self->len; return true; }
         // buffers
@@ -155,13 +297,14 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         if (sel == "newBufferWithBytesNoCopy:length:options:deallocator:") {
             uint64_t h; FakeObjcObj* b = fake_metal_bag(&h);
             b->len = frame.x[3]; b->mem = reinterpret_cast<void*>(frame.x[2]);
+            b->borrowed_mem = true;
             frame.ret_x0 = h; return true;
         }
         // textures made from a descriptor / another texture inherit its values
         if (starts("newTextureWithDescriptor:") || starts("newTextureViewWithPixelFormat:")) {
             uint64_t h; FakeObjcObj* t = fake_metal_bag(&h);
             FakeObjcObj* src = starts("newTextureViewWithPixelFormat:") ? self : fake_lookup(frame.x[2]);
-            if (src) t->props = src->props;
+            if (src) { t->props = src->props; fake_retain_owned_props(t); }
             if (starts("newTextureViewWithPixelFormat:")) t->props["pixelFormat"] = frame.x[2];
             frame.ret_x0 = h; return true;
         }
@@ -180,14 +323,18 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         if (sel == "objectAtIndexedSubscript:") {
             std::string key = "#obj" + std::to_string(frame.x[2]);
             auto it = self->props.find(key);
-            if (it == self->props.end()) { uint64_t h; fake_metal_bag(&h); it = self->props.emplace(key, h).first; }
+            if (it == self->props.end()) {
+                uint64_t h;
+                fake_metal_bag(&h)->parent_owned = true;
+                it = self->props.emplace(key, h).first;
+            }
             frame.ret_x0 = it->second; return true;
         }
-        if (sel == "setObject:atIndexedSubscript:") { self->props["#obj" + std::to_string(frame.x[3])] = frame.x[2]; return true; }
+        if (sel == "setObject:atIndexedSubscript:") { fake_set_prop(self, "#obj" + std::to_string(frame.x[3]), frame.x[2]); return true; }
         // property bag: setFoo: / foo
         if (starts("set") && colons == 1) {
             std::string key = lower_first(sel.substr(3, sel.size() - 4));
-            self->props[key] = frame.x[2];
+            fake_set_prop(self, key, frame.x[2]);
             uint64_t bits; std::memcpy(&bits, &g_objc_in_d[0], 8);
             self->props[key + "#d"] = bits;
             return true;
@@ -206,7 +353,8 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
             for (const char* suf : objprops) {
                 size_t n = std::strlen(suf);
                 if (sel.size() >= n && sel.compare(sel.size() - n, n, suf) == 0) {
-                    uint64_t h; fake_metal_bag(&h);
+                    uint64_t h;
+                    fake_metal_bag(&h)->parent_owned = true;
                     self->props[sel] = h; frame.ret_x0 = h; return true;
                 }
             }
@@ -238,6 +386,16 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
 static bool fake_uikit_message(CallFrame& frame, const std::string& sel);   // fake_uikit.hpp
 
 static bool fake_foundation(CallFrame& frame, const std::string& sel) {
+    if (sel == "retain" || sel == "release" || sel == "autorelease" || sel == "copy" || sel == "copyWithZone:" || sel == "mutableCopy") {
+        FakeObjcObj* c = fake_counted(frame.x[0]);
+        if (c && c->kind != 3) {
+            if (sel == "release") { fake_release(frame.x[0]); frame.ret_x0 = 0; return true; }
+            if (sel == "autorelease") fake_autorelease(frame.x[0]);
+            else fake_retain(frame.x[0]);
+            frame.ret_x0 = frame.x[0];
+            return true;
+        }
+    }
     if (fake_uikit_message(frame, sel)) return true;
     FakeObjcObj* self = fake_lookup(frame.x[0]);
     // --- foreign class objects (kind 7: _OBJC_CLASS_$_UIDevice, ...) ---
@@ -377,6 +535,47 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
 }
 
 extern "C" void* native_mtl_create_system_default_device() {
-    static uint64_t dev = fake_make(3, "device");
+    static uint64_t dev = [] {
+        uint64_t h = fake_make(3, "device");
+        fake_lookup(h)->refs = 1 << 30;
+        return h;
+    }();
     return reinterpret_cast<void*>(dev);
+}
+
+// LOADER_FAKE_LIFE: report a message whose receiver or first arguments are dead fakes.
+static void fake_life_check(const CallFrame& frame, const std::string& sel) {
+    if (!fake_life_debug()) return;
+    std::lock_guard<std::mutex> l(g_grave_mu);
+    for (int a = 0; a < 4; ++a) {
+        auto it = g_fake_dead.find(frame.x[a == 0 ? 0 : a + 1]);
+        if (it != g_fake_dead.end())
+            printf("[DEAD] %s arg%d is dead (born %s) lr=%#llx\n", sel.c_str(), a, it->second.c_str(),
+                   static_cast<unsigned long long>(frame.lr - reinterpret_cast<uint64_t>(g_loaded_image_base)));
+    }
+}
+
+// ARC and MRC entry points (objc_retain, objc_storeStrong, objc_setProperty, ...), bound by register_objc_runtime_natives.
+extern "C" {
+uint64_t native_objc_retain(uint64_t x) { fake_retain(x); return x; }
+void native_objc_release(uint64_t x) { fake_release(x); }
+uint64_t native_objc_autorelease(uint64_t x) { fake_autorelease(x); return x; }
+uint64_t native_objc_retain_autorelease(uint64_t x) { fake_retain(x); fake_autorelease(x); return x; }
+uint64_t native_objc_pool_push() { return fake_pool_push(); }
+void native_objc_pool_pop(uint64_t token) { fake_pool_pop(token); }
+void native_objc_store_strong(uint64_t* addr, uint64_t v) {
+    if (!addr || *addr == v) return;
+    uint64_t old = *addr;
+    fake_retain(v);
+    *addr = v;
+    fake_release(old);
+}
+uint64_t native_objc_load_weak_retained(uint64_t* addr) { return native_objc_retain(addr ? *addr : 0); }
+uint64_t native_objc_get_property(uint64_t self, void*, int64_t off, bool atomic) {
+    uint64_t v = self ? *reinterpret_cast<uint64_t*>(self + off) : 0;
+    return atomic ? native_objc_retain_autorelease(v) : v;
+}
+void native_objc_set_property(uint64_t self, void*, uint64_t v, int64_t off) {
+    if (self) native_objc_store_strong(reinterpret_cast<uint64_t*>(self + off), v);
+}
 }

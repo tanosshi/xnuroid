@@ -33,7 +33,9 @@ command-line loader, or in `loader.env` on the device for the [Android app](andr
 | `LOADER_GL_SOLID` | Force a solid magenta fragment color for shaders writing o_SV_Target0. |
 | `LOADER_DRAW_STATS` | Print draws per presented frame every 60 frames. |
 | `LOADER_LOG_PVRTC` | Log PVRTC decode timing. |
-| `LOADER_MEM_STATS` | Print live fake-object and GL texture memory every 600 frames. |
+| `LOADER_MEM_STATS` | Every 600 frames: live fake objects (top kinds) and GL texture memory (largest textures). |
+| `LOADER_FAKE_LIFE` | Track freed fake objects and log `[DEAD]` when a message reaches one; adds creating selectors to `LOADER_MEM_STATS`. Never reuses freed handles. |
+| `LOADER_LOG_DEFAULTS` | Log NSUserDefaults (PlayerPrefs) saves to <sandbox>/Library/Preferences. |
 | `LOADER_TOUCH` | Scripted taps: <frame>:<x>,<y>[,<frames held>];... in screen pixels. |
 | `LOADER_AUDIO` | 0 disables AAudio and discards rendered samples. |
 | `LOADER_AUDIO_WAV` | Record rendered audio to this WAV path. |
