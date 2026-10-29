@@ -1620,6 +1620,18 @@ extern "C" int native_pthread_mutexattr_settype(pthread_mutexattr_t* a, int t) {
     return pthread_mutexattr_settype(a, m);
 }
 extern "C" int native_pthread_mutexattr_setprotocol(pthread_mutexattr_t*, int) { return 0; }
+// Darwin PTHREAD_CREATE_JOINABLE 1 / DETACHED 2 (bionic 0 / 1).
+extern "C" int native_pthread_attr_setdetachstate(pthread_attr_t* a, int s) {
+    return pthread_attr_setdetachstate(a, s == 2 ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE);
+}
+// Darwin SCHED_OTHER 1 / FIFO 4 / RR 2. Real-time policies are refused for unprivileged Android processes and
+// native_pthread_create_logged drops them anyway, so the request is accepted and recorded as SCHED_OTHER.
+extern "C" int native_pthread_attr_setschedpolicy(pthread_attr_t* a, int p) {
+    if (p != 1 && p != 2 && p != 4) return EINVAL;
+    pthread_attr_setschedpolicy(a, SCHED_OTHER);
+    return 0;
+}
+extern "C" int native_pthread_attr_setschedparam(pthread_attr_t*, const void*) { return 0; }
 
 // Darwin struct stat64 layout for arm64 (144 bytes = 0x90):
 //   +0x00: st_dev       (int32_t)
@@ -2311,116 +2323,15 @@ int32_t native_cmtime_compare(CMTime a, CMTime b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
-// --- AudioUnit (RemoteIO) output: a real-time pump that drives the render callback and discards the samples ---
-struct AuRenderCallback { int32_t (*proc)(void*, uint32_t*, const void*, uint32_t, uint32_t, void*); void* refcon; };
-struct AuUnit {
-    AuRenderCallback cb{nullptr, nullptr};
-    double rate = 44100.0;
-    uint32_t channels = 2, bits = 32, flags = 0x29;   // float | packed(8) | ... default: interleaved float32
-    bool non_interleaved = false;
-    std::atomic<bool> running{false};
-    std::thread th;
-};
-static char g_audio_component;
-void* native_au_find_next(void* prev, const void*) { return prev ? nullptr : &g_audio_component; }
-int32_t native_au_instance_new(void*, void** out) { if (out) *out = new AuUnit(); return 0; }
-int32_t native_au_instance_dispose(void* u) {
-    auto* a = static_cast<AuUnit*>(u);
-    if (a) { a->running = false; if (a->th.joinable()) a->th.join(); delete a; }
-    return 0;
-}
-int32_t native_au_set_property(void* u, uint32_t prop, uint32_t, uint32_t, const void* data, uint32_t size) {
-    auto* a = static_cast<AuUnit*>(u);
-    if (!a || !data) return 0;
-    if (prop == 23 && size >= sizeof(AuRenderCallback)) {          // kAudioUnitProperty_SetRenderCallback
-        std::memcpy(&a->cb, data, sizeof(AuRenderCallback));
-        fprintf(stderr, "[AUDIO] render callback set: %p refcon=%p\n", reinterpret_cast<void*>(a->cb.proc), a->cb.refcon);
-    } else if (prop == 8 && size >= 40) {                           // kAudioUnitProperty_StreamFormat (ASBD)
-        double rate; uint32_t fl, ch, bits;
-        std::memcpy(&rate, data, 8);
-        std::memcpy(&fl, static_cast<const char*>(data) + 12, 4);
-        std::memcpy(&ch, static_cast<const char*>(data) + 28, 4);
-        std::memcpy(&bits, static_cast<const char*>(data) + 32, 4);
-        if (rate > 0) a->rate = rate;
-        if (ch) a->channels = ch;
-        if (bits) a->bits = bits;
-        a->flags = fl;
-        a->non_interleaved = (fl & 0x20) != 0;
-        fprintf(stderr, "[AUDIO] stream format: %.0f Hz, %u ch, %u bit, flags=0x%x%s\n", a->rate, a->channels, a->bits, fl,
-                a->non_interleaved ? " non-interleaved" : "");
-    }
-    return 0;
-}
-int32_t native_au_get_property(void* u, uint32_t prop, uint32_t, uint32_t, void* data, uint32_t* size) {
-    auto* a = static_cast<AuUnit*>(u);
-    if (!data || !size) return 0;
-    if (prop == 8 && *size >= 40 && a) {                            // default output format: 44.1 kHz stereo float32
-        std::memset(data, 0, 40);
-        double rate = a->rate;
-        uint32_t fid = 0x6c70636d /* 'lpcm' */, fl = 0x29, bpp = 8, fpp = 1, ch = 2, bits = 32;
-        std::memcpy(data, &rate, 8);
-        std::memcpy(static_cast<char*>(data) + 8, &fid, 4);
-        std::memcpy(static_cast<char*>(data) + 12, &fl, 4);
-        std::memcpy(static_cast<char*>(data) + 16, &bpp, 4);
-        std::memcpy(static_cast<char*>(data) + 20, &fpp, 4);
-        std::memcpy(static_cast<char*>(data) + 24, &bpp, 4);
-        std::memcpy(static_cast<char*>(data) + 28, &ch, 4);
-        std::memcpy(static_cast<char*>(data) + 32, &bits, 4);
-        *size = 40;
-    } else if (prop == 14 && *size >= 4) {                          // MaximumFramesPerSlice
-        uint32_t v = 4096; std::memcpy(data, &v, 4); *size = 4;
-    } else {
-        std::memset(data, 0, *size);
-    }
-    return 0;
-}
-int32_t native_au_zero(void*) { return 0; }
-int32_t native_au_start(void* u) {
-    auto* a = static_cast<AuUnit*>(u);
-    if (!a || a->running.exchange(true)) return 0;
-    a->th = std::thread([a] {
-        const uint32_t frames = 512;
-        const uint32_t bytes_per_sample = a->bits / 8 ? a->bits / 8 : 4;
-        const uint32_t nbufs = a->non_interleaved ? a->channels : 1;
-        const uint32_t chans_per_buf = a->non_interleaved ? 1 : a->channels;
-        std::vector<char> storage(static_cast<size_t>(nbufs) * frames * chans_per_buf * bytes_per_sample);
-        struct Ab { uint32_t n_ch, bytes; void* data; };
-        std::vector<char> abl_mem(8 + sizeof(Ab) * nbufs);
-        double sample_time = 0;
-        timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
-        uint64_t calls = 0;
-        while (a->running) {
-            auto* abl = reinterpret_cast<uint32_t*>(abl_mem.data());
-            abl[0] = nbufs;
-            auto* bufs = reinterpret_cast<Ab*>(abl_mem.data() + 8);
-            for (uint32_t i = 0; i < nbufs; ++i) {
-                bufs[i].n_ch = chans_per_buf;
-                bufs[i].bytes = frames * chans_per_buf * bytes_per_sample;
-                bufs[i].data = storage.data() + static_cast<size_t>(i) * bufs[i].bytes;
-            }
-            std::memset(storage.data(), 0, storage.size());
-            alignas(8) char ts[80] = {};
-            std::memcpy(ts, &sample_time, 8);
-            uint32_t ts_flags = 1;   // kAudioTimeStampSampleTimeValid
-            std::memcpy(ts + 68, &ts_flags, 4);
-            uint32_t action_flags = 0;
-            if (a->cb.proc) {
-                a->cb.proc(a->cb.refcon, &action_flags, ts, 0, frames, abl_mem.data());
-                if (++calls == 1) fprintf(stderr, "[AUDIO] first render callback returned\n");
-            }
-            sample_time += frames;
-            next.tv_nsec += static_cast<long>(1e9 * frames / a->rate);
-            while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-        }
-    });
-    return 0;
-}
-int32_t native_au_stop(void* u) {
-    auto* a = static_cast<AuUnit*>(u);
-    if (a) { a->running = false; if (a->th.joinable()) a->th.join(); }
-    return 0;
-}
+// AudioUnit output: audio_unit.cpp
+void* native_au_find_next(void* prev, const void*);
+int32_t native_au_instance_new(void*, void** out);
+int32_t native_au_instance_dispose(void* u);
+int32_t native_au_set_property(void* u, uint32_t prop, uint32_t, uint32_t, const void* data, uint32_t size);
+int32_t native_au_get_property(void* u, uint32_t prop, uint32_t, uint32_t, void* data, uint32_t* size);
+int32_t native_au_zero(void*);
+int32_t native_au_start(void* u);
+int32_t native_au_stop(void* u);
 } // extern "C"
 
 
@@ -2661,6 +2572,9 @@ static void init_custom_shims() {
     g_custom_shims["_readdir$INODE64"] = reinterpret_cast<void*>(&native_darwin_readdir);
     g_custom_shims["_pthread_mutexattr_settype"] = reinterpret_cast<void*>(&native_pthread_mutexattr_settype);
     g_custom_shims["_pthread_mutexattr_setprotocol"] = reinterpret_cast<void*>(&native_pthread_mutexattr_setprotocol);
+    g_custom_shims["_pthread_attr_setdetachstate"] = reinterpret_cast<void*>(&native_pthread_attr_setdetachstate);
+    g_custom_shims["_pthread_attr_setschedpolicy"] = reinterpret_cast<void*>(&native_pthread_attr_setschedpolicy);
+    g_custom_shims["_pthread_attr_setschedparam"] = reinterpret_cast<void*>(&native_pthread_attr_setschedparam);
 
     // Darwin variadics (args on the stack) -> CallFrame shims building an AAPCS64 va_list
     g_custom_shims["_printf"] = allocate_trampoline(shim_printf, "_printf");
