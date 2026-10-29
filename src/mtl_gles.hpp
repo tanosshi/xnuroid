@@ -197,7 +197,8 @@ inline uint64_t g_frame_no = 0;
 // LOADER_GL_TRACE=<n>: log render passes and draws for the first n presented frames.
 inline bool tracing() {
     static const uint64_t n = getenv("LOADER_GL_TRACE") ? strtoull(getenv("LOADER_GL_TRACE"), nullptr, 10) : 0;
-    return g_frame_no < n;
+    static const uint64_t at = getenv("LOADER_GL_TRACE_AT") ? strtoull(getenv("LOADER_GL_TRACE_AT"), nullptr, 10) : ~0ull;   // one frame
+    return g_frame_no < n || g_frame_no == at;
 }
 
 template <class T> T* gl_obj(FakeObjcObj* o) { return o ? reinterpret_cast<T*>(o->props.count("#gl") ? o->props["#gl"] : 0) : nullptr; }
@@ -1000,6 +1001,11 @@ inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t typ
                e->pipe->prog, e->pipe->attrs.size(), e->pipe->vs.blocks.size(), e->pipe->fs.samplers.size(),
                texture(fake_lookup(e->ftex[0])) ? texture(fake_lookup(e->ftex[0]))->id : 0, glGetError());
         const Blend& b0 = e->pipe->blend[0];
+        for (const msl::SamplerUse& su : e->pipe->fs.samplers) {
+            Tex* t = su.texture >= 0 && su.texture < 32 ? texture(fake_lookup(e->ftex[su.texture])) : nullptr;
+            printf("[GLTRACE]   fs %s <- tex[%d] %s pf %llu %dx%d levels %d, sampler %d\n", su.uniform.c_str(), su.texture,
+                   t ? "" : "(NONE)", t ? static_cast<unsigned long long>(t->pf) : 0ull, t ? t->w : 0, t ? t->h : 0, t ? t->levels : 0, su.sampler);
+        }
         printf("[GLTRACE]   blend %d src 0x%x dst 0x%x mask %llu | vbuf0 %p+%llu fbuf0 %p\n", b0.enabled, b0.src_rgb, b0.dst_rgb,
                static_cast<unsigned long long>(b0.mask), static_cast<void*>(e->vbuf[0].buf), static_cast<unsigned long long>(e->vbuf[0].offset),
                static_cast<void*>(e->fbuf[0].buf));
@@ -1228,6 +1234,26 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
                 return true;
             }
             if (rest == "Texture:atIndex:" && frame.x[3] < 32) { (vtx ? e->vtex : e->ftex)[frame.x[3]] = frame.x[2]; return true; }
+            // array forms: (ids, [offsets,] NSRange{location, length}) with the range in two registers
+            if (rest == "Textures:withRange:" || rest == "SamplerStates:withRange:") {
+                const uint64_t* ids = reinterpret_cast<const uint64_t*>(frame.x[2]);
+                bool tex = rest[0] == 'T';
+                uint64_t* slots = tex ? (vtx ? e->vtex : e->ftex) : (vtx ? e->vsamp : e->fsamp);
+                uint64_t limit = tex ? 32 : 16;
+                for (uint64_t i = 0; ids && i < frame.x[4] && frame.x[3] + i < limit; ++i) slots[frame.x[3] + i] = ids[i];
+                return true;
+            }
+            if (rest == "Buffers:offsets:withRange:") {
+                const uint64_t* ids = reinterpret_cast<const uint64_t*>(frame.x[2]);
+                const uint64_t* offs = reinterpret_cast<const uint64_t*>(frame.x[3]);
+                for (uint64_t i = 0; ids && i < frame.x[5] && frame.x[4] + i < 32; ++i) {
+                    BoundBuf& b = bufs[frame.x[4] + i];
+                    b.buf = fake_lookup(ids[i]);
+                    b.offset = offs ? offs[i] : 0;
+                    b.bytes.clear();
+                }
+                return true;
+            }
             if (rest == "SamplerState:atIndex:" && frame.x[3] < 16) { (vtx ? e->vsamp : e->fsamp)[frame.x[3]] = frame.x[2]; return true; }
             if (rest == "SamplerState:lodMinClamp:lodMaxClamp:atIndex:" && frame.x[3] < 16) { (vtx ? e->vsamp : e->fsamp)[frame.x[3]] = frame.x[2]; return true; }
         }
