@@ -134,6 +134,9 @@ Without `LOADER_ENGINE`, the diagnostic path runs these stages:
 With `LOADER_ENGINE` set, the headless sequence is skipped and the engine path runs instead.
 `LOADER_ENGINE=8` performs the full `UIApplicationMain`-style launch and enters the run loop.
 
+## Built with AI
+Note on development: This project is a 24 hour proof of concept generated using autonomous AI coding agents driven by adb logcat traces, disassembly, and automated hardware testing. All shader translations, mock apis, and system patches were written through agentic prompts and automated execution loops. If you spot weird inline comments, AI patterns, or unusual code structure, that is why. Everything was generated through automated loops and steered by me.
+
 ## Environment variables
 
 See the [environment variables](docs/environment-variables.md) reference.
