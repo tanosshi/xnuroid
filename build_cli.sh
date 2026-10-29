@@ -2,7 +2,7 @@
 # Builds the command-line loader (xnuroid_loader) run from adb shell.
 set -euo pipefail
 cd "$(dirname "$0")"
-SDK=$(cygpath -m "${ANDROID_SDK:-/c/Users/user/AppData/Local/Android/Sdk}")
+SDK=$(cygpath -m "${ANDROID_SDK:-/c/Users/${USERNAME}/AppData/Local/Android/Sdk}")
 CXX=$SDK/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android31-clang++.cmd
 mkdir -p build
 # hot pixel loops are built optimized on their own

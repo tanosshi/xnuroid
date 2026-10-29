@@ -1,9 +1,12 @@
+import os
 import subprocess
 from pathlib import Path
 from macho_runner import MachOBinary
 from game_config import unity_framework_path
 
-CXXFILT = r"C:\Users\user\AppData\Local\Android\Sdk\ndk\28.2.13676358\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-cxxfilt.exe"
+# llvm-cxxfilt comes from the NDK. Override with CXXFILT, or point ANDROID_SDK at your install.
+_SDK = Path(os.environ.get("ANDROID_SDK") or Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Android" / "Sdk")
+CXXFILT = os.environ.get("CXXFILT") or str(_SDK / "ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-cxxfilt.exe")
 
 b = MachOBinary(unity_framework_path())
 libcxx_bindings = []

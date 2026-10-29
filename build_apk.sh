@@ -6,7 +6,7 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$0")"
 
-SDK=$(cygpath -m "${ANDROID_SDK:-/c/Users/user/AppData/Local/Android/Sdk}")
+SDK=$(cygpath -m "${ANDROID_SDK:-/c/Users/${USERNAME}/AppData/Local/Android/Sdk}")
 NDK=$SDK/ndk/28.2.13676358
 BT=$SDK/build-tools/36.1.0
 PLATFORM=$SDK/platforms/android-36/android.jar

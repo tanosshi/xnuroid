@@ -69,7 +69,7 @@ every function or only offsets listed in a file.
 - An arm64 Android device, API 31 or newer
 - A **decrypted** IPA containing an arm64 Unity IL2CPP build (FairPlay encryption is not handled)
 
-The build scripts hardcode the SDK location as `C:\Users\user\AppData\Local\Android\Sdk`
+The build scripts default the SDK location to `%LOCALAPPDATA%\Android\Sdk`
 (overridable with `ANDROID_SDK`). Edit the version variables if your SDK differs.
 
 ### Pointing the analysis scripts at your IPA
