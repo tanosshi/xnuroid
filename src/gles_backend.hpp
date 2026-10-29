@@ -13,6 +13,8 @@ namespace gles {
 bool ensure_context();
 // Makes GL writes from this thread visible to the other contexts (glFinish when called off the drawing thread).
 void publish();
+// Shows an RGBA texture (rows top-first) in the app window, scaled to fit. False when there is no window.
+bool present_texture(unsigned tex, int w, int h);
 // Logs GL_RENDERER/VERSION, limits and the extensions the Metal emulation cares about.
 void probe();
 bool has_extension(const char* name);

@@ -11,6 +11,7 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <dlfcn.h>
+#include <jni.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,6 +23,8 @@
 #include <string>
 
 extern "C" int loader_main(int argc, char** argv);
+extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp
+extern "C" void host_set_vibrate_hook(void (*hook)(int ms, int amplitude));  // haptics.cpp
 
 namespace {
 
@@ -77,7 +80,7 @@ void show_boot_frame(ANativeWindow* window) {
         if (surf != EGL_NO_SURFACE) eglDestroySurface(dpy, surf);
         if (ctx != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctx);
     }
-    eglTerminate(dpy);
+    // no eglTerminate: the display is process-wide and the engine's renderer uses it too
 }
 
 void* loader_thread(void*) {
@@ -105,12 +108,68 @@ void start_loader() {
     pthread_attr_destroy(&attr);
 }
 
+// Touches: positions normalized to the window, phases in UIKit terms (0 began, 1 moved, 3 ended, 4 cancelled).
+int32_t on_input(android_app* app, AInputEvent* ev) {
+    if (AInputEvent_getType(ev) != AINPUT_EVENT_TYPE_MOTION || !app->window) return 0;
+    const float w = static_cast<float>(ANativeWindow_getWidth(app->window)), h = static_cast<float>(ANativeWindow_getHeight(app->window));
+    if (w <= 0 || h <= 0) return 0;
+    const int32_t action = AMotionEvent_getAction(ev), kind = action & AMOTION_EVENT_ACTION_MASK;
+    const size_t index = static_cast<size_t>((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    auto send = [&](size_t i, int phase) {
+        host_touch(AMotionEvent_getPointerId(ev, i), phase, AMotionEvent_getX(ev, i) / w, AMotionEvent_getY(ev, i) / h);
+    };
+    switch (kind) {
+        case AMOTION_EVENT_ACTION_DOWN: case AMOTION_EVENT_ACTION_POINTER_DOWN: send(index, 0); break;
+        case AMOTION_EVENT_ACTION_UP: case AMOTION_EVENT_ACTION_POINTER_UP: send(index, 3); break;
+        case AMOTION_EVENT_ACTION_MOVE:
+            for (size_t i = 0; i < AMotionEvent_getPointerCount(ev); ++i) send(i, 1);
+            break;
+        case AMOTION_EVENT_ACTION_CANCEL:
+            for (size_t i = 0; i < AMotionEvent_getPointerCount(ev); ++i) send(i, 4);
+            break;
+        default: return 0;
+    }
+    return 1;
+}
+
+// Vibrator.vibrate(VibrationEffect.createOneShot(ms, amplitude)) through JNI; the calling thread stays attached.
+JavaVM* g_vm = nullptr;
+jobject g_vibrator = nullptr;
+jmethodID g_vibrate = nullptr, g_one_shot = nullptr;
+jclass g_effect_class = nullptr;
+void jni_vibrate(int ms, int amplitude) {
+    JNIEnv* env = nullptr;
+    if (!g_vm || !g_vibrator || g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    jobject effect = env->CallStaticObjectMethod(g_effect_class, g_one_shot, static_cast<jlong>(ms), static_cast<jint>(amplitude));
+    if (effect) env->CallVoidMethod(g_vibrator, g_vibrate, effect);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (effect) env->DeleteLocalRef(effect);
+}
+void setup_vibrator(android_app* app) {
+    JNIEnv* env = nullptr;
+    g_vm = app->activity->vm;
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    jclass context = env->FindClass("android/content/Context");
+    jmethodID get_service = env->GetMethodID(context, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jstring name = env->NewStringUTF("vibrator");
+    jobject vib = env->CallObjectMethod(app->activity->clazz, get_service, name);
+    jclass vib_class = env->FindClass("android/os/Vibrator");
+    jclass effect = env->FindClass("android/os/VibrationEffect");
+    if (env->ExceptionCheck() || !vib || !vib_class || !effect) { env->ExceptionClear(); log("no vibrator"); return; }
+    g_vibrator = env->NewGlobalRef(vib);
+    g_effect_class = static_cast<jclass>(env->NewGlobalRef(effect));
+    g_vibrate = env->GetMethodID(vib_class, "vibrate", "(Landroid/os/VibrationEffect;)V");
+    g_one_shot = env->GetStaticMethodID(effect, "createOneShot", "(JI)Landroid/os/VibrationEffect;");
+    if (env->ExceptionCheck() || !g_vibrate || !g_one_shot) { env->ExceptionClear(); g_vibrator = nullptr; return; }
+    host_set_vibrate_hook(jni_vibrate);
+}
+
 void on_app_cmd(android_app* app, int32_t cmd) {
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             if (app->window) {
                 g_window = app->window;
-                show_boot_frame(app->window);
+                if (!g_loader_started) show_boot_frame(app->window);   // the renderer owns the window afterwards
                 start_loader();
             }
             break;
@@ -129,6 +188,7 @@ void configure(android_app* app) {
     mkdir(tmp.c_str(), 0700);
     setenv("LOADER_GAME_DIR", (internal + "/game").c_str(), 0);
     setenv("LOADER_TMP_DIR", tmp.c_str(), 0);
+    setenv("LOADER_SANDBOX_DIR", (internal + "/sandbox").c_str(), 0);
     setenv("LOADER_LIBCXX", (library_dir() + "/libsysc++.so").c_str(), 0);
     setenv("LOADER_ENGINE", "8", 0);
     setenv("LOADER_FDE", "all", 0);
@@ -146,6 +206,8 @@ extern "C" ANativeWindow* host_window() { return g_window.load(); }
 
 void android_main(android_app* app) {
     app->onAppCmd = on_app_cmd;
+    app->onInputEvent = on_input;
+    setup_vibrator(app);
     configure(app);
     while (!app->destroyRequested) {
         android_poll_source* source = nullptr;

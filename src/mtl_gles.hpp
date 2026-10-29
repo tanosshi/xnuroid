@@ -1047,6 +1047,7 @@ inline void commit(FakeObjcObj* cb) {
             fflush(stdout);
         }
     }
+    if (Tex* t = texture(fake_lookup(prop(fake_lookup(drawable), "texture", 0)))) gles::present_texture(t->id, t->w, t->h);
     glFlush();
 }
 

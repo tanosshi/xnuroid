@@ -18,6 +18,8 @@
 #include <thread>
 #include <vector>
 
+extern "C" void loader_bind_thread();   // android_loader.cpp
+
 namespace {
 
 struct RenderCallback { int32_t (*proc)(void*, uint32_t*, const void*, uint32_t, uint32_t, void*); void* refcon; };
@@ -89,6 +91,8 @@ void render(Unit* u, void* out, uint32_t frames) {
 
 aaudio_data_callback_result_t on_audio(AAudioStream*, void* user, void* data, int32_t frames) {
     auto* u = static_cast<Unit*>(user);
+    static thread_local bool bound = false;
+    if (!bound) { loader_bind_thread(); bound = true; }   // AAudio's thread runs guest code (the render callback)
     if (!u->running) {
         std::memset(data, 0, static_cast<size_t>(frames) * u->channels * bytes_per_sample(u));
         return AAUDIO_CALLBACK_RESULT_CONTINUE;

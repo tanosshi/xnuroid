@@ -2,6 +2,10 @@
 #include "msl_glsl.hpp"
 
 #include <dirent.h>
+#include <android/native_window.h>
+
+// Provided by the NativeActivity host (android_app.cpp); absent in the command-line build.
+extern "C" ANativeWindow* host_window() __attribute__((weak));
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -40,7 +44,7 @@ bool init_display_locked() {
     }
     const char* egl_ext = eglQueryString(g_display, EGL_EXTENSIONS);
     g_surfaceless = egl_ext && std::strstr(egl_ext, "EGL_KHR_surfaceless_context");
-    const EGLint attrs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+    const EGLint attrs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
                             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
     EGLint n = 0;
     if (!eglChooseConfig(g_display, attrs, &g_config, 1, &n) || n == 0) {
@@ -84,6 +88,52 @@ bool ensure_context() {
     }
     t_context = ctx;
     t_surface = surf;
+    return true;
+}
+
+// ---- presentation to the app window (absent in the command-line build) ----
+namespace {
+thread_local ANativeWindow* t_window = nullptr;
+thread_local EGLSurface t_window_surface = EGL_NO_SURFACE;
+thread_local GLuint t_present_fbo = 0;
+}  // namespace
+
+bool present_texture(unsigned tex, int w, int h) {
+    ANativeWindow* win = host_window ? host_window() : nullptr;
+    if (win != t_window) {   // window created, replaced or gone: rebind this thread's surface
+        eglMakeCurrent(g_display, t_surface, t_surface, t_context);
+        if (t_window_surface != EGL_NO_SURFACE) eglDestroySurface(g_display, t_window_surface);
+        t_window_surface = EGL_NO_SURFACE;
+        t_window = win;
+        if (win) {
+            t_window_surface = eglCreateWindowSurface(g_display, g_config, win, nullptr);
+            if (t_window_surface == EGL_NO_SURFACE || !eglMakeCurrent(g_display, t_window_surface, t_window_surface, t_context)) {
+                fprintf(stderr, "[GLES] window surface failed: 0x%x\n", eglGetError());
+                t_window_surface = EGL_NO_SURFACE;
+                eglMakeCurrent(g_display, t_surface, t_surface, t_context);
+            } else {
+                eglSwapInterval(g_display, 1);
+            }
+        }
+    }
+    if (t_window_surface == EGL_NO_SURFACE) return false;
+    EGLint ww = 0, wh = 0;
+    eglQuerySurface(g_display, t_window_surface, EGL_WIDTH, &ww);
+    eglQuerySurface(g_display, t_window_surface, EGL_HEIGHT, &wh);
+    if (!t_present_fbo) glGenFramebuffers(1, &t_present_fbo);
+    GLint prev_read = 0, prev_draw = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, t_present_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    // texture rows are top-first (Metal order); the window's row 0 is the bottom
+    glBlitFramebuffer(0, 0, w, h, 0, wh, ww, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    eglSwapBuffers(g_display, t_window_surface);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw));
     return true;
 }
 

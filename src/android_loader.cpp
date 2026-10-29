@@ -39,6 +39,25 @@ static uint64_t get_tpidr_el0() {
     return v;
 }
 
+// Library builds keep g_apple_tsd in dynamic TLS, out of immediate range of TPIDR_EL0. Then the TLS veneers load
+// the thread's TSD address from bionic's TLS_SLOT_APP instead, and every thread that runs guest code stores it there
+// (bind_apple_tsd). The slot index is found at run time: TLS_SLOT_APP follows TLS_SLOT_THREAD_ID, which holds
+// pthread_self() (index 1 on current bionic, 2 on older releases).
+static int g_tsd_slot = -1;   // -1: immediate-offset veneers
+static int find_tls_app_slot() {
+    auto* tp = reinterpret_cast<uint64_t*>(get_tpidr_el0());
+    uint64_t self = static_cast<uint64_t>(pthread_self());
+    for (int i = 0; i < 4; ++i)
+        if (tp[i] == self) return i + 1;
+    return -1;
+}
+static inline void bind_apple_tsd() {
+    if (g_tsd_slot < 0) return;
+    auto* tp = reinterpret_cast<uint64_t*>(get_tpidr_el0());
+    tp[g_tsd_slot] = reinterpret_cast<uint64_t>(&g_apple_tsd[0]);
+}
+extern "C" void loader_bind_thread() { bind_apple_tsd(); }   // threads created outside the guest (audio callbacks)
+
 // Global trampolines and handlers
 extern "C" void callframe_trampoline();
 extern "C" void* native_mmap(void*, size_t, int, int, int, off_t);
@@ -589,6 +608,7 @@ static void* guest_thread_tramp(void* p) {
     GuestThreadStart st = *static_cast<GuestThreadStart*>(p);
     free(p);
     static const bool log = getenv("LOADER_LOG_THREADS") != nullptr;
+    bind_apple_tsd();
     mach_register_current();
     if (log) fprintf(stderr, "[THREADS] #%d started: fn=%p arg=%p\n", st.id, reinterpret_cast<void*>(st.fn), st.arg);
     void* r = st.fn(st.arg);
@@ -3470,9 +3490,13 @@ extern "C" int loader_main(int argc, char** argv) {
     int64_t tsd_hi = tsd_diff / 4096;
     int64_t tsd_lo = tsd_diff % 4096;
     if (tsd_hi > 4095 || tsd_hi < -4095) {
-        fprintf(stderr, "[FATAL] TSD offset %ld does not fit in two ARM add/sub immediates\n",
-                static_cast<long>(tsd_diff));
-        return 1;
+        g_tsd_slot = find_tls_app_slot();
+        if (g_tsd_slot < 0) {
+            fprintf(stderr, "[FATAL] TSD offset %ld out of immediate range and no TLS_SLOT_APP found\n", static_cast<long>(tsd_diff));
+            return 1;
+        }
+        printf("[*] TSD offset %ld out of immediate range: veneers load it from TLS slot %d\n", static_cast<long>(tsd_diff), g_tsd_slot);
+        bind_apple_tsd();
     }
 
     for (size_t off = 0; off < text_seg->filesize; off += 4) {
@@ -3488,8 +3512,12 @@ extern "C" int loader_main(int argc, char** argv) {
         uint32_t* vstub = veneer_ptr;
         size_t nins = 0;
         vstub[nins++] = 0xd53bd040 | reg; // mrs xN, tpidr_el0
-        if (tsd_lo != 0) vstub[nins++] = encode_add_sub_imm12(reg, reg, tsd_lo, false);
-        if (tsd_hi != 0) vstub[nins++] = encode_add_sub_imm12(reg, reg, tsd_hi, true);
+        if (g_tsd_slot >= 0) {
+            vstub[nins++] = 0xf9400000 | (static_cast<uint32_t>(g_tsd_slot) << 10) | (reg << 5) | reg;   // ldr xN, [xN, #slot*8]
+        } else {
+            if (tsd_lo != 0) vstub[nins++] = encode_add_sub_imm12(reg, reg, tsd_lo, false);
+            if (tsd_hi != 0) vstub[nins++] = encode_add_sub_imm12(reg, reg, tsd_hi, true);
+        }
         vstub[nins] = encode_b(reinterpret_cast<uint8_t*>(&vstub[nins]), site_addr + 4, "tls veneer return");
         nins++;
         veneer_ptr += nins;

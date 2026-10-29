@@ -1235,34 +1235,73 @@ static std::vector<ScriptedTap> parse_touch_script() {
     }
     return out;
 }
-static void deliver_scripted_touches(std::vector<ScriptedTap>& taps, int f) {
+// Delivers one touch phase to the key window's root view, as UIKit does: touchesBegan/Moved/Ended/Cancelled with a
+// UIEvent whose allTouches holds the UITouch. x, y are in points. phase: UITouchPhase (0 began, 1 moved, 3 ended,
+// 4 cancelled).
+static void send_touch(uint64_t touch, int phase, double x, double y) {
     using namespace fakeui;
+    FakeObjcObj* ks = g_key_window ? ui_state(g_key_window) : nullptr;
+    uint64_t root = ks ? getp(ks, "rootViewController") : 0;
+    uint64_t view = root ? send(root, "view") : 0;
+    FakeObjcObj* ts = fake_lookup(touch);
+    if (!view || !ts) return;
+    if (phase == 0) { setd(ts, "px", x); setd(ts, "py", y); }
+    else { setd(ts, "px", getd(ts, "x", x)); setd(ts, "py", getd(ts, "y", y)); }
+    setd(ts, "x", x);
+    setd(ts, "y", y);
+    setd(ts, "timestamp", now_s());
+    ts->props["phase"] = static_cast<uint64_t>(phase);
+    ts->props["tapCount"] = 1;
+    ts->props["view"] = view;
+    ts->props["window"] = g_key_window;
+    uint64_t set = fake_make(8, "NSSet");
+    fake_lookup(set)->items = {touch};
+    uint64_t ev = fake_make(8, "UIEvent");
+    FakeObjcObj* es = fake_lookup(ev);
+    es->props["touches"] = set;
+    setd(es, "timestamp", now_s());
+    static const char* const sels[] = {"touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesMoved:withEvent:",
+                                       "touchesEnded:withEvent:", "touchesCancelled:withEvent:"};
+    send(view, sels[phase >= 0 && phase <= 4 ? phase : 4], set, ev);
+}
+
+static void deliver_scripted_touches(std::vector<ScriptedTap>& taps, int f) {
     for (ScriptedTap& t : taps) {
         bool begin = f == t.frame, end = f == t.frame + t.hold;
         if (!begin && !end) continue;
-        FakeObjcObj* ks = g_key_window ? ui_state(g_key_window) : nullptr;
-        uint64_t root = ks ? getp(ks, "rootViewController") : 0;
-        uint64_t view = root ? send(root, "view") : 0;
-        if (!view) continue;
         if (begin) t.touch = fake_make(8, "UITouch");
-        FakeObjcObj* ts = fake_lookup(t.touch);
-        if (!ts) continue;
-        double px = t.x / kScreenScale, py = t.y / kScreenScale;
-        setd(ts, "x", px); setd(ts, "y", py); setd(ts, "px", px); setd(ts, "py", py);
-        setd(ts, "timestamp", now_s());
-        ts->props["phase"] = begin ? 0 : 3;   // UITouchPhaseBegan / Ended
-        ts->props["tapCount"] = 1;
-        ts->props["view"] = view;
-        ts->props["window"] = g_key_window;
-        uint64_t set = fake_make(8, "NSSet");
-        fake_lookup(set)->items = {t.touch};
-        uint64_t ev = fake_make(8, "UIEvent");
-        FakeObjcObj* es = fake_lookup(ev);
-        es->props["touches"] = set;
-        setd(es, "timestamp", now_s());
         printf("[TOUCH] %s (%.0f, %.0f) px at frame %d\n", begin ? "began" : "ended", t.x, t.y, f);
         fflush(stdout);
-        send(view, begin ? "touchesBegan:withEvent:" : "touchesEnded:withEvent:", set, ev);
+        send_touch(t.touch, begin ? 0 : 3, t.x / fakeui::kScreenScale, t.y / fakeui::kScreenScale);
+    }
+}
+
+// Live input from the app host (any thread): pointer id, phase as above, position normalized to the window (0..1).
+struct HostTouch { int id, phase; double x, y; };
+static std::mutex g_host_touch_mu;
+static std::vector<HostTouch> g_host_touches;
+extern "C" void host_touch(int id, int phase, float nx, float ny) {
+    std::lock_guard<std::mutex> l(g_host_touch_mu);
+    // consecutive moves of one pointer within a tick collapse into the latest position
+    if (phase == 1 && !g_host_touches.empty() && g_host_touches.back().id == id && g_host_touches.back().phase == 1) {
+        g_host_touches.back().x = nx;
+        g_host_touches.back().y = ny;
+        return;
+    }
+    g_host_touches.push_back({id, phase, nx, ny});
+}
+static void deliver_host_touches() {
+    std::vector<HostTouch> batch;
+    {
+        std::lock_guard<std::mutex> l(g_host_touch_mu);
+        batch.swap(g_host_touches);
+    }
+    static std::unordered_map<int, uint64_t> live;   // pointer id -> UITouch
+    for (const HostTouch& t : batch) {
+        uint64_t& touch = live[t.id];
+        if (t.phase == 0 || !touch) touch = fake_make(8, "UITouch");
+        send_touch(touch, t.phase, t.x * fakeui::kScreenW, t.y * fakeui::kScreenH);
+        if (t.phase >= 3) live.erase(t.id);
     }
 }
 
@@ -1287,6 +1326,7 @@ static void fakeui_run_application(int frames) {
     for (int f = 0; f < frames; ++f) {
         double a = now_s();
         deliver_scripted_touches(taps, f);
+        deliver_host_touches();
         fakeui_run_loop_once();
         double ms = (now_s() - a) * 1e3;
         if (ms > worst) worst = ms;

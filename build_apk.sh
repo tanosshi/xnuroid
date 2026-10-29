@@ -21,8 +21,9 @@ mkdir -p "$OUT/lib/arm64-v8a"
 
 "$CC" -c -O2 -fPIC -I"$GLUE" "$GLUE/android_native_app_glue.c" -o build/native_app_glue.o
 "$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY -I"$GLUE" \
-    src/android_loader.cpp src/apple_string.cpp src/trampolines.s src/android_app.cpp build/native_app_glue.o \
-    -u ANativeActivity_onCreate -static-libstdc++ -landroid -llog -lEGL -lGLESv3 -ldl \
+    src/android_loader.cpp src/apple_string.cpp src/trampolines.s src/gles_backend.cpp src/msl_glsl.cpp src/audio_unit.cpp \
+    src/haptics.cpp src/android_app.cpp build/native_app_glue.o \
+    -u ANativeActivity_onCreate -static-libstdc++ -landroid -llog -lEGL -lGLESv3 -lz -laaudio -ldl \
     -o "$OUT/lib/arm64-v8a/libxnuroid.so"
 
 # The app's linker namespace cannot load /system/lib64/libc++.so; ship the phone's own copy under another name.
