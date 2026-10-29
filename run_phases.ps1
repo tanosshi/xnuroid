@@ -37,7 +37,7 @@ function Get-GameRoot {
     # the git-ignored game_config_local.py (GAME_ROOT = "...").
     if ($GameDir) { return $GameDir }
     if ($env:LOADER_GAME_DIR) { return $env:LOADER_GAME_DIR }
-    $local = Join-Path $PSScriptRoot "game_config_local.py"
+    $local = Join-Path $PSScriptRoot "tools\game_config_local.py"
     if (Test-Path $local) {
         $m = Select-String -Path $local -Pattern '^\s*GAME_ROOT\s*=\s*["'']([^"'']*)["'']' | Select-Object -First 1
         if ($m) { return $m.Matches[0].Groups[1].Value }
@@ -57,7 +57,7 @@ if (-not $SkipBuild) {
     $clang = Join-Path $ndk "toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android31-clang++.cmd"
     if (-not (Test-Path $clang)) { $clang = $clang -replace "\.cmd$", ".exe" }
     Write-Host "NDK: $ndk"
-    & $clang -std=c++17 -O1 -g -fno-omit-frame-pointer src/android_loader.cpp src/apple_string.cpp src/trampolines.s -ldl -o xnuroid_loader *> (Join-Path $logs "build.log")
+    & $clang -std=c++17 -O1 -g -fno-omit-frame-pointer -Isrc/loader -Isrc/objc -Isrc/gfx -Isrc/platform src/loader/android_loader.cpp src/loader/apple_string.cpp src/loader/trampolines.s -ldl -o xnuroid_loader *> (Join-Path $logs "build.log")
     if ($LASTEXITCODE -ne 0) {
         Get-Content (Join-Path $logs "build.log") | Select-Object -Last 60
         throw "BUILD FAILED (log: $logs\build.log). Paste the last lines of that file."
@@ -78,10 +78,10 @@ if ($gameRoot) {
 if ($fw) {
     $localDataForScan = Join-Path (Split-Path (Split-Path $fw.DirectoryName)) "Data"
     if (-not $Quick) {
-    python il2cpp_exports.py $fw.FullName "_Unity" | Out-File -Encoding utf8 (Join-Path $logs "exports_Unity.txt")
-    python il2cpp_exports.py $fw.FullName "_" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
-    python macho_symbols.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "symbols_unity.txt")
-    python macho_objc.py $fw.FullName "^Unity(?!PLCrash)" 3 | Out-File -Encoding utf8 (Join-Path $logs "objc_unity.txt")
+    python tools/il2cpp_exports.py $fw.FullName "_Unity" | Out-File -Encoding utf8 (Join-Path $logs "exports_Unity.txt")
+    python tools/il2cpp_exports.py $fw.FullName "_" | Where-Object { $_ -notmatch '^_il2cpp_' } | Out-File -Encoding utf8 (Join-Path $logs "exports_non_il2cpp.txt")
+    python tools/macho_symbols.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "symbols_unity.txt")
+    python tools/macho_objc.py $fw.FullName "^Unity(?!PLCrash)" 3 | Out-File -Encoding utf8 (Join-Path $logs "objc_unity.txt")
     }
     $objdump = $null
     foreach ($c in @((Get-Command llvm-objdump -ErrorAction SilentlyContinue).Source, "C:\Program Files\LLVM\bin\llvm-objdump.exe", (Join-Path (Find-Ndk) "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-objdump.exe"))) { if ($c -and (Test-Path $c)) { $objdump = $c; break } }
@@ -96,10 +96,10 @@ if ($fw) {
             & $objdump -d --no-show-raw-insn ("--start-address=0x{0:x}" -f $r[1]) ("--stop-address=0x{0:x}" -f $r[2]) $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs ("disasm_" + $r[0] + ".txt"))
         }
     } else { Write-Host "llvm-objdump not found: skipped disassembly dumps" }
-    if ($localDataForScan -and (Test-Path $localDataForScan)) { python scan_data.py $localDataForScan | Out-File -Encoding utf8 (Join-Path $logs "data_scan.txt") }
-    if (Test-Path xref_targets.txt) { python macho_xref.py $fw.FullName xref_targets.txt | Out-File -Encoding utf8 (Join-Path $logs "xref.txt") }
-    if (Test-Path funcs_targets.txt) { python macho_objc.py $fw.FullName --funcs funcs_targets.txt 2 | Out-File -Encoding utf8 (Join-Path $logs "funcs.txt") }
-    if (-not $Quick) { python compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt") }
+    if ($localDataForScan -and (Test-Path $localDataForScan)) { python tools/scan_data.py $localDataForScan | Out-File -Encoding utf8 (Join-Path $logs "data_scan.txt") }
+    if (Test-Path xref_targets.txt) { python tools/macho_xref.py $fw.FullName xref_targets.txt | Out-File -Encoding utf8 (Join-Path $logs "xref.txt") }
+    if (Test-Path funcs_targets.txt) { python tools/macho_objc.py $fw.FullName --funcs funcs_targets.txt 2 | Out-File -Encoding utf8 (Join-Path $logs "funcs.txt") }
+    if (-not $Quick) { python tools/compact_unwind.py $fw.FullName | Out-File -Encoding utf8 (Join-Path $logs "unwind_summary.txt") }
     if (Test-Path (Join-Path $logs 'exports_Unity.txt')) { Write-Host "exports: $((Get-Content (Join-Path $logs 'exports_Unity.txt')).Count) _Unity* symbols" }
 }
 

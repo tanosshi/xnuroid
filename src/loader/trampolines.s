@@ -229,7 +229,7 @@ g_mmap_capture_count:
     .zero 8
 
 // ---------------------------------------------------------------------------
-// Objective-C message dispatch for guest classes (see src/objc_runtime.hpp).
+// Objective-C message dispatch for guest classes (see src/objc/objc_runtime.hpp).
 //   objc_msgSend_guest:      x0 = receiver, x1 = selector. If the receiver is a guest class/instance with a matching
 //                            method, tail-jump to its IMP (all argument registers and lr untouched). Otherwise
 //                            tail-call objc_fallback_c(x0..x7), the fake-Foundation / nil-message path.

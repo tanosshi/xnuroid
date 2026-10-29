@@ -1,6 +1,6 @@
-// Host test for src/guest_fde.hpp: reads a thin arm64 Mach-O, builds the synthesized CIE/FDE
+// Host test for src/loader/guest_fde.hpp: reads a thin arm64 Mach-O, builds the synthesized CIE/FDE
 // section (dry run, no unwinder calls) and writes it to <out.bin> for llvm-dwarfdump --eh-frame.
-// Build: g++ -std=c++17 -I src tests/fde_host_test.cpp -o fde_host_test
+// Build: g++ -std=c++17 -I src/loader tests/fde_host_test.cpp -o fde_host_test
 // Usage: fde_host_test <macho> <out.bin> [fake_personality]
 #include <cstdio>
 #include <cstdlib>

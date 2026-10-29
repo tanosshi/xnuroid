@@ -74,7 +74,7 @@ The build scripts default the SDK location to `%LOCALAPPDATA%\Android\Sdk`
 
 ### Pointing the analysis scripts at your IPA
 
-The scripts in the repository root read the guest bundle location from
+The scripts in `tools/` read the guest bundle location from
 `game_config.py`, which ships empty. Extract your decrypted IPA and create a
 local, git-ignored `game_config_local.py` beside it:
 
@@ -112,7 +112,7 @@ activity is `android.app.NativeActivity`. The install script pulls the device's
 open the system C++ library directly.
 
 > **Note:** `CMakeLists.txt` is stale. It builds only the host-side `macho-inspect` tool from
-> `src/main.cpp` and `src/chained_fixups.cpp`; it does not build either loader. Use the shell scripts.
+> `src/host/main.cpp` and `src/host/chained_fixups.cpp`; it does not build either loader. Use the shell scripts.
 
 ## Running
 
@@ -260,17 +260,13 @@ unresolved data imports read from poison pages.
 - No arm64e or pointer authentication support. The tested guest is arm64.
 - The CLI path is diagnostic. The playable experience is the APK host.
 ## Repository layout
-- src/android_loader.cpp — Mach-O loader, shims, engine stages, crash handling, IL2CPP tests
-- src/android_app.cpp — NativeActivity host, window, input, logging, JNI vibration
-- src/trampolines.s, src/shim_types.hpp — trampoline ABI and CallFrame
-- src/apple_string.cpp — libc++ std::__1 string ABI
-- src/objc_runtime.hpp — guest Objective-C runtime
-- src/fake_foundation.hpp, src/fake_uikit.hpp — stateful Foundation/UIKit fakes and run loop
-- src/mtl_gles.hpp, src/gles_backend.*, src/msl_glsl.* — Metal-on-GLES and MSL translation
-- src/pvrtc.*, src/pvrtc_gpu.hpp — PVRTC decoding
-- src/audio_unit.cpp, src/haptics.cpp, src/darwin_pthread.cpp — audio, vibration, pthread ABI
-- src/guest_fde.hpp — compact-unwind to DWARF FDE synthesis
-- src/main.cpp, src/chained_fixups.* — host-side Mach-O inspector (macho-inspect)
+- tools/ — Python analysis and inspection scripts (`game_config.py`, `macho_runner.py`, `il2cpp_exports.py`, `compact_unwind.py`, …)
+- src/loader/ — `android_loader.cpp` (Mach-O loader, shims, engine stages, crash handling, IL2CPP tests), `trampolines.s`, `shim_types.hpp`, `apple_string.cpp`, `darwin_pthread.cpp`, `guest_fde.hpp`
+- src/objc/ — `objc_runtime.hpp`, `fake_foundation.hpp`, `fake_uikit.hpp` (guest Objective-C runtime and stateful Foundation/UIKit fakes)
+- src/gfx/ — `mtl_gles.hpp`, `gles_backend.*`, `msl_glsl.*` (Metal-on-GLES and MSL translation), `pvrtc.*`, `pvrtc_gpu.hpp` (PVRTC decoding)
+- src/platform/ — `android_app.cpp` (NativeActivity host, window, input, logging, JNI vibration), `audio_unit.cpp`, `haptics.cpp`
+- src/host/ — `main.cpp`, `chained_fixups.*` (host-side Mach-O inspector, macho-inspect)
+- tests/ — `fde_host_test.cpp`, plus `harness/` and `tls/` device ABI probes
 - build_cli.sh, build_apk.sh — authoritative loader builds
 - android/AndroidManifest.xml — NativeActivity manifest
 - run_phases.ps1, watch_runner.ps1, run_matrix.txt — device test harness
