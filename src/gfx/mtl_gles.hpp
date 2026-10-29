@@ -206,11 +206,12 @@ inline int64_t texture_bytes(const Tex* t) {
     return texels * faces * depth * bpp * t->samples;
 }
 inline uint64_t g_frame_no = 0;
+inline uint64_t g_trace_triggered = ~0ull;   // frame requested through LOADER_GL_TRACE_TRIGGER
 // LOADER_GL_TRACE=<n>: log render passes and draws for the first n presented frames.
 inline bool tracing() {
     static const uint64_t n = getenv("LOADER_GL_TRACE") ? strtoull(getenv("LOADER_GL_TRACE"), nullptr, 10) : 0;
     static const uint64_t at = getenv("LOADER_GL_TRACE_AT") ? strtoull(getenv("LOADER_GL_TRACE_AT"), nullptr, 10) : ~0ull;   // one frame
-    return g_frame_no < n || g_frame_no == at;
+    return g_frame_no < n || g_frame_no == at || g_frame_no == g_trace_triggered;
 }
 
 template <class T> T* gl_obj(FakeObjcObj* o) { return o ? reinterpret_cast<T*>(o->props.count("#gl") ? o->props["#gl"] : 0) : nullptr; }
@@ -526,10 +527,10 @@ inline Sampler* make_sampler(FakeObjcObj* d) {
         glSamplerParameterf(s->id, GL_TEXTURE_MAX_ANISOTROPY_EXT, static_cast<float>(aniso));
     glSamplerParameterf(s->id, GL_TEXTURE_MIN_LOD, static_cast<float>(propd(d, "lodMinClamp", 0.0)));
     glSamplerParameterf(s->id, GL_TEXTURE_MAX_LOD, static_cast<float>(propd(d, "lodMaxClamp", 1000.0)));
-    if (d && d->props.count("compareFunction")) {
+    if (uint64_t cmp = prop(d, "compareFunction", 0)) {   // MTLCompareFunctionNever (0): plain sampling
         s->compare = true;
         glSamplerParameteri(s->id, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
-        glSamplerParameteri(s->id, GL_TEXTURE_COMPARE_FUNC, static_cast<GLint>(compare_fn(prop(d, "compareFunction", 7))));
+        glSamplerParameteri(s->id, GL_TEXTURE_COMPARE_FUNC, static_cast<GLint>(compare_fn(cmp)));
     }
     gles::publish();
     return s;
@@ -991,6 +992,27 @@ inline bool ready(Encoder* e) {
     return ok;
 }
 
+// LOADER_GL_TRACE_PROBE=<x>,<y> (or "x,y" in the trigger file): print the render target pixel at x,y (Metal
+// coordinates) after each traced draw.
+inline int g_probe_x = -1, g_probe_y = -1;
+inline void trace_probe() {
+    static const bool env = [] {
+        const char* s = getenv("LOADER_GL_TRACE_PROBE");
+        return s && sscanf(s, "%d,%d", &g_probe_x, &g_probe_y) == 2;
+    }();
+    (void)env;
+    const int px = g_probe_x, py = g_probe_y;
+    if (px < 0 || py < 0) return;
+    GLint draw_fb = 0, read_fb = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(draw_fb));
+    uint8_t c[4] = {};
+    glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read_fb));
+    printf("[GLTRACE]   probe %d,%d = %u %u %u %u err 0x%x\n", px, py, c[0], c[1], c[2], c[3], glGetError());
+}
+
 inline void draw(Encoder* e, uint64_t prim, uint64_t start, uint64_t count, uint64_t instances) {
     ThreadGL& g = tgl();
     if (!ready(e) || !count) return;
@@ -1001,6 +1023,7 @@ inline void draw(Encoder* e, uint64_t prim, uint64_t start, uint64_t count, uint
     glDrawArraysInstanced(primitive(prim), static_cast<GLint>(start), static_cast<GLsizei>(count), static_cast<GLsizei>(instances ? instances : 1));
     if (tracing()) printf("[GLTRACE] drawArrays prim %llu start %llu count %llu prog %u err 0x%x\n", static_cast<unsigned long long>(prim),
                           static_cast<unsigned long long>(start), static_cast<unsigned long long>(count), e->pipe->prog, glGetError());
+    if (tracing()) trace_probe();
 }
 
 inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t type, FakeObjcObj* ibuf, uint64_t ioff, uint64_t instances) {
@@ -1036,6 +1059,16 @@ inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t typ
         printf("[GLTRACE]   blend %d src 0x%x dst 0x%x mask %llu | vbuf0 %p+%llu fbuf0 %p\n", b0.enabled, b0.src_rgb, b0.dst_rgb,
                static_cast<unsigned long long>(b0.mask), static_cast<void*>(e->vbuf[0].buf), static_cast<unsigned long long>(e->vbuf[0].offset),
                static_cast<void*>(e->fbuf[0].buf));
+        trace_probe();
+        static std::map<GLuint, bool> dumped;
+        const char* dir = getenv("LOADER_FRAME_DIR");
+        if (dir && dumped.emplace(e->pipe->prog, true).second) {
+            std::string path = std::string(dir) + "/prog_" + std::to_string(e->pipe->prog) + ".glsl";
+            if (FILE* fp = fopen(path.c_str(), "wb")) {
+                fprintf(fp, "%s\n// ---- fragment ----\n%s", e->pipe->vs.glsl.c_str(), e->pipe->fs.glsl.c_str());
+                fclose(fp);
+            }
+        }
         if (const char* dir = getenv("LOADER_FRAME_DIR")) {   // the first texture of each traced draw
             Tex* t = texture(fake_lookup(e->ftex[0]));
             std::vector<uint8_t> px;
@@ -1097,9 +1130,21 @@ inline void commit(FakeObjcObj* cb) {
         for (size_t i = 0; i < big.size() && i < 6; ++i) printf("[MEM]   tex %.1f MB %s\n", big[i].first / 1048576.0, big[i].second.c_str());
         fflush(stdout);
     }
+    const bool traced = n - 1 == g_trace_triggered;
+    static const char* trigger = getenv("LOADER_GL_TRACE_TRIGGER");
+    if (trigger && n % 5 == 0 && access(trigger, F_OK) == 0) {
+        if (FILE* f = fopen(trigger, "r")) {
+            int x, y;
+            if (fscanf(f, "%d,%d", &x, &y) == 2) { g_probe_x = x; g_probe_y = y; }
+            fclose(f);
+        }
+        unlink(trigger);
+        g_trace_triggered = n;
+        printf("[GLTRACE] triggered: frame %llu\n", static_cast<unsigned long long>(n));
+    }
     static const char* dir = getenv("LOADER_FRAME_DIR");
     static const uint64_t every = getenv("LOADER_FRAME_EVERY") ? strtoull(getenv("LOADER_FRAME_EVERY"), nullptr, 10) : 60;
-    if (dir && every && n % every == 0) {
+    if (dir && (traced || (every && n % every == 0))) {
         Tex* t = texture(fake_lookup(prop(fake_lookup(drawable), "texture", 0)));
         std::vector<uint8_t> px;
         if (read_rgba(t, px)) {

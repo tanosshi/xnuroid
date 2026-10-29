@@ -169,10 +169,9 @@ static void fake_retain_owned_props(FakeObjcObj* o) {
 }
 // Stores an object-valued property, holding a reference to the new value and dropping the old one.
 static void fake_set_prop(FakeObjcObj* o, const std::string& key, uint64_t value) {
-    uint64_t old = 0;
     auto it = o->props.find(key);
-    if (it != o->props.end()) old = it->second;
-    if (old == value) return;
+    const uint64_t old = it != o->props.end() ? it->second : 0;
+    if (it != o->props.end() && old == value) return;   // 0 must still be stored: Metal defaults are often non-zero
     bool own = owning_key(key);
     if (own) fake_retain(value);
     o->props[key] = value;
@@ -323,10 +322,10 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         if (sel == "objectAtIndexedSubscript:") {
             std::string key = "#obj" + std::to_string(frame.x[2]);
             auto it = self->props.find(key);
-            if (it == self->props.end()) {
+            if (it == self->props.end() || !it->second) {   // descriptor arrays never hand out nil, even after a nil store
                 uint64_t h;
                 fake_metal_bag(&h)->parent_owned = true;
-                it = self->props.emplace(key, h).first;
+                it = self->props.insert_or_assign(key, h).first;
             }
             frame.ret_x0 = it->second; return true;
         }

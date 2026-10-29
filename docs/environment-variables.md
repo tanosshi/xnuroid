@@ -29,6 +29,8 @@ command-line loader, or in `loader.env` on the device for the [Android app](andr
 | `LOADER_FRAME_EVERY` | Save every Nth frame. Default 60. |
 | `LOADER_GL_TRACE` | Log render passes and draws for the first N presented frames. |
 | `LOADER_GL_TRACE_AT` | Log one specific presented frame. |
+| `LOADER_GL_TRACE_TRIGGER` | File path checked every 5 frames. When it appears, the next frame is traced and the file is removed. An `x,y` line in the file sets the probe pixel. With `LOADER_FRAME_DIR`, the traced frame, the first texture of each draw, and each program's GLSL (`prog_<id>.glsl`) are saved. |
+| `LOADER_GL_TRACE_PROBE` | `x,y` render-target pixel (Metal coordinates) printed after each traced draw. |
 | `LOADER_GL_SKIP_DRAW` | Drop the Nth draw of each pass (debug). |
 | `LOADER_GL_SOLID` | Force a solid magenta fragment color for shaders writing o_SV_Target0. |
 | `LOADER_DRAW_STATS` | Print draws per presented frame every 60 frames. |
