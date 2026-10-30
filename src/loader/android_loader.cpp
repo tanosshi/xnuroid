@@ -493,6 +493,9 @@ static const std::string& game_binary_path() {
         if (const char* e = getenv("LOADER_APP_EXECUTABLE")) if (*e) return dir + "/" + e;
         struct stat st;
         if (stat((dir + "/UnityFramework").c_str(), &st) == 0) return dir + "/UnityFramework";
+        // An unmodified .app keeps the engine in Frameworks/; its CFBundleExecutable is only a launcher stub.
+        std::string framework = dir + "/Frameworks/UnityFramework.framework/UnityFramework";
+        if (stat(framework.c_str(), &st) == 0) return framework;
         std::string exe = app::bundle_executable(dir);   // CFBundleExecutable from Info.plist
         if (!exe.empty() && stat((dir + "/" + exe).c_str(), &st) == 0) return dir + "/" + exe;
         return dir + "/UnityFramework";
