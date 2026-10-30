@@ -318,6 +318,17 @@ void to_guest_frame(const ASensorVector& a, double& x, double& y, double& z) {
     if (land) { x = -sy / g; y = sx / g; }   // LandscapeRight: device +x points up the screen, +y to its left
     else { x = -sx / g; y = -sy / g; }
     z = -a.z / g;
+    // LOADER_APP_TILT=swapxy,flipx,flipy,flipz: for sensors mounted against the Android convention
+    static const int fix = [] {
+        const char* t = getenv("LOADER_APP_TILT");
+        if (!t) return 0;
+        return (std::strstr(t, "flipx") ? 1 : 0) | (std::strstr(t, "flipy") ? 2 : 0) | (std::strstr(t, "flipz") ? 4 : 0) |
+               (std::strstr(t, "swapxy") ? 8 : 0);
+    }();
+    if (fix & 8) std::swap(x, y);
+    if (fix & 1) x = -x;
+    if (fix & 2) y = -y;
+    if (fix & 4) z = -z;
 }
 
 void sensor_poll() {
@@ -336,6 +347,12 @@ void sensor_poll() {
         g_grav_x += 0.1 * (g_accel_x - g_grav_x);
         g_grav_y += 0.1 * (g_accel_y - g_grav_y);
         g_grav_z += 0.1 * (g_accel_z - g_grav_z);
+    }
+    static const bool trace = getenv("LOADER_APP_LOG_MOTION") != nullptr;
+    static double next = 0;
+    if (trace && now_s() >= next) {
+        next = now_s() + 0.5;
+        log("motion: guest (%.2f %.2f %.2f) atan2(y,x) %.0f deg", g_accel_x, g_accel_y, g_accel_z, std::atan2(g_accel_y, g_accel_x) * 180 / M_PI);
     }
 }
 bool sensor_start(double hz) {

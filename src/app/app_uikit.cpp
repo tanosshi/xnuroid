@@ -1309,11 +1309,12 @@ static void define_window_vc_app() {
     def(VC, "title", +[](id self, SEL) -> id { return cx(self)->title; });
     def(VC, "setTitle:", +[](id self, SEL, id t) { auto* e = cx(self); id o = e->title; e->title = send(t, "copy"); release(o); });
     def(VC, "nextResponder", +[](id self, SEL) -> id { id v = cx(self)->view; return v ? vx(v)->superview : nullptr; });
-    def(VC, "interfaceOrientation", +[](id, SEL) -> long { return screen().landscape ? 4 : 1; });
+    // UIInterfaceOrientationLandscapeRight (3): home button on the right, the frame CoreMotion readings are mapped to
+    def(VC, "interfaceOrientation", +[](id, SEL) -> long { return screen().landscape ? 3 : 1; });
     def(VC, "shouldAutorotate", +[](id, SEL) -> bool { return true; });
     def(VC, "shouldAutorotateToInterfaceOrientation:", +[](id, SEL, long o) -> bool { return screen().landscape ? (o == 3 || o == 4) : (o == 1); });
     def(VC, "supportedInterfaceOrientations", +[](id, SEL) -> NSUInteger { return screen().landscape ? 24 : 2; });
-    def(VC, "preferredInterfaceOrientationForPresentation", +[](id, SEL) -> long { return screen().landscape ? 4 : 1; });
+    def(VC, "preferredInterfaceOrientationForPresentation", +[](id, SEL) -> long { return screen().landscape ? 3 : 1; });
     def(VC, "prefersStatusBarHidden", +[](id, SEL) -> bool { return true; });
     def(VC, "preferredStatusBarStyle", +[](id, SEL) -> long { return 0; });
     def(VC, "setWantsFullScreenLayout:", +[](id, SEL, bool) {});
@@ -1439,9 +1440,9 @@ static void define_window_vc_app() {
 
     C_UIApplication = def_class("UIApplication", "UIResponder");
     Class A = C_UIApplication;
-    struct AppExt : Ext { id delegate = nullptr; bool idle = false, status_hidden = true, net = false; long badge = 0, orientation = 4; };
+    struct AppExt : Ext { id delegate = nullptr; bool idle = false, status_hidden = true, net = false; long badge = 0, orientation = 3; };
     defc(A, "sharedApplication", +[](id, SEL) -> id { return g_app; });
-    def(A, "init", +[](id self, SEL) -> id { if (!g_app) g_app = self; ext_get<AppExt>(self)->orientation = screen().landscape ? 4 : 1; return self; });
+    def(A, "init", +[](id self, SEL) -> id { if (!g_app) g_app = self; ext_get<AppExt>(self)->orientation = screen().landscape ? 3 : 1; return self; });
     def(A, "delegate", +[](id self, SEL) -> id { return ext_get<AppExt>(self)->delegate; });
     def(A, "setDelegate:", +[](id self, SEL, id d) { ext_get<AppExt>(self)->delegate = d; });
     def(A, "keyWindow", +[](id, SEL) -> id { return g_key_window; });
