@@ -212,9 +212,25 @@ def main() -> int:
     manifest, count = re.subn(r'\bpackage="[^"]*"', f'package="{package}"', manifest, count=1)
     if not count:
         raise SystemExit(f"branding: {template} lacks a package attribute")
+
+    # Match the activity's orientation to the app's UISupportedInterfaceOrientations so landscape games fill the
+    # screen and portrait apps stand upright, instead of a hardcoded orientation.
+    # Older bundles may only carry the ~iphone variant or the single initial UIInterfaceOrientation.
+    orients = (info.get("UISupportedInterfaceOrientations") or info.get("UISupportedInterfaceOrientations~iphone")
+               or info.get("UIInterfaceOrientation") or [])
+    if isinstance(orients, str):
+        orients = [orients]
+    has_land = any("Landscape" in o for o in orients)
+    has_port = any("Portrait" in o for o in orients)
+    if not orients:
+        orientation = "portrait"   # iOS default without the key, and this template's previous fixed value
+    else:
+        orientation = "sensorLandscape" if has_land and not has_port else "sensorPortrait" if has_port and not has_land else "fullSensor"
+    manifest = re.sub(r'android:screenOrientation="[^"]*"', f'android:screenOrientation="{orientation}"', manifest, count=1)
+
     manifest_out.write_text(manifest if icon else manifest.replace(ICON_ATTR, ""), encoding="utf-8")
 
-    log(f"package {package}, label '{label}', icon {f'{icon.name} ({png_width(icon)}px)' if icon else 'default'}")
+    log(f"package {package}, label '{label}', orientation {orientation}, icon {f'{icon.name} ({png_width(icon)}px)' if icon else 'default'}")
     print(package)
     return 0
 

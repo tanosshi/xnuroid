@@ -1,19 +1,22 @@
 // NativeActivity host: runs the Mach-O loader inside an Android app process that owns a real window.
 //
 // Layout on the device (adb can write the app's external files dir):
-//   <internalDataPath>/game/        UnityFramework, Info.plist, Data/ ...   (LOADER_GAME_DIR; the app cannot read
-//                                   files adb creates in its external dir, so build_apk.sh copies via run-as)
+//   <internalDataPath>/game/        UnityFramework, Info.plist, Data/ ...   (LOADER_GAME_DIR; extracted from the APK's
+//                                   assets/game/ on first launch and whenever assets/game.stamp changes)
 //   <externalDataPath>/loader.env   optional KEY=VALUE lines, applied over the defaults below
 //   <externalDataPath>/out.txt, err.txt, exit.txt   loader stdout / stderr / exit code
+#include <android/asset_manager.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <dlfcn.h>
+#include <ftw.h>
 #include <jni.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -23,7 +26,9 @@
 #include <string>
 
 extern "C" int loader_main(int argc, char** argv);
-extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp
+extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp (engine mode)
+extern "C" void app_host_touch(int id, int phase, float nx, float ny) __attribute__((weak));   // app_uikit.cpp (app mode)
+extern "C" void app_host_lifecycle(int active) __attribute__((weak));       // app_uikit.cpp
 extern "C" void host_set_vibrate_hook(void (*hook)(int ms, int amplitude));  // haptics.cpp
 extern "C" void host_set_screen_size(int width_px, int height_px);           // screen_metrics.hpp
 extern "C" void host_set_safe_area(int top_px, int left_px, int bottom_px, int right_px, int width_px);
@@ -32,8 +37,10 @@ namespace {
 
 constexpr const char* kTag = "xnuroid";
 std::atomic<ANativeWindow*> g_window{nullptr};
+std::atomic<unsigned> g_window_gen{0};   // bumped on every window change (a new window may reuse the old address)
 std::atomic<bool> g_loader_started{false};
 std::string g_files;
+AAssetManager* g_assets = nullptr;
 
 void log(const char* fmt, const char* arg = "") { __android_log_print(ANDROID_LOG_INFO, kTag, fmt, arg); }
 
@@ -85,11 +92,93 @@ void show_boot_frame(ANativeWindow* window) {
     // no eglTerminate: the display is process-wide and the engine's renderer uses it too
 }
 
+std::string read_asset(const char* name) {
+    AAsset* a = g_assets ? AAssetManager_open(g_assets, name, AASSET_MODE_BUFFER) : nullptr;
+    if (!a) return "";
+    std::string s(static_cast<const char*>(AAsset_getBuffer(a)), static_cast<size_t>(AAsset_getLength(a)));
+    AAsset_close(a);
+    return s;
+}
+
+std::string read_file(const std::string& path) {
+    std::string s;
+    if (FILE* fp = fopen(path.c_str(), "rb")) {
+        char buf[256];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, fp)) > 0) s.append(buf, n);
+        fclose(fp);
+    }
+    return s;
+}
+
+void make_dirs(const std::string& path) {
+    for (size_t i = path.find('/', 1); i != std::string::npos; i = path.find('/', i + 1)) mkdir(path.substr(0, i).c_str(), 0700);
+    mkdir(path.c_str(), 0700);
+}
+
+void remove_tree(const std::string& path) {
+    nftw(path.c_str(), [](const char* p, const struct stat*, int, FTW*) { return remove(p); }, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+// build_apk.sh packages the game bundle as assets/game/<path>, lists the paths in assets/game.files and versions
+// them with assets/game.stamp. The guest opens its bundle with ordinary file calls, so the bundle is copied out to
+// LOADER_GAME_DIR on first launch and again whenever the stamp changes. The stamp is written last, so an
+// interrupted copy starts over. An APK without a bundled game uses whatever LOADER_GAME_DIR already holds.
+bool extract_bundled_game() {
+    const std::string stamp = read_asset("game.stamp");
+    if (stamp.empty()) return true;
+    const std::string dir = getenv("LOADER_GAME_DIR"), stamp_path = dir + ".stamp";
+    if (read_file(stamp_path) == stamp) return true;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "extracting bundled game to %s", dir.c_str());
+    timespec t0{}, t1{};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    unlink(stamp_path.c_str());
+    remove_tree(dir);
+    make_dirs(dir);
+    const std::string list = read_asset("game.files");
+    std::string buf(1 << 20, '\0');
+    size_t files = 0, bytes = 0;
+    for (size_t pos = 0, end; pos < list.size(); pos = end + 1) {
+        end = list.find('\n', pos);
+        if (end == std::string::npos) end = list.size();
+        const std::string rel = list.substr(pos, end - pos);
+        if (rel.empty()) continue;
+        AAsset* a = AAssetManager_open(g_assets, ("game/" + rel).c_str(), AASSET_MODE_STREAMING);
+        const std::string out = dir + "/" + rel;
+        make_dirs(out.substr(0, out.rfind('/')));
+        FILE* fp = a ? fopen(out.c_str(), "wb") : nullptr;
+        bool ok = fp != nullptr;
+        for (int n; ok && (n = AAsset_read(a, buf.data(), buf.size())) != 0;) {
+            ok = n > 0 && fwrite(buf.data(), 1, static_cast<size_t>(n), fp) == static_cast<size_t>(n);
+            bytes += n > 0 ? static_cast<size_t>(n) : 0;
+        }
+        if (fp && fclose(fp) != 0) ok = false;
+        if (a) AAsset_close(a);
+        if (!ok) {
+            __android_log_print(ANDROID_LOG_ERROR, kTag, "extracting game/%s failed", rel.c_str());
+            fprintf(stderr, "[FATAL] extracting bundled game/%s failed (storage full?)\n", rel.c_str());
+            return false;
+        }
+        ++files;
+    }
+    if (FILE* fp = fopen(stamp_path.c_str(), "wb")) {
+        fwrite(stamp.data(), 1, stamp.size(), fp);
+        fclose(fp);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    __android_log_print(ANDROID_LOG_INFO, kTag, "extracted %zu files (%zu MB) in %.1f s", files, bytes >> 20,
+                        (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+    return true;
+}
+
 void* loader_thread(void*) {
     static char arg0[] = "xnuroid";
     char* argv[] = {arg0, nullptr};
-    log("loader_main starting");
-    int rc = loader_main(1, argv);
+    int rc = 1;
+    if (extract_bundled_game()) {
+        log("loader_main starting");
+        rc = loader_main(1, argv);
+    }
     fflush(stdout);
     fflush(stderr);
     if (FILE* fp = fopen((g_files + "/exit.txt").c_str(), "w")) {
@@ -118,7 +207,10 @@ int32_t on_input(android_app* app, AInputEvent* ev) {
     const int32_t action = AMotionEvent_getAction(ev), kind = action & AMOTION_EVENT_ACTION_MASK;
     const size_t index = static_cast<size_t>((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     auto send = [&](size_t i, int phase) {
-        host_touch(AMotionEvent_getPointerId(ev, i), phase, AMotionEvent_getX(ev, i) / w, AMotionEvent_getY(ev, i) / h);
+        int id = AMotionEvent_getPointerId(ev, i);
+        float nx = AMotionEvent_getX(ev, i) / w, ny = AMotionEvent_getY(ev, i) / h;
+        host_touch(id, phase, nx, ny);
+        if (app_host_touch) app_host_touch(id, phase, nx, ny);
     };
     switch (kind) {
         case AMOTION_EVENT_ACTION_DOWN: case AMOTION_EVENT_ACTION_POINTER_DOWN: send(index, 0); break;
@@ -164,6 +256,33 @@ void setup_vibrator(android_app* app) {
     g_one_shot = env->GetStaticMethodID(effect, "createOneShot", "(JI)Landroid/os/VibrationEffect;");
     if (env->ExceptionCheck() || !g_vibrate || !g_one_shot) { env->ExceptionClear(); g_vibrator = nullptr; return; }
     host_set_vibrate_hook(jni_vibrate);
+}
+
+// Display.getRotation() (Surface.ROTATION_*), polled from the glue thread: a 180-degree flip between the two
+// landscape orientations changes no configuration, so there is no event to wait for.
+std::atomic<int> g_rotation{-1};
+jobject g_display = nullptr;
+jmethodID g_get_rotation = nullptr;
+void refresh_rotation(android_app* app) {
+    JNIEnv* env = nullptr;
+    if (!g_vm || g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    if (!g_display) {
+        if (env->PushLocalFrame(8) != JNI_OK) return;
+        jobject wm = env->CallObjectMethod(app->activity->clazz,
+            env->GetMethodID(env->GetObjectClass(app->activity->clazz), "getWindowManager", "()Landroid/view/WindowManager;"));
+        jobject display = wm ? env->CallObjectMethod(wm, env->GetMethodID(env->FindClass("android/view/WindowManager"),
+            "getDefaultDisplay", "()Landroid/view/Display;")) : nullptr;
+        if (!env->ExceptionCheck() && display) {
+            g_display = env->NewGlobalRef(display);
+            g_get_rotation = env->GetMethodID(env->FindClass("android/view/Display"), "getRotation", "()I");
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->PopLocalFrame(nullptr);
+        if (!g_display || !g_get_rotation) return;
+    }
+    jint r = env->CallIntMethod(g_display, g_get_rotation);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    if (g_rotation.exchange(r) != r) __android_log_print(ANDROID_LOG_INFO, kTag, "display rotation %d", r * 90);
 }
 
 // UI thread: hides the system bars (a swipe shows them transiently) and reports their full extent, the display cutout
@@ -233,6 +352,7 @@ void on_app_cmd(android_app* app, int32_t cmd) {
         case APP_CMD_INIT_WINDOW:
             if (app->window) {
                 g_window = app->window;
+                ++g_window_gen;
                 if (!g_loader_started) {   // the guest screen is fixed once the engine starts; the renderer owns the window
                     host_set_screen_size(ANativeWindow_getWidth(app->window), ANativeWindow_getHeight(app->window));
                     show_boot_frame(app->window);
@@ -241,7 +361,18 @@ void on_app_cmd(android_app* app, int32_t cmd) {
             }
             break;
         case APP_CMD_TERM_WINDOW:
+            // The renderer watches g_window and tears its EGL surface down on the next frame; clearing it here
+            // (before the framework destroys the ANativeWindow) keeps the render thread off the dead window.
             g_window = nullptr;
+            ++g_window_gen;
+            break;
+        case APP_CMD_GAINED_FOCUS:
+        case APP_CMD_RESUME:
+            if (app_host_lifecycle) app_host_lifecycle(1);
+            break;
+        case APP_CMD_LOST_FOCUS:
+        case APP_CMD_PAUSE:
+            if (app_host_lifecycle) app_host_lifecycle(0);
             break;
         default:
             break;
@@ -250,6 +381,7 @@ void on_app_cmd(android_app* app, int32_t cmd) {
 
 void configure(android_app* app) {
     g_files = app->activity->externalDataPath ? app->activity->externalDataPath : "";
+    g_assets = app->activity->assetManager;
     std::string internal = app->activity->internalDataPath ? app->activity->internalDataPath : g_files;
     std::string tmp = internal + "/tmp/";
     mkdir(tmp.c_str(), 0700);
@@ -270,6 +402,10 @@ void configure(android_app* app) {
 
 // The window the renderer presents to (null while the activity has no surface).
 extern "C" ANativeWindow* host_window() { return g_window.load(); }
+// Changes whenever the window does, including when a recreated window lands at the old address.
+extern "C" unsigned host_window_generation() { return g_window_gen.load(); }
+// Surface.ROTATION_* of the display (0..3), or -1 before it is known.
+extern "C" int host_display_rotation() { return g_rotation.load(); }
 
 // Activity entry point (android.app.func_name): the glue's ANativeActivity_onCreate plus UI-thread system-bar handling.
 extern "C" JNIEXPORT void xnuroid_on_create(ANativeActivity* activity, void* saved_state, size_t saved_state_size) {
@@ -284,11 +420,20 @@ void android_main(android_app* app) {
     app->onInputEvent = on_input;
     setup_vibrator(app);
     configure(app);
+    refresh_rotation(app);
+    timespec last{};
+    clock_gettime(CLOCK_MONOTONIC, &last);
     while (!app->destroyRequested) {
         android_poll_source* source = nullptr;
         int events = 0;
-        if (ALooper_pollOnce(-1, nullptr, &events, reinterpret_cast<void**>(&source)) >= 0 && source)
+        if (ALooper_pollOnce(500, nullptr, &events, reinterpret_cast<void**>(&source)) >= 0 && source)
             source->process(app, source);
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000 >= 500) {
+            last = now;
+            refresh_rotation(app);
+        }
     }
     // The engine cannot be unwound from another thread; end the process with the activity.
     fflush(stdout);

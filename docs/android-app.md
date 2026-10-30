@@ -11,8 +11,14 @@ The Android app is the playable host. It runs the same loader as a `NativeActivi
 ./build_apk.sh install
 ```
 
-The first command builds `build/xnuroid.apk`. The `install` command builds, installs, copies
-game files if missing, and launches the app.
+The first command builds `build/xnuroid.apk`. The `install` command builds, installs, and launches the app.
+
+The game bundle configured in `tools/game_config.py` is packaged into the APK as `assets/game/`, so the APK is
+self-contained and can be installed on any arm64 device. The build also writes `assets/game.files` (the file list)
+and `assets/game.stamp` (a hash of the bundle's file names, sizes, and modification times). On first launch, and
+whenever the stamp changes, the app copies the bundle to `<internalDataPath>/game/` before the loader starts,
+because the guest opens its bundle with ordinary file calls. Updating the IPA and rebuilding therefore refreshes
+the game on the next launch.
 
 The APK package is `com.xnuroid.<name>`, the native library is `libxnuroid.so`, and the
 activity is `android.app.NativeActivity`. The install script pulls the device's
@@ -38,14 +44,16 @@ iPhone with a notch.
 
 ## Running
 
-`./build_apk.sh install` installs the APK, copies `/data/local/tmp/game` into the app's internal
-files directory with `run-as` if needed, and starts the activity.
+`./build_apk.sh install` installs the APK and starts the activity. If no game bundle is configured, the APK
+carries no game; the script then copies `/data/local/tmp/game` into the app's internal files directory with
+`run-as` if the app has no game yet.
 
 The app uses this layout:
 
 | Path | Contents |
 | --- | --- |
-| `<internalDataPath>/game/` | `UnityFramework`, `Info.plist`, and `Data/` |
+| `<internalDataPath>/game/` | The app bundle (`UnityFramework` or the app executable, `Info.plist`, resources), copied from the APK |
+| `<internalDataPath>/game.stamp` | Stamp of the bundle last copied out of the APK |
 | `<internalDataPath>/sandbox/` | Guest-visible `Documents`, `Library`, and `Caches` tree |
 | `<externalDataPath>/loader.env` | Optional `KEY=VALUE` environment overrides |
 | `<externalDataPath>/out.txt`, `err.txt` | Loader standard output and error |

@@ -28,6 +28,12 @@
 #include "guest_fde.hpp"
 #include "objc_runtime.hpp"
 #include "gles_backend.hpp"
+#include "../app/app.hpp"
+
+// App mode runs a plain Objective-C iOS app (no Unity/IL2CPP): the loader resolves Foundation/UIKit/OpenGL/OpenAL
+// and the Objective-C runtime through src/app instead of the engine-mode fakes. Chosen by LOADER_APP, or auto
+// when the image imports _UIApplicationMain and LOADER_ENGINE is unset.
+static bool g_app_mode = false;
 
 // Thread-local Apple TSD block (512 64-bit slots = 4096 bytes per thread)
 alignas(64) __thread uint64_t g_apple_tsd[512] = {0};
@@ -482,7 +488,15 @@ static const char* game_dir() {
     return d.c_str();
 }
 static const std::string& game_binary_path() {
-    static const std::string p = std::string(game_dir()) + "/UnityFramework";
+    static const std::string p = [] {
+        std::string dir = game_dir();
+        if (const char* e = getenv("LOADER_APP_EXECUTABLE")) if (*e) return dir + "/" + e;
+        struct stat st;
+        if (stat((dir + "/UnityFramework").c_str(), &st) == 0) return dir + "/UnityFramework";
+        std::string exe = app::bundle_executable(dir);   // CFBundleExecutable from Info.plist
+        if (!exe.empty() && stat((dir + "/" + exe).c_str(), &st) == 0) return dir + "/" + exe;
+        return dir + "/UnityFramework";
+    }();
     return p;
 }
 
@@ -2705,9 +2719,23 @@ static void init_custom_shims() {
     g_custom_shims["_vm_allocate"] = reinterpret_cast<void*>(&native_vm_allocate);
     g_custom_shims["_vm_deallocate"] = reinterpret_cast<void*>(&native_vm_deallocate);
 
-    // Dynamic ObjC message dispatch; engine mode already bound the guest-runtime dispatchers, which must win
-    g_custom_shims.emplace("_objc_msgSend", allocate_trampoline(shim_objc_msgSend, "_objc_msgSend"));
-    g_custom_shims.emplace("_objc_msgSendSuper2", allocate_trampoline(shim_objc_msgSend, "_objc_msgSendSuper2"));
+    // Dynamic ObjC message dispatch; engine mode already bound the guest-runtime dispatchers, which must win.
+    // App mode provides its own objc_msgSend, so skip the fake-Foundation one entirely there.
+    if (!g_app_mode) {
+        g_custom_shims.emplace("_objc_msgSend", allocate_trampoline(shim_objc_msgSend, "_objc_msgSend"));
+        g_custom_shims.emplace("_objc_msgSendSuper2", allocate_trampoline(shim_objc_msgSend, "_objc_msgSendSuper2"));
+    } else {
+        // App mode: RemoteIO AudioUnit output on AAudio (audio_unit.cpp), e.g. a game's music mixer
+        g_custom_shims["_AudioComponentFindNext"] = reinterpret_cast<void*>(&native_au_find_next);
+        g_custom_shims["_AudioComponentInstanceNew"] = reinterpret_cast<void*>(&native_au_instance_new);
+        g_custom_shims["_AudioComponentInstanceDispose"] = reinterpret_cast<void*>(&native_au_instance_dispose);
+        g_custom_shims["_AudioUnitSetProperty"] = reinterpret_cast<void*>(&native_au_set_property);
+        g_custom_shims["_AudioUnitGetProperty"] = reinterpret_cast<void*>(&native_au_get_property);
+        g_custom_shims["_AudioUnitInitialize"] = reinterpret_cast<void*>(&native_au_zero);
+        g_custom_shims["_AudioUnitUninitialize"] = reinterpret_cast<void*>(&native_au_zero);
+        g_custom_shims["_AudioOutputUnitStart"] = reinterpret_cast<void*>(&native_au_start);
+        g_custom_shims["_AudioOutputUnitStop"] = reinterpret_cast<void*>(&native_au_stop);
+    }
 
     // Data symbols
     g_custom_shims["___stack_chk_guard"] = &g_stack_chk_guard_val;
@@ -2750,6 +2778,15 @@ static void init_custom_shims() {
 static void* resolve_symbol(const std::string& name) {
     auto cache_it = g_resolved_cache.find(name);
     if (cache_it != g_resolved_cache.end()) return cache_it->second;
+
+    // App mode wins for the Objective-C runtime and the frameworks it implements; it returns null for libc and
+    // Darwin functions, which fall through to the shims below.
+    if (g_app_mode) {
+        if (void* p = app::resolve_symbol(name)) {
+            g_resolved_cache[name] = p;
+            return p;
+        }
+    }
 
     auto it = g_custom_shims.find(name);
     if (it != g_custom_shims.end()) {
@@ -2841,6 +2878,12 @@ static void* resolve_symbol(const std::string& name) {
             g_resolved_cache[name] = slot;
             return slot;
         }
+    }
+    // App mode: an unresolved function returns 0 (nil / zero) instead of aborting, so a game that references a
+    // libSystem/framework call we have not implemented degrades gracefully rather than crashing on first use.
+    if (g_app_mode && is_fn) {
+        g_resolved_cache[name] = reinterpret_cast<void*>(&native_null);
+        return reinterpret_cast<void*>(&native_null);
     }
     void* stub = allocate_trampoline(shim_unresolved, strdup(name.c_str()));
     g_resolved_cache[name] = stub;
@@ -3081,6 +3124,17 @@ extern "C" int loader_main(int argc, char** argv) {
 
     printf("=== Native ARM64 Mach-O Android Loader ===\n");
 
+    // Disable bionic heap pointer tagging: the guest's Objective-C/C code masks the top byte of heap pointers
+    // (isa stripping, tagged-pointer tricks), which makes free() see a mismatched tag and abort. Without tagging,
+    // those masked pointers free cleanly.
+#ifndef M_BIONIC_SET_HEAP_TAGGING_LEVEL
+#define M_BIONIC_SET_HEAP_TAGGING_LEVEL (-208)
+#endif
+#ifndef M_HEAP_TAGGING_LEVEL_NONE
+#define M_HEAP_TAGGING_LEVEL_NONE 0
+#endif
+    mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE);
+
     // 1. Calculate TSD offset
     uint64_t tpidr = get_tpidr_el0();
     uint64_t tsd_addr = reinterpret_cast<uint64_t>(&g_apple_tsd[0]);
@@ -3112,6 +3166,32 @@ extern "C" int loader_main(int argc, char** argv) {
     close(fd);
     printf("[*] Mapped %s (%zu bytes) at %p\n", bin_path, file_size, file_data);
 
+    // A fat/universal binary (0xcafebabe, big-endian) holds several slices; iOS 5/6-era apps are usually
+    // armv7 + arm64. Advance file_data to the arm64 (cputype 0x0100000c) slice so the rest parses a thin image.
+    {
+        auto be32 = [](const uint8_t* p) -> uint32_t { return static_cast<uint32_t>(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; };
+        uint32_t magic = be32(file_data);
+        if (magic == 0xcafebabe || magic == 0xcafebabf) {
+            bool is64 = magic == 0xcafebabf;
+            uint32_t narch = be32(file_data + 4);
+            if (8 + static_cast<uint64_t>(narch) * (is64 ? 32 : 20) > file_size) { fprintf(stderr, "[FATAL] truncated fat header\n"); return 1; }
+            uint64_t slice_off = 0, slice_size = 0;
+            for (uint32_t i = 0; i < narch; ++i) {
+                const uint8_t* a = file_data + 8 + i * (is64 ? 32 : 20);
+                uint32_t cputype = be32(a);
+                uint64_t off = is64 ? (static_cast<uint64_t>(be32(a + 8)) << 32 | be32(a + 12)) : be32(a + 8);
+                uint64_t size = is64 ? (static_cast<uint64_t>(be32(a + 16)) << 32 | be32(a + 20)) : be32(a + 12);
+                if (cputype == 0x0100000c) { slice_off = off; slice_size = size; break; }   // CPU_TYPE_ARM64
+            }
+            if (!slice_off) { fprintf(stderr, "[FATAL] fat binary has no arm64 slice\n"); return 1; }
+            if (slice_off > file_size || slice_size > file_size - slice_off) { fprintf(stderr, "[FATAL] arm64 slice lies outside the file\n"); return 1; }
+            printf("[*] Fat binary: using arm64 slice at offset 0x%llx (%llu bytes)\n",
+                   static_cast<unsigned long long>(slice_off), static_cast<unsigned long long>(slice_size));
+            file_data += slice_off;
+            file_size = slice_size;
+        }
+    }
+
     // 4. Parse Mach-O 64 header
     uint32_t ncmds = *reinterpret_cast<uint32_t*>(file_data + 16);
     uint32_t cur = 32;
@@ -3132,6 +3212,10 @@ extern "C" int loader_main(int argc, char** argv) {
     uint32_t export_off = 0, export_size = 0;
     uint64_t unwind_info_vm = 0, unwind_info_size = 0, eh_frame_vm = 0, eh_frame_size = 0;
     uint64_t objc_classlist_vm = 0, objc_classlist_size = 0, objc_catlist_vm = 0, objc_catlist_size = 0, objc_methname_vm = 0, objc_methname_size = 0;
+    uint64_t objc_nlclslist_vm = 0, objc_nlclslist_size = 0, objc_nlcatlist_vm = 0, objc_nlcatlist_size = 0;
+    uint64_t objc_selrefs_vm = 0, objc_selrefs_size = 0, objc_protolist_vm = 0, objc_protolist_size = 0;
+    uint64_t lc_main_entryoff = 0;
+    uint64_t mod_init_vm_scan = 0, mod_init_size_scan = 0;
 
     for (uint32_t i = 0; i < ncmds; ++i) {
         uint32_t cmd = *reinterpret_cast<uint32_t*>(file_data + cur);
@@ -3155,7 +3239,14 @@ extern "C" int loader_main(int argc, char** argv) {
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_classlist", 16) == 0) { objc_classlist_vm = saddr; objc_classlist_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_catlist", 16) == 0) { objc_catlist_vm = saddr; objc_catlist_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_methname", 16) == 0) { objc_methname_vm = saddr; objc_methname_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_nlclslist", 16) == 0) { objc_nlclslist_vm = saddr; objc_nlclslist_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_nlcatlist", 16) == 0) { objc_nlcatlist_vm = saddr; objc_nlcatlist_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_selrefs", 16) == 0) { objc_selrefs_vm = saddr; objc_selrefs_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_protolist", 16) == 0) { objc_protolist_vm = saddr; objc_protolist_size = ssize; }
+                if (std::strncmp(reinterpret_cast<const char*>(sp), "__mod_init_func", 16) == 0) { mod_init_vm_scan = saddr; mod_init_size_scan = ssize; }
             }
+        } else if (cmd == 0x80000028) { // LC_MAIN
+            lc_main_entryoff = *reinterpret_cast<uint64_t*>(file_data + cur + 8);
         } else if (cmd == 0x22 || cmd == 0x80000022) { // LC_DYLD_INFO
             rebase_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
             rebase_size = *reinterpret_cast<uint32_t*>(file_data + cur + 12);
@@ -3169,10 +3260,32 @@ extern "C" int loader_main(int argc, char** argv) {
         cur += cmdsize;
     }
 
-    // Determine total image range
+    // Decide app mode now: resolve_symbol and init_custom_shims both depend on it, and binds happen below.
+    {
+        const char* env = getenv("LOADER_APP");
+        if (env) {
+            g_app_mode = std::strcmp(env, "0") != 0;
+        } else {
+            // Auto: an Objective-C app is an MH_EXECUTE with LC_MAIN that imports _UIApplicationMain. Unity's
+            // UnityFramework is a dylib with no LC_MAIN, so engine mode still wins there even with LOADER_ENGINE set.
+            auto has_symbol = [&](uint32_t off, uint32_t size, const char* sym) {
+                if (!size) return false;
+                size_t n = std::strlen(sym);
+                for (const uint8_t* p = file_data + off; p + n < file_data + off + size; ++p)
+                    if (std::memcmp(p, sym, n) == 0) return true;
+                return false;
+            };
+            bool imports_uikit = has_symbol(bind_off, bind_size, "_UIApplicationMain") || has_symbol(lazy_off, lazy_size, "_UIApplicationMain");
+            g_app_mode = lc_main_entryoff != 0 && imports_uikit;
+        }
+        if (g_app_mode) printf("[*] App mode: Objective-C / UIKit / OpenGL ES iOS app\n");
+    }
+
+    // Determine total image range. __PAGEZERO is a 4 GB unmapped guard region at vmaddr 0 in executables (iOS
+    // apps); folding it in would push min_vm to 0 and place every real segment 4 GB above the mapping, so skip it.
     uint64_t min_vm = UINT64_MAX, max_vm = 0;
     for (auto& s : segments) {
-        if (s.vmsize == 0) continue;
+        if (s.vmsize == 0 || s.name == "__PAGEZERO") continue;
         if (s.vmaddr < min_vm) min_vm = s.vmaddr;
         if (s.vmaddr + s.vmsize > max_vm) max_vm = s.vmaddr + s.vmsize;
     }
@@ -3472,11 +3585,13 @@ extern "C" int loader_main(int argc, char** argv) {
 
     // 8. Set memory permissions & flush icache
     for (auto& s : segments) {
+        if (s.name == "__PAGEZERO" || s.vmsize == 0) continue;
         uint8_t* seg_start = image_base + (s.vmaddr - min_vm);
         int prot = PROT_READ;
         if (s.name == "__TEXT") prot = PROT_READ | PROT_EXEC;
         else if (s.name == "__DATA") prot = PROT_READ | PROT_WRITE;
-        else if (s.name == "__DATA_CONST") prot = PROT_READ;
+        // app::boot below still rewrites Objective-C metadata (class lists, caches) that newer linkers put here
+        else if (s.name == "__DATA_CONST") prot = g_app_mode ? PROT_READ | PROT_WRITE : PROT_READ;
 
         mprotect(seg_start, s.vmsize, prot);
         if (prot & PROT_EXEC) {
@@ -3523,6 +3638,38 @@ extern "C" int loader_main(int argc, char** argv) {
         }
     }
 
+    // 8.5 Execute static initializers in __mod_init_func.
+    typedef void (*init_func_t)();
+    if (g_app_mode) {
+        // App mode: register the guest's Objective-C classes first, so +load and C++ constructors that message
+        // them resolve, then run the guest's own __mod_init_func (located from the section table).
+        app::ImageInfo ai;
+        ai.base = reinterpret_cast<uintptr_t>(image_base);
+        ai.size = total_vmsize;
+        ai.slide = slide;
+        auto rt = [&](uint64_t vm) -> uintptr_t { return vm ? reinterpret_cast<uintptr_t>(image_base) + (vm - min_vm) : 0; };
+        ai.classlist = rt(objc_classlist_vm); ai.classlist_size = objc_classlist_size;
+        ai.catlist = rt(objc_catlist_vm); ai.catlist_size = objc_catlist_size;
+        ai.nlclslist = rt(objc_nlclslist_vm); ai.nlclslist_size = objc_nlclslist_size;
+        ai.nlcatlist = rt(objc_nlcatlist_vm); ai.nlcatlist_size = objc_nlcatlist_size;
+        ai.selrefs = rt(objc_selrefs_vm); ai.selrefs_size = objc_selrefs_size;
+        ai.methname = rt(objc_methname_vm); ai.methname_size = objc_methname_size;
+        ai.protolist = rt(objc_protolist_vm); ai.protolist_size = objc_protolist_size;
+        app::boot(ai);
+        if (mod_init_size_scan) {
+            uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm_scan - min_vm));
+            size_t n = mod_init_size_scan / 8;
+            printf("[*] Running %zu static initializers from __mod_init_func...\n", n);
+            for (size_t i = 0; i < n; ++i) if (uint64_t f = inits[i]) reinterpret_cast<init_func_t>(f)();
+        }
+        void* entry = lc_main_entryoff ? reinterpret_cast<void*>(image_base + lc_main_entryoff) : nullptr;
+        if (!entry) { fprintf(stderr, "[FATAL] app mode: no LC_MAIN entry point\n"); return 1; }
+        static char arg0[] = "app";
+        char* argv_app[] = {arg0, nullptr};
+        app::run_main(entry, 1, argv_app);
+        return 0;   // run_main does not return
+    }
+
     // Check value at 0x29b8890
     uint64_t* bzero_slot = reinterpret_cast<uint64_t*>(image_base + 0x29b8890);
     printf("[*] Value at 0x29b8890 (bzero slot): 0x%lx\n", *bzero_slot);
@@ -3532,7 +3679,6 @@ extern "C" int loader_main(int argc, char** argv) {
     size_t init_count = 449;
     uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm - min_vm));
     printf("[*] Running %zu static initializers from __mod_init_func...\n", init_count);
-    typedef void (*init_func_t)();
     for (size_t i = 0; i < init_count; ++i) {
         init_func_t fn = reinterpret_cast<init_func_t>(inits[i]);
         if (fn) {
