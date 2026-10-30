@@ -87,6 +87,7 @@ const Screen& screen() {
         s.content_x, s.content_y);
     return g_screen;
 }
+bool screen_landscape() { return screen().landscape; }   // guest interface orientation: LandscapeRight, else portrait
 void screen_content_rect(int& x, int& y, int& w, int& h, int& sw, int& sh) {
     const Screen& s = screen();
     x = static_cast<int>(s.content_x); y = static_cast<int>(s.content_y);

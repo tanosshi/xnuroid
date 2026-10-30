@@ -289,22 +289,53 @@ namespace app {
 // ---------------------------------------------------------------------------------------------------------------
 // CoreMotion (fed from Android sensors when available, otherwise zero)
 // ---------------------------------------------------------------------------------------------------------------
+bool screen_landscape();                                                    // app_uikit.cpp
+extern "C" int host_display_rotation() __attribute__((weak));               // android_app.cpp (APK only)
 namespace {
 ASensorManager* g_sensor_mgr = nullptr;
 const ASensor* g_accel = nullptr;
 ASensorEventQueue* g_queue = nullptr;
-double g_accel_x = 0, g_accel_y = 0, g_accel_z = -1;
+double g_accel_x = 0, g_accel_y = 0, g_accel_z = -1;   // guest device frame, g, gravity included
+double g_grav_x = 0, g_grav_y = 0, g_grav_z = -1;      // low-passed: CMDeviceMotion.gravity
 std::mutex g_accel_mu;
+
+// Android reports the reaction to gravity (flat on a table: z = +9.8 m/s^2) along the axes of the display's natural
+// orientation; iOS reports gravity itself in g (flat: z = -1) along the device's portrait axes. The reading is turned
+// into current-screen axes with the display rotation, then into the device axes implied by the interface orientation
+// the guest is told (LandscapeRight, home button on the right, or portrait).
+void to_guest_frame(const ASensorVector& a, double& x, double& y, double& z) {
+    const bool land = screen_landscape();
+    int r = host_display_rotation ? host_display_rotation() : -1;
+    if (r < 0) r = land ? 1 : 0;   // unknown (adb shell): a portrait-natural panel turned to the guest's orientation
+    double sx, sy;
+    switch (r & 3) {
+        case 0: sx = a.x; sy = a.y; break;
+        case 1: sx = -a.y; sy = a.x; break;
+        case 2: sx = -a.x; sy = -a.y; break;
+        default: sx = a.y; sy = -a.x; break;
+    }
+    constexpr double g = 9.80665;
+    if (land) { x = -sy / g; y = sx / g; }   // LandscapeRight: device +x points up the screen, +y to its left
+    else { x = -sx / g; y = -sy / g; }
+    z = -a.z / g;
+}
 
 void sensor_poll() {
     if (!g_queue) return;
     ASensorEvent e;
     std::lock_guard<std::mutex> l(g_accel_mu);
     while (ASensorEventQueue_getEvents(g_queue, &e, 1) > 0) {
-        // Android: m/s^2, x right / y up; iOS: g, reported here already in the guest's landscape frame
-        g_accel_x = e.acceleration.x / 9.81;
-        g_accel_y = e.acceleration.y / 9.81;
-        g_accel_z = e.acceleration.z / 9.81;
+        to_guest_frame(e.acceleration, g_accel_x, g_accel_y, g_accel_z);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            log("motion: rotation %d, android (%.2f %.2f %.2f) m/s^2 -> guest (%.2f %.2f %.2f) g",
+                host_display_rotation ? host_display_rotation() : -1, e.acceleration.x, e.acceleration.y, e.acceleration.z,
+                g_accel_x, g_accel_y, g_accel_z);
+        }
+        g_grav_x += 0.1 * (g_accel_x - g_grav_x);
+        g_grav_y += 0.1 * (g_accel_y - g_grav_y);
+        g_grav_z += 0.1 * (g_accel_z - g_grav_z);
     }
 }
 bool sensor_start(double hz) {
@@ -326,7 +357,7 @@ bool sensor_start(double hz) {
 }
 }  // namespace
 
-struct AccelDataExt : app::Ext { double x = 0, y = 0, z = -1; };
+struct AccelDataExt : app::Ext { double x = 0, y = 0, z = -1, gx = 0, gy = 0, gz = -1; };
 static void init_coremotion() {
     Class MM = def_class("CMMotionManager", "NSObject");
     struct MotExt : Ext { bool accel = false, device = false; double interval = 1.0 / 60; uint64_t timer = 0; };
@@ -356,6 +387,7 @@ static void init_coremotion() {
         id d = autorelease(alloc(dc));
         auto* e = ext_get<AccelDataExt>(d);
         e->x = g_accel_x; e->y = g_accel_y; e->z = g_accel_z;
+        e->gx = g_grav_x; e->gy = g_grav_y; e->gz = g_grav_z;
         (void)mgr;
         return d;
     };
@@ -370,8 +402,8 @@ static void init_coremotion() {
     def(AD, "acceleration", +[](id self, SEL) -> Accel3 { auto* e = ext_get<AccelDataExt>(self); return {e->x, e->y, e->z}; });
     def(AD, "timestamp", +[](id, SEL) -> double { return now_s(); });
     Class DM = def_class("CMDeviceMotion", "NSObject");
-    def(DM, "userAcceleration", +[](id self, SEL) -> Accel3 { auto* e = ext_get<AccelDataExt>(self); return {e->x, e->y, e->z}; });
-    def(DM, "gravity", +[](id, SEL) -> Accel3 { return {0, 0, -1}; });
+    def(DM, "userAcceleration", +[](id self, SEL) -> Accel3 { auto* e = ext_get<AccelDataExt>(self); return {e->x - e->gx, e->y - e->gy, e->z - e->gz}; });
+    def(DM, "gravity", +[](id self, SEL) -> Accel3 { auto* e = ext_get<AccelDataExt>(self); return {e->gx, e->gy, e->gz}; });
     def(DM, "rotationRate", +[](id, SEL) -> Accel3 { return {0, 0, 0}; });
 }
 

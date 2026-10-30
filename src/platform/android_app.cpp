@@ -14,6 +14,7 @@
 #include <jni.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -171,6 +172,33 @@ void setup_vibrator(android_app* app) {
     host_set_vibrate_hook(jni_vibrate);
 }
 
+// Display.getRotation() (Surface.ROTATION_*), polled from the glue thread: a 180-degree flip between the two
+// landscape orientations changes no configuration, so there is no event to wait for.
+std::atomic<int> g_rotation{-1};
+jobject g_display = nullptr;
+jmethodID g_get_rotation = nullptr;
+void refresh_rotation(android_app* app) {
+    JNIEnv* env = nullptr;
+    if (!g_vm || g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    if (!g_display) {
+        if (env->PushLocalFrame(8) != JNI_OK) return;
+        jobject wm = env->CallObjectMethod(app->activity->clazz,
+            env->GetMethodID(env->GetObjectClass(app->activity->clazz), "getWindowManager", "()Landroid/view/WindowManager;"));
+        jobject display = wm ? env->CallObjectMethod(wm, env->GetMethodID(env->FindClass("android/view/WindowManager"),
+            "getDefaultDisplay", "()Landroid/view/Display;")) : nullptr;
+        if (!env->ExceptionCheck() && display) {
+            g_display = env->NewGlobalRef(display);
+            g_get_rotation = env->GetMethodID(env->FindClass("android/view/Display"), "getRotation", "()I");
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->PopLocalFrame(nullptr);
+        if (!g_display || !g_get_rotation) return;
+    }
+    jint r = env->CallIntMethod(g_display, g_get_rotation);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    if (g_rotation.exchange(r) != r) __android_log_print(ANDROID_LOG_INFO, kTag, "display rotation %d", r * 90);
+}
+
 // UI thread: hides the system bars (a swipe shows them transiently) and reports their full extent, the display cutout
 // and the mandatory gesture areas (the home-indicator analogue) to the guest as safe-area insets. Root insets exist
 // once the window is attached, i.e. by the first focus.
@@ -285,6 +313,8 @@ void configure(android_app* app) {
 
 // The window the renderer presents to (null while the activity has no surface).
 extern "C" ANativeWindow* host_window() { return g_window.load(); }
+// Surface.ROTATION_* of the display (0..3), or -1 before it is known.
+extern "C" int host_display_rotation() { return g_rotation.load(); }
 
 // Activity entry point (android.app.func_name): the glue's ANativeActivity_onCreate plus UI-thread system-bar handling.
 extern "C" JNIEXPORT void xnuroid_on_create(ANativeActivity* activity, void* saved_state, size_t saved_state_size) {
@@ -299,11 +329,20 @@ void android_main(android_app* app) {
     app->onInputEvent = on_input;
     setup_vibrator(app);
     configure(app);
+    refresh_rotation(app);
+    timespec last{};
+    clock_gettime(CLOCK_MONOTONIC, &last);
     while (!app->destroyRequested) {
         android_poll_source* source = nullptr;
         int events = 0;
-        if (ALooper_pollOnce(-1, nullptr, &events, reinterpret_cast<void**>(&source)) >= 0 && source)
+        if (ALooper_pollOnce(500, nullptr, &events, reinterpret_cast<void**>(&source)) >= 0 && source)
             source->process(app, source);
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000 >= 500) {
+            last = now;
+            refresh_rotation(app);
+        }
     }
     // The engine cannot be unwound from another thread; end the process with the activity.
     fflush(stdout);
