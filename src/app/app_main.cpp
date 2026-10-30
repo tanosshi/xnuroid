@@ -14,6 +14,7 @@ void boot_guest(const ImageInfo& info);           // app_runtime.cpp
 bool override_method(const char* cls, const char* sel, bool class_method, IMP imp);
 void register_guest_protocols(uintptr_t list, uintptr_t size);
 void init_nib();                                  // app_nib.cpp
+void apply_game_patches();                        // app_patches.cpp
 void* gl_resolve(const char* name);               // app_gl.cpp
 
 namespace {
@@ -141,6 +142,7 @@ void boot(const ImageInfo& info) {
     // classes already bound into the image by dyld; the guest classes must exist before we can neuter any.
     boot_guest(info);
     disable_sdk_noise();
+    apply_game_patches();
 }
 
 [[noreturn]] void run_main(void* entry, int argc, char** argv) {

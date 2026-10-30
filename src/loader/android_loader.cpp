@@ -2724,6 +2724,17 @@ static void init_custom_shims() {
     if (!g_app_mode) {
         g_custom_shims.emplace("_objc_msgSend", allocate_trampoline(shim_objc_msgSend, "_objc_msgSend"));
         g_custom_shims.emplace("_objc_msgSendSuper2", allocate_trampoline(shim_objc_msgSend, "_objc_msgSendSuper2"));
+    } else {
+        // App mode: RemoteIO AudioUnit output on AAudio (audio_unit.cpp), e.g. a game's music mixer
+        g_custom_shims["_AudioComponentFindNext"] = reinterpret_cast<void*>(&native_au_find_next);
+        g_custom_shims["_AudioComponentInstanceNew"] = reinterpret_cast<void*>(&native_au_instance_new);
+        g_custom_shims["_AudioComponentInstanceDispose"] = reinterpret_cast<void*>(&native_au_instance_dispose);
+        g_custom_shims["_AudioUnitSetProperty"] = reinterpret_cast<void*>(&native_au_set_property);
+        g_custom_shims["_AudioUnitGetProperty"] = reinterpret_cast<void*>(&native_au_get_property);
+        g_custom_shims["_AudioUnitInitialize"] = reinterpret_cast<void*>(&native_au_zero);
+        g_custom_shims["_AudioUnitUninitialize"] = reinterpret_cast<void*>(&native_au_zero);
+        g_custom_shims["_AudioOutputUnitStart"] = reinterpret_cast<void*>(&native_au_start);
+        g_custom_shims["_AudioOutputUnitStop"] = reinterpret_cast<void*>(&native_au_stop);
     }
 
     // Data symbols

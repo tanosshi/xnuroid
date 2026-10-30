@@ -127,7 +127,10 @@ void mix(float* out, int frames) {
     }
 }
 
+std::atomic<bool> g_mixer_paused{false};
+
 aaudio_data_callback_result_t on_audio(AAudioStream*, void*, void* data, int32_t frames) {
+    if (g_mixer_paused) { std::memset(data, 0, sizeof(float) * frames * 2); return AAUDIO_CALLBACK_RESULT_CONTINUE; }
     std::lock_guard<std::mutex> l(g_al);
     mix(static_cast<float*>(data), frames);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
@@ -162,6 +165,7 @@ void start_mixer() {
             std::vector<float> scratch(512 * 2);
             for (;;) {
                 usleep(11600);
+                if (g_mixer_paused) continue;
                 std::lock_guard<std::mutex> l(g_al);
                 mix(scratch.data(), 512);
             }
@@ -170,6 +174,14 @@ void start_mixer() {
 }
 
 }  // namespace
+
+// Background/foreground: stop the OpenAL mixer's output (sources keep their state and resume where they were).
+void audio_set_paused(bool paused) {
+    g_mixer_paused = paused;
+    if (!g_stream) return;
+    if (paused) AAudioStream_requestPause(g_stream);
+    else AAudioStream_requestStart(g_stream);
+}
 
 }  // namespace app
 

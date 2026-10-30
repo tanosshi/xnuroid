@@ -15,6 +15,7 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -40,6 +41,11 @@ struct Unit {
 };
 
 uint32_t bytes_per_sample(const Unit* u) { return u->bits / 8 ? u->bits / 8 : 4; }
+
+// live units, so the host can pause every output stream when the app goes to the background
+std::mutex g_units_mu;
+std::set<Unit*> g_units;
+std::atomic<bool> g_paused{false};
 
 void wav_header(FILE* f, const Unit* u, uint32_t data_bytes) {
     uint32_t rate = static_cast<uint32_t>(u->rate), bps = bytes_per_sample(u), block = u->channels * bps;
@@ -93,7 +99,7 @@ aaudio_data_callback_result_t on_audio(AAudioStream*, void* user, void* data, in
     auto* u = static_cast<Unit*>(user);
     static thread_local bool bound = false;
     if (!bound) { loader_bind_thread(); bound = true; }   // AAudio's thread runs guest code (the render callback)
-    if (!u->running) {
+    if (!u->running || g_paused) {
         std::memset(data, 0, static_cast<size_t>(frames) * u->channels * bytes_per_sample(u));
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
@@ -136,7 +142,7 @@ void run_pump(Unit* u) {
     timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (u->running) {
-        render(u, out.data(), frames);
+        if (!g_paused) render(u, out.data(), frames);
         next.tv_nsec += static_cast<long>(1e9 * frames / u->rate);
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
@@ -150,7 +156,23 @@ char g_component;
 extern "C" {
 
 void* native_au_find_next(void* prev, const void*) { return prev ? nullptr : &g_component; }
-int32_t native_au_instance_new(void*, void** out) { if (out) *out = new Unit(); return 0; }
+int32_t native_au_instance_new(void*, void** out) {
+    auto* u = new Unit();
+    { std::lock_guard<std::mutex> l(g_units_mu); g_units.insert(u); }
+    if (out) *out = u;
+    return 0;
+}
+
+// Background/foreground: pause every AAudio output stream (the guest's render callback stops being called).
+void host_audio_units_pause(int paused) {
+    g_paused = paused != 0;
+    std::lock_guard<std::mutex> l(g_units_mu);
+    for (Unit* u : g_units) {
+        if (!u->stream || !u->running) continue;
+        if (paused) AAudioStream_requestPause(u->stream);
+        else AAudioStream_requestStart(u->stream);
+    }
+}
 
 int32_t native_au_stop(void* p) {
     auto* u = static_cast<Unit*>(p);
@@ -168,6 +190,7 @@ int32_t native_au_instance_dispose(void* p) {
     auto* u = static_cast<Unit*>(p);
     if (!u) return 0;
     native_au_stop(u);
+    { std::lock_guard<std::mutex> l(g_units_mu); g_units.erase(u); }
     if (u->wav) { wav_header(u->wav, u, u->wav_bytes); fclose(u->wav); }
     delete u;
     return 0;

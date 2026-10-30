@@ -7,7 +7,9 @@
 #include <android/sensor.h>
 #include <android/looper.h>
 
+#include <algorithm>
 #include <map>
+#include <set>
 
 namespace app {
 
@@ -201,8 +203,10 @@ void keychain_save() {
 }
 bool item_matches(id item, id query) {
     for (auto& kv : dict_entries(query)) {
+        // match class and attributes (account, service, generic, ...); skip return/match/value options and the
+        // accessibility attribute, which do not identify an item
         std::string k = utf8(kv.first);
-        if (k.empty() || k[0] != 'a') continue;   // match only kSecAttr* keys (account/service/...)
+        if (k.empty() || k.compare(0, 2, "r_") == 0 || k.compare(0, 2, "m_") == 0 || k.compare(0, 2, "v_") == 0) continue;
         if (k == "accc" || k == "pdmn") continue;
         id have = dict_get(item, kv.first);
         if (!have || !obj_equal(have, kv.second)) return false;
@@ -223,7 +227,7 @@ static int sec_item_copy(id query, id* result) {
     id limit = dict_get(query, "m_Limit");
     bool one = !limit || utf8(limit) == "m_LimitOne";
     auto item_result = [&](id item) -> id {
-        if (want_attrs && !want_data) return item;
+        if (want_attrs) return item;   // the attribute dictionary (it carries v_Data too)
         id d = dict_get(item, "v_Data");
         return d ? d : item;
     };
@@ -374,6 +378,211 @@ static void init_coremotion() {
 // ---------------------------------------------------------------------------------------------------------------
 // GameKit / StoreKit / iAd / analytics: present and inert (no accounts, no network, no purchases)
 // ---------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------
+// StoreKit. There is no App Store on Android, so by default nothing can be bought (canMakePayments is NO).
+// LOADER_APP_OFFLINE_STORE=1 replaces it with a local store: product requests answer with every identifier the
+// app asks for, and payments complete immediately (owned products persist in the sandbox and come back on
+// restore). LOADER_APP_OFFLINE_STORE=own_all also delivers every requested product as purchased, so an app whose
+// store has gone away (a delisted game) gets the content it already ships through its own purchase handling.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+int store_mode() {
+    const char* e = getenv("LOADER_APP_OFFLINE_STORE");
+    if (!e || !*e || !std::strcmp(e, "0")) return 0;
+    return std::strcmp(e, "own_all") == 0 ? 2 : 1;
+}
+struct ProductExt : Ext { id ident = nullptr; ~ProductExt() override { release(ident); } };
+struct ResponseExt : Ext { id products = nullptr, invalid = nullptr; ~ResponseExt() override { release(products); release(invalid); } };
+struct RequestExt : Ext { id ids = nullptr, delegate = nullptr; ~RequestExt() override { release(ids); } };
+struct PaymentExt : Ext { id ident = nullptr; long qty = 1; ~PaymentExt() override { release(ident); } };
+struct TxExt : Ext { id payment = nullptr, ident = nullptr, date = nullptr, original = nullptr; long state = 0; ~TxExt() override { release(payment); release(ident); release(date); release(original); } };
+
+std::mutex g_store_mu;
+std::vector<id> g_store_observers;            // not retained, like SKPaymentQueue
+std::set<std::string> g_store_granted;         // own_all deliveries made this session
+id g_store_queue;
+
+std::string owned_path() { return sandbox_dir("Library") + "/xnuroid_store.plist"; }
+std::set<std::string> owned_load() {
+    std::set<std::string> s;
+    std::string data;
+    if (read_file(owned_path(), data)) {
+        id a = plist_parse(reinterpret_cast<const uint8_t*>(data.data()), data.size(), false);
+        for (id x : arr_items(a)) s.insert(utf8(x));
+        release(a);
+    }
+    return s;
+}
+void owned_add(const std::string& ident) {
+    std::set<std::string> s = owned_load();
+    if (!s.insert(ident).second) return;
+    std::vector<id> v;
+    for (auto& x : s) v.push_back(str(x));
+    std::string out;
+    if (plist_write_xml(arr(v), out)) {
+        if (FILE* f = fopen(owned_path().c_str(), "wb")) { fwrite(out.data(), 1, out.size(), f); fclose(f); }
+    }
+}
+id make_payment(id ident) {
+    id p = autorelease(alloc(class_named("SKPayment")));
+    ext_get<PaymentExt>(p)->ident = retain(ident);
+    return p;
+}
+id make_tx(id payment, long state, id original) {
+    id t = autorelease(alloc(class_named("SKPaymentTransaction")));
+    auto* e = ext_get<TxExt>(t);
+    e->payment = retain(payment);
+    e->state = state;
+    e->ident = retain(send(send_cls(class_named("NSUUID"), "UUID"), "UUIDString"));
+    e->date = retain(send_cls(class_named("NSDate"), "date"));
+    e->original = retain(original);
+    return t;
+}
+void deliver(const std::vector<id>& txs) {
+    if (txs.empty()) return;
+    std::vector<id> obs;
+    { std::lock_guard<std::mutex> l(g_store_mu); obs = g_store_observers; }
+    id list = arr(txs);
+    for (id o : obs)
+        if (responds(o, sel("paymentQueue:updatedTransactions:"))) send<void>(o, "paymentQueue:updatedTransactions:", g_store_queue, list);
+}
+}  // namespace
+
+static void init_storekit() {
+    Class PQ = def_class("SKPaymentQueue", "NSObject");
+    g_store_queue = alloc(PQ);
+    defc(PQ, "defaultQueue", +[](id, SEL) -> id { return g_store_queue; });
+    defc(PQ, "canMakePayments", +[](id, SEL) -> bool { return store_mode() != 0; });
+    def(PQ, "addTransactionObserver:", +[](id, SEL, id o) {
+        std::lock_guard<std::mutex> l(g_store_mu);
+        if (o && std::find(g_store_observers.begin(), g_store_observers.end(), o) == g_store_observers.end()) g_store_observers.push_back(o);
+    });
+    def(PQ, "removeTransactionObserver:", +[](id, SEL, id o) {
+        std::lock_guard<std::mutex> l(g_store_mu);
+        g_store_observers.erase(std::remove(g_store_observers.begin(), g_store_observers.end(), o), g_store_observers.end());
+    });
+    def(PQ, "transactions", +[](id, SEL) -> id { return arr({}); });
+    def(PQ, "finishTransaction:", +[](id, SEL, id) {});
+    def(PQ, "addPayment:", +[](id, SEL, id payment) {
+        if (!payment) return;
+        std::string ident = utf8(ext_get<PaymentExt>(payment)->ident);
+        log("StoreKit: purchase %s (%s)", ident.c_str(), store_mode() ? "offline store: granted" : "no store: failed");
+        retain(payment);
+        post_main([payment, ident] {
+            long state = store_mode() ? 1 : 2;   // Purchased / Failed
+            if (state == 1) owned_add(ident);
+            deliver({make_tx(payment, state, nullptr)});
+            release(payment);
+        }, 0.3);
+    });
+    def(PQ, "restoreCompletedTransactions", +[](id, SEL) {
+        post_main([] {
+            std::vector<id> txs;
+            if (store_mode())
+                for (auto& ident : owned_load()) {
+                    id p = make_payment(str(ident));
+                    txs.push_back(make_tx(p, 3, make_tx(p, 1, nullptr)));   // Restored, with its original purchase
+                }
+            log("StoreKit: restore -> %zu transactions", txs.size());
+            deliver(txs);
+            std::vector<id> obs;
+            { std::lock_guard<std::mutex> l(g_store_mu); obs = g_store_observers; }
+            for (id o : obs)
+                if (responds(o, sel("paymentQueueRestoreCompletedTransactionsFinished:"))) send<void>(o, "paymentQueueRestoreCompletedTransactionsFinished:", g_store_queue);
+        }, 0.3);
+    });
+
+    Class PR = def_class("SKRequest", "NSObject");
+    def(PR, "setDelegate:", +[](id self, SEL, id d) { ext_get<RequestExt>(self)->delegate = d; });
+    def(PR, "delegate", +[](id self, SEL) -> id { return ext_get<RequestExt>(self)->delegate; });
+    def(PR, "cancel", +[](id self, SEL) { ext_get<RequestExt>(self)->delegate = nullptr; });
+    Class PRQ = def_class("SKProductsRequest", "SKRequest");
+    def(PRQ, "initWithProductIdentifiers:", +[](id self, SEL, id ids) -> id { ext_get<RequestExt>(self)->ids = send(ids, "copy"); return self; });
+    def(PRQ, "start", +[](id self, SEL) {
+        retain(self);
+        post_main([self] {
+            auto* e = ext_get<RequestExt>(self);
+            id d = e->delegate;
+            std::vector<id> products, invalid;
+            std::vector<std::string> grant;
+            for (id ident : arr_items(send(e->ids, "allObjects"))) {
+                if (!store_mode()) { invalid.push_back(ident); continue; }
+                id p = autorelease(alloc(class_named("SKProduct")));
+                ext_get<ProductExt>(p)->ident = retain(ident);
+                products.push_back(p);
+                std::lock_guard<std::mutex> l(g_store_mu);
+                if (store_mode() == 2 && g_store_granted.insert(utf8(ident)).second) grant.push_back(utf8(ident));
+            }
+            id resp = autorelease(alloc(class_named("SKProductsResponse")));
+            auto* re = ext_get<ResponseExt>(resp);
+            re->products = retain(arr(products));
+            re->invalid = retain(arr(invalid));
+            log("StoreKit: product request -> %zu products, %zu invalid", products.size(), invalid.size());
+            if (responds(d, sel("productsRequest:didReceiveResponse:"))) send<void>(d, "productsRequest:didReceiveResponse:", self, resp);
+            if (responds(d, sel("requestDidFinish:"))) send<void>(d, "requestDidFinish:", self);
+            if (!grant.empty()) {
+                // own_all: hand every product over through the app's own purchase handler
+                std::vector<id> txs;
+                for (auto& ident : grant) { owned_add(ident); txs.push_back(make_tx(make_payment(str(ident)), 1, nullptr)); }
+                log("StoreKit: own_all granted %zu products", txs.size());
+                deliver(txs);
+            }
+            release(self);
+        }, 0.2);
+    });
+    Class RR = def_class("SKReceiptRefreshRequest", "SKRequest");
+    def(RR, "initWithReceiptProperties:", +[](id self, SEL, id) -> id { return self; });
+    def(RR, "start", +[](id self, SEL) {
+        id d = ext_get<RequestExt>(self)->delegate;
+        if (responds(d, sel("requestDidFinish:"))) send<void>(d, "requestDidFinish:", self);
+    });
+
+    Class P = def_class("SKProduct", "NSObject");
+    def(P, "productIdentifier", +[](id self, SEL) -> id { return ext_get<ProductExt>(self)->ident; });
+    def(P, "localizedTitle", +[](id self, SEL) -> id { return ext_get<ProductExt>(self)->ident; });
+    def(P, "localizedDescription", +[](id, SEL) -> id { return str(""); });
+    def(P, "price", +[](id, SEL) -> id { return send_cls(class_named("NSDecimalNumber"), "zero"); });
+    def(P, "priceLocale", +[](id, SEL) -> id { return send_cls(class_named("NSLocale"), "currentLocale"); });
+    def(P, "isDownloadable", +[](id, SEL) -> bool { return false; });
+    def(P, "downloadContentLengths", +[](id, SEL) -> id { return arr({}); });
+    Class RS = def_class("SKProductsResponse", "NSObject");
+    def(RS, "products", +[](id self, SEL) -> id { return ext_get<ResponseExt>(self)->products; });
+    def(RS, "invalidProductIdentifiers", +[](id self, SEL) -> id { return ext_get<ResponseExt>(self)->invalid; });
+
+    Class PM = def_class("SKPayment", "NSObject");
+    defc(PM, "paymentWithProduct:", +[](id, SEL, id product) -> id { return make_payment(send(product, "productIdentifier")); });
+    defc(PM, "paymentWithProductIdentifier:", +[](id, SEL, id ident) -> id { return make_payment(ident); });
+    def(PM, "productIdentifier", +[](id self, SEL) -> id { return ext_get<PaymentExt>(self)->ident; });
+    def(PM, "quantity", +[](id self, SEL) -> long { return ext_get<PaymentExt>(self)->qty; });
+    def(PM, "requestData", +[](id, SEL) -> id { return nullptr; });
+    def(PM, "applicationUsername", +[](id, SEL) -> id { return nullptr; });
+    def(PM, "copyWithZone:", +[](id self, SEL, void*) -> id { return retain(self); });
+    def(PM, "mutableCopyWithZone:", +[](id self, SEL, void*) -> id {
+        id m = alloc(class_named("SKMutablePayment"));
+        ext_get<PaymentExt>(m)->ident = retain(ext_get<PaymentExt>(self)->ident);
+        return m;
+    });
+    Class MP = def_class("SKMutablePayment", "SKPayment");
+    def(MP, "setProductIdentifier:", +[](id self, SEL, id i) { auto* e = ext_get<PaymentExt>(self); release(e->ident); e->ident = send(i, "copy"); });
+    def(MP, "setQuantity:", +[](id self, SEL, long q) { ext_get<PaymentExt>(self)->qty = q; });
+    def(MP, "setRequestData:", +[](id, SEL, id) {});
+    def(MP, "setApplicationUsername:", +[](id, SEL, id) {});
+
+    Class T = def_class("SKPaymentTransaction", "NSObject");
+    def(T, "payment", +[](id self, SEL) -> id { return ext_get<TxExt>(self)->payment; });
+    def(T, "transactionState", +[](id self, SEL) -> long { return ext_get<TxExt>(self)->state; });
+    def(T, "transactionIdentifier", +[](id self, SEL) -> id { return ext_get<TxExt>(self)->ident; });
+    def(T, "transactionDate", +[](id self, SEL) -> id { return ext_get<TxExt>(self)->date; });
+    def(T, "originalTransaction", +[](id self, SEL) -> id { return ext_get<TxExt>(self)->original; });
+    def(T, "transactionReceipt", +[](id, SEL) -> id { return autorelease(data_new("offline", 7)); });
+    def(T, "error", +[](id self, SEL) -> id {
+        if (ext_get<TxExt>(self)->state != 2) return nullptr;
+        return send_cls(class_named("NSError"), "errorWithDomain:code:userInfo:", str("SKErrorDomain"), 0L, static_cast<id>(nullptr));
+    });
+    def(T, "downloads", +[](id, SEL) -> id { return arr({}); });
+    def_class("SKStoreProductViewController", "UIViewController");
+}
+
 static void init_services() {
     void* nil_v = nullptr;
     (void)nil_v;
@@ -410,29 +619,7 @@ static void init_services() {
                           "GKLeaderboardViewController", "GKMatchmakerViewController"})
         def_class(n, "NSObject");
 
-    // StoreKit: no products, purchases fail
-    Class PQ = def_class("SKPaymentQueue", "NSObject");
-    static id queue = alloc(PQ);
-    defc(PQ, "defaultQueue", +[](id, SEL) -> id { return queue; });
-    defc(PQ, "canMakePayments", +[](id, SEL) -> bool { return false; });
-    def(PQ, "addTransactionObserver:", +[](id, SEL, id) {});
-    def(PQ, "removeTransactionObserver:", +[](id, SEL, id) {});
-    def(PQ, "addPayment:", +[](id, SEL, id) {});
-    def(PQ, "restoreCompletedTransactions", +[](id, SEL) {});
-    def(PQ, "finishTransaction:", +[](id, SEL, id) {});
-    Class PR = def_class("SKProductsRequest", "NSObject");
-    def(PR, "initWithProductIdentifiers:", +[](id self, SEL, id) -> id { return self; });
-    def(PR, "setDelegate:", +[](id, SEL, id) {});
-    def(PR, "start", +[](id self, SEL) {
-        id d = send(self, "valueForKey:", str("delegate"));
-        (void)d;
-    });
-    def(PR, "cancel", +[](id, SEL) {});
-    def_class("SKPayment", "NSObject");
-    def_class("SKProduct", "NSObject");
-    def_class("SKMutablePayment", "SKPayment");
-    def_class("SKProductsResponse", "NSObject");
-    def_class("SKStoreProductViewController", "UIViewController");
+    init_storekit();
 
     // iAd / ads (Chartboost, Flurry, AdColony et al. are the guest's own classes; leave them to run, but neuter
     // the Apple ad classes they may fall back to)

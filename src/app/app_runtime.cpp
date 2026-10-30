@@ -732,6 +732,15 @@ void run_loads() {
     g_load_list.clear();
 }
 
+// the current implementation of a method (searching superclasses), or null
+IMP method_imp(const char* cls_name, const char* sel_name, bool class_method) {
+    std::lock_guard<std::recursive_mutex> l(g_rt);
+    auto it = by_name().find(cls_name);
+    if (it == by_name().end()) return nullptr;
+    MethodEntry* m = find_method_locked(class_method ? it->second->meta : it->second, sel(sel_name));
+    return m ? m->imp : nullptr;
+}
+
 // replaces a guest method with a native one (used to keep analytics/ad SDKs inert)
 bool override_method(const char* cls_name, const char* sel_name, bool class_method, IMP imp) {
     std::lock_guard<std::recursive_mutex> l(g_rt);

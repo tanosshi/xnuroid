@@ -425,9 +425,10 @@ static double link_period(LinkExt* e) {
     if (e->preferred_fps > 0) return 1.0 / static_cast<double>(e->preferred_fps);
     return std::max<long>(1, e->interval) / 60.0;
 }
+static std::atomic<bool> g_suspended{false};   // app in the background: display links stop, like iOS suspension
 static void link_fire(id link) {
     auto* e = ext_get<LinkExt>(link);
-    if (!e->valid || e->paused) return;
+    if (!e->valid || e->paused || g_suspended) return;
     double t = now_s();
     e->last = e->timestamp ? e->timestamp : t;
     e->timestamp = t;
@@ -633,7 +634,17 @@ extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id del
 }
 
 // lifecycle events from the Android host
+void audio_set_paused(bool paused);                                   // app_audio.cpp
+extern "C" void host_audio_units_pause(int paused) __attribute__((weak));   // audio_unit.cpp
+
 extern "C" void app_host_lifecycle(int active) {
+    // focus and pause/resume both report the same transition; act once per change
+    static std::atomic<int> last{-1};
+    if (last.exchange(active) == active) return;
+    // act on audio and rendering immediately (the main loop may be busy); the delegate callbacks are queued
+    g_suspended = !active;
+    audio_set_paused(!active);
+    if (host_audio_units_pause) host_audio_units_pause(!active);
     post_main([active] {
         id d = send(g_app, "delegate");
         if (!active) {
