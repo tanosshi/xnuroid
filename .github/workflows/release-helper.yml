@@ -1,0 +1,38 @@
+name: Release helper
+
+on:
+  push:
+    tags: ["*"]
+
+permissions:
+  contents: write
+
+jobs:
+  helper-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        run: python -m unittest discover -s tests/gui -v
+
+      - name: Build xnuroid-helper.exe
+        run: |
+          python -m pip install --upgrade pyinstaller
+          python -m PyInstaller --noconfirm --onefile --windowed --name xnuroid-helper --paths gui `
+            --distpath dist --workpath build/pyinstaller --specpath build/pyinstaller gui/xnuroid_gui.py
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/xnuroid-helper.exe
+          append_body: true
+          body: |
+            ### xnuroid helper (Windows)
+
+            1. Download **Source code (zip)** below and unzip it.
+            2. Download **xnuroid-helper.exe** and put it inside the unzipped folder.
+            3. Double-click it, or drop your decrypted `.ipa` onto it, and follow the three steps.

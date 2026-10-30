@@ -86,6 +86,20 @@ APP_NAME = "YourApp"                  # YourApp.app lives inside Payload/
 You can also set the `LOADER_GAME_DIR` and `LOADER_APP_NAME` environment
 variables instead. `run_phases.ps1` accepts the same folder through `-GameDir`.
 
+## Helper app
+
+`xnuroid-helper.exe` (attached to each tagged release) or `python gui/xnuroid_gui.py` does the whole Android app flow
+without a terminal. Put the exe in the repository folder and open it, or drop an `.ipa` onto it.
+
+- Checks Git Bash, Python, the Android SDK parts, and the debug signing key, and fixes what it can (SDK packages
+  through `sdkmanager`, the debug keystore through `keytool`).
+- Watches for a USB-debugging phone and reports unauthorized, non-arm64, or pre-Android 12 devices.
+- Takes an `.ipa`, an unpacked folder, a `Payload` folder, or a `.app`. IPAs are unpacked into `games/`. It reads the
+  `cryptid` of every `LC_ENCRYPTION_INFO(_64)` command in the main executable and the bundled frameworks, and refuses
+  App Store copies that are still FairPlay encrypted.
+- Writes `tools/game_config_local.py`, runs `./build_apk.sh install`, and reads `err.txt` / `out.txt` from the phone if
+  the game closes right after launch. The last build log is kept in `build/helper_last_build.log`.
+
 ## Build
 
 ### Build the command-line loader
