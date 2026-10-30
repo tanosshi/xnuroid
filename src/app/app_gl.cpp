@@ -20,6 +20,8 @@
 #include "pvrtc.hpp"
 
 extern "C" ANativeWindow* host_window() __attribute__((weak));
+// bumped by the host on every window change, so a window recreated at the old address is still noticed
+extern "C" unsigned host_window_generation() __attribute__((weak));
 
 typedef unsigned int GLenum;
 typedef unsigned int GLuint;
@@ -156,10 +158,15 @@ bool egl_init() {
 }
 
 ANativeWindow* g_win_native = nullptr;   // the ANativeWindow g_win was created from (for background/foreground)
+unsigned g_win_gen = 0;                  // host_window_generation() when g_win was created
+EGLSurface g_park = EGL_NO_SURFACE;      // 1x1 pbuffer the main context stays current on while there is no window
+
+unsigned window_generation() { return host_window_generation ? host_window_generation() : 0; }
 
 // the surface the guest's drawable maps to: the Android window, or an offscreen pbuffer in the command-line host
 void ensure_window_surface() {
     if (g_win != EGL_NO_SURFACE) return;
+    g_win_gen = window_generation();
     ANativeWindow* win = host_window ? host_window() : nullptr;
     g_win_native = win;
     if (win) {
@@ -181,22 +188,29 @@ void ensure_window_surface() {
     log("drawable surface %dx%d (%s)", g_surf_w, g_surf_h, g_win_is_pbuffer ? "pbuffer" : "window");
 }
 
-// Reconcile the EGL window surface with the host's current ANativeWindow. On background the host drops the window
-// (host_window() -> null); on return it hands back a new one. Rebuild the surface and rebind the current context so
-// rendering resumes. Returns false while there is no window (caller should skip the frame). Main thread only.
+// Reconcile the EGL window surface with the host's current ANativeWindow. On background (or screen off) the host
+// drops the window (host_window() -> null); on return it hands back a new one. The guest's context stays current
+// throughout, on a 1x1 pbuffer while there is no window, so GL calls made meanwhile are not lost and the context
+// is rebound to the new surface. Returns false while there is no window (caller should skip the frame). Main
+// thread only.
 bool refresh_window_surface() {
-    if (!on_main_thread()) return g_win != EGL_NO_SURFACE;
-    ANativeWindow* cur = host_window ? host_window() : nullptr;
-    if (g_win != EGL_NO_SURFACE && (cur == g_win_native || g_win_is_pbuffer)) return true;   // unchanged
-    // window changed (or first appeared): drop the old surface
-    EGLContext ctx = eglGetCurrentContext();
-    if (g_win != EGL_NO_SURFACE) {
-        eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (!g_win_is_pbuffer) eglDestroySurface(g_dpy, g_win);
-        g_win = EGL_NO_SURFACE;
+    if (!on_main_thread() || !host_window) return g_win != EGL_NO_SURFACE;   // command-line host: offscreen for good
+    const unsigned gen = window_generation();
+    ANativeWindow* cur = host_window();
+    if (g_win != EGL_NO_SURFACE && !g_win_is_pbuffer && gen == g_win_gen && cur == g_win_native) return true;   // unchanged
+    if (!cur && g_win == EGL_NO_SURFACE) return false;   // still backgrounded, already parked
+    // window gone or replaced: move the context off the old surface, then drop it
+    EGLContext ctx = t_ctx ? t_ctx->egl : EGL_NO_CONTEXT;
+    if (g_park == EGL_NO_SURFACE) {
+        const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+        g_park = eglCreatePbufferSurface(g_dpy, g_cfg, pb);
     }
+    if (ctx != EGL_NO_CONTEXT && !eglMakeCurrent(g_dpy, g_park, g_park, ctx)) log("park: eglMakeCurrent failed 0x%x", eglGetError());
+    if (g_win != EGL_NO_SURFACE) eglDestroySurface(g_dpy, g_win);
+    g_win = EGL_NO_SURFACE;
     g_win_native = cur;
-    if (!cur) return false;   // still backgrounded
+    g_win_gen = gen;
+    if (!cur) { log("window gone: context parked offscreen"); return false; }
     EGLint fmt = 0;
     eglGetConfigAttrib(g_dpy, g_cfg, EGL_NATIVE_VISUAL_ID, &fmt);
     ANativeWindow_setBuffersGeometry(cur, 0, 0, fmt);

@@ -3174,6 +3174,7 @@ extern "C" int loader_main(int argc, char** argv) {
         if (magic == 0xcafebabe || magic == 0xcafebabf) {
             bool is64 = magic == 0xcafebabf;
             uint32_t narch = be32(file_data + 4);
+            if (8 + static_cast<uint64_t>(narch) * (is64 ? 32 : 20) > file_size) { fprintf(stderr, "[FATAL] truncated fat header\n"); return 1; }
             uint64_t slice_off = 0, slice_size = 0;
             for (uint32_t i = 0; i < narch; ++i) {
                 const uint8_t* a = file_data + 8 + i * (is64 ? 32 : 20);
@@ -3183,6 +3184,7 @@ extern "C" int loader_main(int argc, char** argv) {
                 if (cputype == 0x0100000c) { slice_off = off; slice_size = size; break; }   // CPU_TYPE_ARM64
             }
             if (!slice_off) { fprintf(stderr, "[FATAL] fat binary has no arm64 slice\n"); return 1; }
+            if (slice_off > file_size || slice_size > file_size - slice_off) { fprintf(stderr, "[FATAL] arm64 slice lies outside the file\n"); return 1; }
             printf("[*] Fat binary: using arm64 slice at offset 0x%llx (%llu bytes)\n",
                    static_cast<unsigned long long>(slice_off), static_cast<unsigned long long>(slice_size));
             file_data += slice_off;
@@ -3588,7 +3590,8 @@ extern "C" int loader_main(int argc, char** argv) {
         int prot = PROT_READ;
         if (s.name == "__TEXT") prot = PROT_READ | PROT_EXEC;
         else if (s.name == "__DATA") prot = PROT_READ | PROT_WRITE;
-        else if (s.name == "__DATA_CONST") prot = PROT_READ;
+        // app::boot below still rewrites Objective-C metadata (class lists, caches) that newer linkers put here
+        else if (s.name == "__DATA_CONST") prot = g_app_mode ? PROT_READ | PROT_WRITE : PROT_READ;
 
         mprotect(seg_start, s.vmsize, prot);
         if (prot & PROT_EXEC) {

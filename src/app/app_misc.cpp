@@ -711,6 +711,10 @@ void init_misc() {
 void register_misc_symbols(std::unordered_map<std::string, void*>& m) {
     auto r = [&](const char* n, auto f) { m[n] = reinterpret_cast<void*>(f); };
     // CoreFoundation
+    // kCFBooleanTrue/False are CFBooleanRef globals; toll-free bridging makes the NSNumber singletons stand in.
+    static id cf_true = num_b(true), cf_false = num_b(false);
+    m["_kCFBooleanTrue"] = &cf_true;
+    m["_kCFBooleanFalse"] = &cf_false;
     r("_CFRetain", &cf_retain);
     r("_CFRelease", &cf_release);
     r("_CFGetRetainCount", &cf_retain_count);

@@ -59,8 +59,11 @@ struct String {
     }
     void assign(const char* str, size_t n) {
         if (n <= SHORT_CAP) {
+            // str may point into our own buffer (substring assign): copy it out before freeing
+            char tmp[SHORT_CAP];
+            if (str && n > 0) std::memcpy(tmp, str, n);
             free_buffer();
-            set_short(str, n);
+            set_short(tmp, n);
         } else {
             size_t p = 32;
             while (p < n + 1) p <<= 1;

@@ -215,12 +215,17 @@ def main() -> int:
 
     # Match the activity's orientation to the app's UISupportedInterfaceOrientations so landscape games fill the
     # screen and portrait apps stand upright, instead of a hardcoded orientation.
-    orients = info.get("UISupportedInterfaceOrientations") or []
+    # Older bundles may only carry the ~iphone variant or the single initial UIInterfaceOrientation.
+    orients = (info.get("UISupportedInterfaceOrientations") or info.get("UISupportedInterfaceOrientations~iphone")
+               or info.get("UIInterfaceOrientation") or [])
     if isinstance(orients, str):
         orients = [orients]
     has_land = any("Landscape" in o for o in orients)
     has_port = any("Portrait" in o for o in orients)
-    orientation = "sensorLandscape" if has_land and not has_port else "sensorPortrait" if has_port and not has_land else "fullSensor"
+    if not orients:
+        orientation = "portrait"   # iOS default without the key, and this template's previous fixed value
+    else:
+        orientation = "sensorLandscape" if has_land and not has_port else "sensorPortrait" if has_port and not has_land else "fullSensor"
     manifest = re.sub(r'android:screenOrientation="[^"]*"', f'android:screenOrientation="{orientation}"', manifest, count=1)
 
     manifest_out.write_text(manifest if icon else manifest.replace(ICON_ATTR, ""), encoding="utf-8")
