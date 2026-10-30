@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 namespace gles {
 
@@ -15,6 +16,10 @@ bool ensure_context();
 void publish();
 // Shows an RGBA texture (rows top-first) in the app window, scaled to fit. False when there is no window.
 bool present_texture(unsigned tex, int w, int h);
+// Debug: with x >= 0, present_texture reads the window back buffer's columns x and width-1-x (all rows, bottom-first)
+// just before swapping. The RGBA rows land in window_columns(), left column first.
+void set_window_probe(int x);
+const std::vector<uint8_t>& window_columns();
 // Logs GL_RENDERER/VERSION, limits and the extensions the Metal emulation cares about.
 void probe();
 bool has_extension(const char* name);

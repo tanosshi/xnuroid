@@ -267,10 +267,11 @@ inline uint64_t next_drawable(uint64_t layer, FakeObjcObj* ls) {
         h = (vs ? vs->rect[3] : screen::g_height) * sc;
     }
     uint64_t pf = ls->props.count("pixelFormat") ? ls->props["pixelFormat"] : 80;   // MTLPixelFormatBGRA8Unorm
-    uint64_t key = (static_cast<uint64_t>(w) << 32) ^ (static_cast<uint64_t>(h) << 8) ^ pf;
+    const int count = g_drawable_count.load();
+    uint64_t key = (static_cast<uint64_t>(w) << 32) ^ (static_cast<uint64_t>(h) << 8) ^ pf ^ (static_cast<uint64_t>(count) << 56);
     if (getp(ls, "#drawableKey") != key || ls->values.empty()) {
         ls->values.clear();
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < count; ++i) {
             uint64_t d = fake_make(8, "CAMetalDrawable");
             uint64_t t;
             FakeObjcObj* tex = fake_metal_bag(&t);
@@ -292,7 +293,7 @@ inline uint64_t next_drawable(uint64_t layer, FakeObjcObj* ls) {
             ls->values.push_back(d);
         }
         ls->props["#drawableKey"] = key;
-        printf("[UI] CAMetalLayer %#llx drawables %.0fx%.0f pixelFormat %llu\n", static_cast<unsigned long long>(layer), w, h,
+        printf("[UI] CAMetalLayer %#llx %d drawables %.0fx%.0f pixelFormat %llu\n", static_cast<unsigned long long>(layer), count, w, h,
                static_cast<unsigned long long>(pf));
         fflush(stdout);
     }

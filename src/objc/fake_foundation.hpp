@@ -121,6 +121,7 @@ static std::unordered_map<uint64_t, std::string> g_fake_born, g_fake_dead;
 static std::mutex g_grave_mu;
 static std::vector<Grave> g_graves;
 static std::atomic<uint64_t> g_present_count{0};   // advanced per presented frame (mtl_gles.hpp)
+static std::atomic<int> g_drawable_count{3};       // CAMetalLayer pool size (fake_uikit.hpp); LOADER_PRESENT_CTL can change it
 static void fake_release(uint64_t h) {
     FakeObjcObj* o = h ? fake_lookup(h) : nullptr;
     if (!o || o->refs.fetch_sub(1) != 1 || (o->kind != 3 && !o->counted)) return;

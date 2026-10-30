@@ -32,9 +32,12 @@ command-line loader, or in `loader.env` on the device for the [Android app](andr
 | `LOADER_GL_TRACE_TRIGGER` | File path checked every 5 frames. When it appears, the next frame is traced and the file is removed. An `x,y` line in the file sets the probe pixel. With `LOADER_FRAME_DIR`, the traced frame, the first texture of each draw, and each program's GLSL (`prog_<id>.glsl`) are saved. |
 | `LOADER_GL_TRACE_PROBE` | `x,y` render-target pixel (Metal coordinates) printed after each traced draw. |
 | `LOADER_GL_SKIP_DRAW` | Drop the Nth draw of each pass (debug). |
+| `LOADER_GL_NO_DEPTH` | Debug: disable the depth test for every draw. |
+| `LOADER_GL_NO_STENCIL` | Debug: disable the stencil test for every draw. |
 | `LOADER_GL_SOLID` | Force a solid magenta fragment color for shaders writing o_SV_Target0. |
 | `LOADER_DRAW_STATS` | Print draws per presented frame every 60 frames. |
 | `LOADER_LOG_PVRTC` | Log PVRTC decode timing. |
+| `LOADER_TEX_PROFILE` | Texture profiler. Logs `[TEXPROF]` texture creation, a per-second summary, and anomalies: textures sampled with no upload or render, missing or wrong-target bindings, render feedback, draws whose texture swaps between a real texture and a tiny single-colour placeholder (Unity default textures), textures destroyed within 120 frames, re-uploads, dropped or unimplemented blits, zero-filled uniform blocks, short vertex buffers, dropped draws and incomplete framebuffers. Also logs each pipeline's vertex attributes and blend state once. With `LOADER_FRAME_DIR`, traces and dumps the frame after each of the first N anomalies. N is the value, default 6. |
 | `LOADER_MEM_STATS` | Every 600 frames: live fake objects (top kinds) and GL texture memory (largest textures). |
 | `LOADER_FAKE_LIFE` | Track freed fake objects and log `[DEAD]` when a message reaches one; adds creating selectors to `LOADER_MEM_STATS`. Never reuses freed handles. |
 | `LOADER_LOG_DEFAULTS` | Log NSUserDefaults (PlayerPrefs) saves to <sandbox>/Library/Preferences. |

@@ -96,7 +96,12 @@ namespace {
 thread_local ANativeWindow* t_window = nullptr;
 thread_local EGLSurface t_window_surface = EGL_NO_SURFACE;
 thread_local GLuint t_present_fbo = 0;
+int g_window_probe_x = -1;
+std::vector<uint8_t> g_window_columns;
 }  // namespace
+
+void set_window_probe(int x) { g_window_probe_x = x; }
+const std::vector<uint8_t>& window_columns() { return g_window_columns; }
 
 bool present_texture(unsigned tex, int w, int h) {
     ANativeWindow* win = host_window ? host_window() : nullptr;
@@ -131,6 +136,15 @@ bool present_texture(unsigned tex, int w, int h) {
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     // texture rows are top-first (Metal order); the window's row 0 is the bottom
     glBlitFramebuffer(0, 0, w, h, 0, wh, ww, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (g_window_probe_x >= 0 && g_window_probe_x < ww) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        g_window_columns.resize(static_cast<size_t>(wh) * 8);
+        glReadPixels(g_window_probe_x, 0, 1, wh, GL_RGBA, GL_UNSIGNED_BYTE, g_window_columns.data());
+        glReadPixels(ww - 1 - g_window_probe_x, 0, 1, wh, GL_RGBA, GL_UNSIGNED_BYTE, g_window_columns.data() + static_cast<size_t>(wh) * 4);
+    } else {
+        g_window_columns.clear();
+    }
     eglSwapBuffers(g_display, t_window_surface);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prev_read));
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prev_draw));
