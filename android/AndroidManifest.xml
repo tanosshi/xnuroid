@@ -16,7 +16,7 @@
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
-            android:screenOrientation="portrait"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
             android:launchMode="singleTask">
             <meta-data android:name="android.app.lib_name" android:value="xnuroid" />

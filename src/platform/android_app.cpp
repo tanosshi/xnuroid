@@ -23,7 +23,9 @@
 #include <string>
 
 extern "C" int loader_main(int argc, char** argv);
-extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp
+extern "C" void host_touch(int id, int phase, float nx, float ny);          // fake_uikit.hpp (engine mode)
+extern "C" void app_host_touch(int id, int phase, float nx, float ny) __attribute__((weak));   // app_uikit.cpp (app mode)
+extern "C" void app_host_lifecycle(int active) __attribute__((weak));       // app_uikit.cpp
 extern "C" void host_set_vibrate_hook(void (*hook)(int ms, int amplitude));  // haptics.cpp
 extern "C" void host_set_screen_size(int width_px, int height_px);           // screen_metrics.hpp
 extern "C" void host_set_safe_area(int top_px, int left_px, int bottom_px, int right_px, int width_px);
@@ -118,7 +120,10 @@ int32_t on_input(android_app* app, AInputEvent* ev) {
     const int32_t action = AMotionEvent_getAction(ev), kind = action & AMOTION_EVENT_ACTION_MASK;
     const size_t index = static_cast<size_t>((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     auto send = [&](size_t i, int phase) {
-        host_touch(AMotionEvent_getPointerId(ev, i), phase, AMotionEvent_getX(ev, i) / w, AMotionEvent_getY(ev, i) / h);
+        int id = AMotionEvent_getPointerId(ev, i);
+        float nx = AMotionEvent_getX(ev, i) / w, ny = AMotionEvent_getY(ev, i) / h;
+        host_touch(id, phase, nx, ny);
+        if (app_host_touch) app_host_touch(id, phase, nx, ny);
     };
     switch (kind) {
         case AMOTION_EVENT_ACTION_DOWN: case AMOTION_EVENT_ACTION_POINTER_DOWN: send(index, 0); break;
@@ -241,7 +246,17 @@ void on_app_cmd(android_app* app, int32_t cmd) {
             }
             break;
         case APP_CMD_TERM_WINDOW:
+            // The renderer watches g_window and tears its EGL surface down on the next frame; clearing it here
+            // (before the framework destroys the ANativeWindow) keeps the render thread off the dead window.
             g_window = nullptr;
+            break;
+        case APP_CMD_GAINED_FOCUS:
+        case APP_CMD_RESUME:
+            if (app_host_lifecycle) app_host_lifecycle(1);
+            break;
+        case APP_CMD_LOST_FOCUS:
+        case APP_CMD_PAUSE:
+            if (app_host_lifecycle) app_host_lifecycle(0);
             break;
         default:
             break;
