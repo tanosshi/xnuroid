@@ -297,11 +297,13 @@ static void cxx_structors(RClass* r) {
     r->cxx_ready.store(true, std::memory_order_release);
 }
 
-id alloc(Class c) {
+id alloc(Class c) { return alloc_extra(c, 0); }
+// `extra` bytes follow the instance variables (object_getIndexedIvars)
+id alloc_extra(Class c, size_t extra) {
     RClass* r = rc_of_class(c);
     size_t size = r ? r->inst_size : 8;
     if (size < 8) size = 8;
-    auto* mem = static_cast<uint8_t*>(calloc(1, sizeof(Header) + size));
+    auto* mem = static_cast<uint8_t*>(calloc(1, sizeof(Header) + size + extra));
     auto* h = reinterpret_cast<Header*>(mem);
     h->magic = kObjMagic;
     h->rc.store(1, std::memory_order_relaxed);
@@ -331,6 +333,18 @@ void release(id o) {
     if (h->rc.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         h->rc.store(kDeallocating);
         send<void>(o, "dealloc");
+    }
+}
+
+// Retains o unless it is already being deallocated (its count reached zero): what a weak reference load needs. A
+// plain retain of a dying object returns it, and another thread then uses it after it is freed.
+bool try_retain(id o) {
+    if (!has_header(o)) return o != nullptr;
+    auto& rc = hdr(o)->rc;
+    int32_t v = rc.load(std::memory_order_relaxed);
+    while (true) {
+        if (v <= 0 || v >= kDeallocating) return v >= kImmortal;   // immortal objects (classes, constants) stay valid
+        if (rc.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel)) return true;
     }
 }
 
@@ -1055,7 +1069,11 @@ static id rt_store_weak(id* loc, id v) {
 }
 static id rt_init_weak(id* loc, id v) { *loc = nullptr; return rt_store_weak(loc, v); }
 static void rt_destroy_weak(id* loc) { weak_unregister(loc, *loc); *loc = nullptr; }
-static id rt_load_weak_retained(id* loc) { std::lock_guard<std::mutex> l(g_side_mu); return app::retain(*loc); }
+static id rt_load_weak_retained(id* loc) {
+    std::lock_guard<std::mutex> l(g_side_mu);
+    id o = *loc;
+    return o && app::try_retain(o) ? o : nullptr;   // nil once the object has started deallocating, as on iOS
+}
 static id rt_load_weak(id* loc) { return app::autorelease(rt_load_weak_retained(loc)); }
 static void rt_copy_weak(id* to, id* from) { rt_init_weak(to, *from); }
 static void rt_move_weak(id* to, id* from) { rt_init_weak(to, *from); rt_destroy_weak(from); }
@@ -1366,9 +1384,10 @@ static id rt_construct_instance(Class c, void* bytes) {
     reinterpret_cast<id>(bytes)->isa = c;
     return static_cast<id>(bytes);
 }
-static id rt_class_create_instance(Class c, size_t extra) {
-    (void)extra;
-    return app::alloc(c);
+static id rt_class_create_instance(Class c, size_t extra) { return app::alloc_extra(c, extra); }
+static void* rt_object_get_indexed_ivars(id o) {
+    RClass* r = o ? rc_of_class(o->isa) : nullptr;
+    return o ? reinterpret_cast<uint8_t*>(o) + (r && r->inst_size >= 8 ? r->inst_size : 8) : nullptr;
 }
 
 // dynamic classes: objc_allocateClassPair/objc_initializeClassPair + objc_registerClassPair
@@ -1474,6 +1493,9 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("_class_addProperty", &rt_class_add_property);
     r("_class_getInstanceVariable", &rt_class_get_instance_variable);
     r("_class_createInstance", &rt_class_create_instance);
+    r("_object_getIndexedIvars", &rt_object_get_indexed_ivars);
+    r("_NSAllocateObject", +[](Class c, size_t extra, void*) -> id { return app::alloc_extra(c, extra); });
+    r("_NSDeallocateObject", +[](id o) { app::dealloc_object(o); });
     r("_property_copyAttributeList", &rt_property_copy_attribute_list);
     r("_class_copyPropertyList", &rt_class_copy_property_list);
     r("_class_getProperty", &rt_class_get_property);

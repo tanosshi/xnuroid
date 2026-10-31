@@ -62,6 +62,8 @@ IMP nil_imp();
 uint32_t instance_size(Class c);
 
 id alloc(Class c);                               // +1, zeroed, isa set
+id alloc_extra(Class c, size_t extra);           // +1, with `extra` bytes after the ivars
+bool try_retain(id o);                          // retains unless o is being deallocated
 id retain(id o);
 void release(id o);
 id autorelease(id o);

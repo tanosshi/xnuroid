@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -44,7 +45,11 @@ struct CMTime { int64_t value; int32_t timescale; uint32_t flags; int64_t epoch;
 CMTime cm_ms(int64_t ms) { return {ms, 1000, 1, 0}; }
 int64_t to_ms(const CMTime& t) { return t.timescale > 0 ? t.value * 1000 / t.timescale : 0; }
 
-bool host_player() { return host_media_open && host_media_play; }
+// LOADER_MEDIA=0: no host player (playback only runs out its duration)
+bool host_player() {
+    static const bool off = getenv("LOADER_MEDIA") && getenv("LOADER_MEDIA")[0] == '0';
+    return !off && host_media_open && host_media_play;
+}
 
 std::mutex g_mu;
 std::unordered_map<int, id> g_owner;   // session id -> AVPlayerItem / AVAudioPlayer (not retained)
@@ -181,6 +186,7 @@ id kvo_value(id self, const std::string& key) {
 void Observed::add(id self, id who, id key, NSUInteger options, void* ctx) {
     if (!who || !key) return;
     std::string k = utf8(key);
+    if (trace_enabled("av")) log("AV observe %s of %p (options 0x%lx)", k.c_str(), static_cast<void*>(self), static_cast<unsigned long>(options));
     observers.push_back({who, k, options, ctx});
     if (k != "status" && !(options & 4)) return;
     id v = kvo_value(self, k);
@@ -401,6 +407,11 @@ void on_media_event(int sid, int event) {
 
 }  // namespace
 
+// LOADER_APP_TRACE=av: one line per AVFoundation call the game makes
+void av_trace(const char* what, id self) {
+    if (trace_enabled("av")) log("AV %s %p", what, static_cast<void*>(self));
+}
+
 void init_av() {
     C_AVAsset = def_class("AVAsset", "NSObject");
     C_AVURLAsset = def_class("AVURLAsset", "AVAsset");
@@ -418,10 +429,15 @@ void init_av() {
     def(C_AVAsset, "duration", +[](id self, SEL) -> CMTime { return cm_ms(ext_get<AssetExt>(self)->length()); });
     def(C_AVAsset, "isPlayable", +[](id, SEL) -> bool { return true; });
     def(C_AVAsset, "isReadable", +[](id, SEL) -> bool { return true; });
-    def(C_AVAsset, "tracks", +[](id, SEL) -> id { return arr({}); });
-    def(C_AVAsset, "tracksWithMediaType:", +[](id, SEL, id) -> id { return arr({}); });
-    def(C_AVAsset, "statusOfValueForKey:error:", +[](id, SEL, id, id* err) -> long { if (err) *err = nullptr; return 2; });   // Loaded
-    def(C_AVAsset, "loadValuesAsynchronouslyForKeys:completionHandler:", +[](id, SEL, id, id handler) {
+    def(C_AVAsset, "tracks", +[](id self, SEL) -> id { av_trace("asset tracks", self); return arr({}); });
+    def(C_AVAsset, "tracksWithMediaType:", +[](id self, SEL, id) -> id { av_trace("asset tracksWithMediaType", self); return arr({}); });
+    def(C_AVAsset, "statusOfValueForKey:error:", +[](id self, SEL, id, id* err) -> long {
+        av_trace("asset statusOfValueForKey", self);
+        if (err) *err = nullptr;
+        return 2;   // Loaded
+    });
+    def(C_AVAsset, "loadValuesAsynchronouslyForKeys:completionHandler:", +[](id self, SEL, id, id handler) {
+        av_trace("asset loadValuesAsynchronously", self);
         if (!handler) return;
         id h = block_copy(handler);
         post_main([h] {
@@ -431,7 +447,10 @@ void init_av() {
     });
 
     C_AVPlayerItem = def_class("AVPlayerItem", "NSObject");
-    defc(C_AVPlayerItem, "playerItemWithAsset:", +[](id, SEL, id asset) -> id { return asset ? autorelease(make_item(asset)) : nullptr; });
+    defc(C_AVPlayerItem, "playerItemWithAsset:", +[](id, SEL, id asset) -> id {
+        av_trace("playerItemWithAsset", asset);
+        return asset ? autorelease(make_item(asset)) : nullptr;
+    });
     defc(C_AVPlayerItem, "playerItemWithURL:", +[](id, SEL, id url) -> id {
         id a = make_asset(url);
         id item = make_item(a);
@@ -481,6 +500,7 @@ void init_av() {
         return autorelease(send(alloc(reinterpret_cast<Class>(cls)), "initWithURL:", url));
     });
     def(C_AVPlayer, "initWithPlayerItem:", +[](id self, SEL, id item) -> id {
+        av_trace("player initWithPlayerItem", item);
         auto* p = player_of(self);
         p->item = retain(item);
         if (ItemExt* ie = item_of(item)) ie->player = self;
@@ -579,6 +599,7 @@ void init_av() {
     });
     def(C_AVPlayerLayer, "player", +[](id self, SEL) -> id { return layer_state(self)->player; });
     def(C_AVPlayerLayer, "setPlayer:", +[](id self, SEL, id player) {
+        av_trace("layer setPlayer", player);
         auto* le = layer_state(self);
         if (le->player == player) return;
         layer_detach(self);

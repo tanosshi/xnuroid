@@ -96,6 +96,12 @@ void register_foundation_symbols(std::unordered_map<std::string, void*>& m) {
                           "NSLocaleCountryCode", "NSLocaleCurrencyCode", "NSLocaleLanguageCode", "NSLocaleIdentifier", "NSGregorianCalendar",
                           "NSWeekCalendarUnit", "NSCurrentLocaleDidChangeNotification"})
         m[std::string("_") + n] = nsstr_const(n);
+    // KVO change dictionary keys have short values of their own, which observers look up
+    m["_NSKeyValueChangeKindKey"] = nsstr_const("kind");
+    m["_NSKeyValueChangeNewKey"] = nsstr_const("new");
+    m["_NSKeyValueChangeOldKey"] = nsstr_const("old");
+    m["_NSKeyValueChangeIndexesKey"] = nsstr_const("indexes");
+    m["_NSKeyValueChangeNotificationIsPriorKey"] = nsstr_const("notificationIsPrior");
     // NSFoundationVersionNumber: iOS 8.x (so version checks behave like the shipping OS)
     static double fvn = 1144.17;
     m["_NSFoundationVersionNumber"] = &fvn;
