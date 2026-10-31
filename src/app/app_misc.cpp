@@ -38,7 +38,71 @@ static id cf_autorelease(id o) { return autorelease(o); }
 static unsigned long cf_hash(id o) { return obj_hash(o); }
 static bool cf_equal(id a, id b) { return a == b || obj_equal(a, b); }
 static id cf_copy_description(id o) { return o ? retain(send(o, "description")) : str_new("(null)"); }
-static long cf_get_type_id(id) { return 1; }
+// CFTypeIDs: arbitrary but distinct per toll-free bridged kind, so CFGetTypeID(x) == CFStringGetTypeID() style checks work
+enum : long { kTidOther = 1, kTidNull = 16, kTidSet = 17, kTidDict = 18, kTidArray = 19, kTidData = 20, kTidBool = 21, kTidNumber = 22,
+              kTidString = 7, kTidURL = 29, kTidUUID = 38, kTidDate = 42 };
+static long cf_get_type_id(id o) {
+    if (!o) return 0;
+    static const std::pair<const char*, long> kinds[] = {{"NSString", kTidString}, {"NSDictionary", kTidDict}, {"NSArray", kTidArray},
+                                                         {"NSData", kTidData}, {"NSNumber", kTidNumber}, {"NSDate", kTidDate}, {"NSURL", kTidURL},
+                                                         {"NSSet", kTidSet}, {"NSNull", kTidNull}, {"NSUUID", kTidUUID}};
+    for (const auto& k : kinds)
+        if (is_kind(o, k.first)) {
+            if (k.second == kTidNumber && (o == num_b(true) || o == num_b(false))) return kTidBool;
+            return k.second;
+        }
+    return kTidOther;
+}
+
+// CFPropertyListCreateDeepCopy: containers rebuilt with copied contents (mutable, a superset of every option)
+static id deep_copy(id o, long options) {
+    if (is_kind(o, "NSDictionary")) {
+        id d = send_cls(class_named("NSMutableDictionary"), "new");
+        id keys = send(o, "allKeys");
+        for (unsigned long i = 0, n = send<unsigned long>(keys, "count"); i < n; ++i) {
+            id k = send(keys, "objectAtIndex:", i);
+            id v = deep_copy(send(o, "objectForKey:", k), options);
+            send<void>(d, "setObject:forKey:", v, k);
+            release(v);
+        }
+        return d;
+    }
+    if (is_kind(o, "NSArray")) {
+        id a = send_cls(class_named("NSMutableArray"), "new");
+        for (unsigned long i = 0, n = send<unsigned long>(o, "count"); i < n; ++i) {
+            id v = deep_copy(send(o, "objectAtIndex:", i), options);
+            send<void>(a, "addObject:", v);
+            release(v);
+        }
+        return a;
+    }
+    return send(o, options == 2 && (is_kind(o, "NSString") || is_kind(o, "NSData")) ? "mutableCopy" : "copy");
+}
+static id cf_property_list_deep_copy(void*, id plist, long options) { return plist ? deep_copy(plist, options) : nullptr; }
+
+// %XX decoding; escapes of characters in `keep` stay as they are. A NULL `keep` means nothing is decoded.
+static id cf_url_unescape(void*, id str, id keep, uint32_t) {
+    if (!str) return nullptr;
+    if (!keep) return retain(send(str, "copy"));
+    std::string in = utf8(str), kept = utf8(keep), out;
+    auto hexv = [](char c) { return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1; };
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size() && hexv(in[i + 1]) >= 0 && hexv(in[i + 2]) >= 0) {
+            char c = static_cast<char>(hexv(in[i + 1]) * 16 + hexv(in[i + 2]));
+            if (kept.find(c) == std::string::npos) { out += c; i += 2; continue; }
+        }
+        out += in[i];
+    }
+    return str_new(out);
+}
+
+// CFUUIDBytes is 16 bytes returned in x0/x1
+struct UuidBytes { uint8_t b[16]; };
+static UuidBytes cf_uuid_get_bytes(id u) {
+    UuidBytes r{};
+    if (u) send<void>(u, "getUUIDBytes:", r.b);
+    return r;
+}
 
 // CFString
 static long cf_string_get_length(id s) { return static_cast<long>(u16(s).size()); }
@@ -723,6 +787,22 @@ void register_misc_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CFEqual", &cf_equal);
     r("_CFCopyDescription", &cf_copy_description);
     r("_CFGetTypeID", &cf_get_type_id);
+    r("_CFStringGetTypeID", +[]() -> long { return kTidString; });
+    r("_CFDictionaryGetTypeID", +[]() -> long { return kTidDict; });
+    r("_CFArrayGetTypeID", +[]() -> long { return kTidArray; });
+    r("_CFDataGetTypeID", +[]() -> long { return kTidData; });
+    r("_CFNumberGetTypeID", +[]() -> long { return kTidNumber; });
+    r("_CFBooleanGetTypeID", +[]() -> long { return kTidBool; });
+    r("_CFDateGetTypeID", +[]() -> long { return kTidDate; });
+    r("_CFURLGetTypeID", +[]() -> long { return kTidURL; });
+    r("_CFSetGetTypeID", +[]() -> long { return kTidSet; });
+    r("_CFNullGetTypeID", +[]() -> long { return kTidNull; });
+    r("_CFUUIDGetTypeID", +[]() -> long { return kTidUUID; });
+    r("_CFMakeCollectable", +[](id o) -> id { return o; });
+    r("_CFPropertyListCreateDeepCopy", &cf_property_list_deep_copy);
+    r("_CFURLCreateStringByReplacingPercentEscapes", &cf_url_unescape);
+    r("_CFURLCreateStringByReplacingPercentEscapesUsingEncoding", &cf_url_unescape);
+    r("_CFUUIDGetUUIDBytes", &cf_uuid_get_bytes);
     r("_CFStringGetLength", &cf_string_get_length);
     r("_CFStringGetCharacterAtIndex", &cf_string_get_char);
     r("_CFStringGetCStringPtr", &cf_string_get_cstr_ptr);

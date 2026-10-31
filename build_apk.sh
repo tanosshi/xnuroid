@@ -23,21 +23,32 @@ mkdir -p "$OUT/lib/arm64-v8a"
 
 "$CC" -c -O2 -fPIC -I"$GLUE" "$GLUE/android_native_app_glue.c" -o build/native_app_glue.o
 "$CXX" -std=c++17 -O3 -fPIC -fvisibility=hidden -c src/gfx/pvrtc.cpp -o build/pvrtc_apk.o
+# iOS ships libsqlite3; the amalgamation is built in with default visibility so guest imports bind to it
+[ build/sqlite3_apk.o -nt src/third_party/sqlite/sqlite3.c ] || "$CC" -c -O2 -fPIC -DSQLITE_THREADSAFE=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_OMIT_LOAD_EXTENSION=1 -DHAVE_USLEEP=1 src/third_party/sqlite/sqlite3.c -o build/sqlite3_apk.o
 "$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY -I"$GLUE" \
     -Isrc/loader -Isrc/objc -Isrc/gfx -Isrc/platform -Isrc/app \
     src/loader/android_loader.cpp src/loader/apple_string.cpp src/loader/trampolines.s src/gfx/gles_backend.cpp src/gfx/msl_glsl.cpp src/platform/audio_unit.cpp \
     src/platform/haptics.cpp src/loader/darwin_pthread.cpp src/platform/android_app.cpp \
-    src/app/app_runtime.cpp src/app/app_foundation.cpp src/app/app_foundation2.cpp src/app/app_plist.cpp src/app/app_uikit.cpp src/app/app_nib.cpp src/app/app_gl.cpp src/app/app_audio.cpp src/app/app_cg.cpp src/app/app_misc.cpp src/app/app_patches.cpp src/app/app_main.cpp src/app/app_msgsend.s \
-    build/native_app_glue.o build/pvrtc_apk.o \
+    src/app/app_runtime.cpp src/app/app_foundation.cpp src/app/app_foundation2.cpp src/app/app_plist.cpp src/app/app_uikit.cpp src/app/app_nib.cpp src/app/app_gl.cpp src/app/app_audio.cpp src/app/app_cg.cpp src/app/app_misc.cpp src/app/app_patches.cpp src/app/app_darwin.cpp src/app/app_crypto.cpp src/app/app_av.cpp src/app/app_main.cpp src/app/app_msgsend.s \
+    build/native_app_glue.o build/pvrtc_apk.o build/sqlite3_apk.o \
     -u ANativeActivity_onCreate -static-libstdc++ -landroid -llog -lEGL -lGLESv3 -lz -laaudio -ldl -ljnigraphics \
     -o "$OUT/lib/arm64-v8a/libxnuroid.so"
 
 # The app's linker namespace cannot load /system/lib64/libc++.so; ship the phone's own copy under another name.
-if [ ! -f build/libsysc++.so ]; then
+# Pulled again when a different phone (build fingerprint) is connected; kept when none is.
+FINGERPRINT=$("$ADB" shell getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
+if [ ! -f build/libsysc++.so ] || { [ -n "$FINGERPRINT" ] && [ "$FINGERPRINT" != "$(cat build/libsysc++.device 2>/dev/null)" ]; }; then
     "$ADB" pull /system/lib64/libc++.so build/libsysc++.so >/dev/null ||
         { echo "connect the arm64 device once so build/libsysc++.so can be pulled" >&2; exit 1; }
+    echo "$FINGERPRINT" > build/libsysc++.device
 fi
 cp build/libsysc++.so "$OUT/lib/arm64-v8a/libsysc++.so"
+
+# The activity (android/java): NativeActivity plus activity results, for the system document picker.
+rm -rf build/classes build/dex
+mkdir -p build/classes build/dex
+"${JAVAC:-javac}" --release 11 -nowarn -classpath "$PLATFORM" -d build/classes android/java/com/xnuroid/HostActivity.java
+"$BT/d8.bat" --min-api 31 --lib "$PLATFORM" --output build/dex $(find build/classes -name '*.class')
 
 # Package id, label and launcher icon come from the configured game's Info.plist (tools/game_config.py).
 rm -rf build/res build/res.zip build/static_res.zip
@@ -48,17 +59,18 @@ PKG=$(python -I tools/apk_branding.py build/res android/AndroidManifest.xml buil
     --min-sdk-version 31 --target-sdk-version 33 build/res.zip build/static_res.zip
 # Native libraries, plus the game bundle as assets/game/<path> with its file list (game.files) and a stamp of
 # names, sizes and mtimes (game.stamp) that tells the app when to copy it out again.
-python -I - build/base.apk "$OUT" <<'EOF'
+python -I - build/base.apk "$OUT" build/dex/classes.dex <<'EOF'
 import hashlib, os, sys, zipfile
 sys.path.insert(0, "tools")
 import game_config
-apk, root = sys.argv[1], sys.argv[2]
+apk, root, dex = sys.argv[1], sys.argv[2], sys.argv[3]
 STORED = {".png", ".jpg", ".jpeg", ".mp3", ".m4a", ".aac", ".ogg", ".mp4", ".zip"}
 with zipfile.ZipFile(apk, "a", zipfile.ZIP_DEFLATED) as z:
     for d, _, files in os.walk(os.path.join(root, "lib")):
         for f in files:
             p = os.path.join(d, f)
             z.write(p, os.path.relpath(p, root).replace(os.sep, "/"))
+    z.write(dex, "classes.dex")
     try:
         bundle = game_config.app_bundle_dir()
     except RuntimeError:
@@ -96,5 +108,5 @@ if [ "${1:-}" = "install" ]; then
     if [ ! -f "$OUT/game.stamp" ] && ! "$ADB" shell "run-as $PKG test -f files/game/Info.plist"; then
         "$ADB" shell "cd /data/local/tmp/game && tar -chf - . | run-as $PKG sh -c 'mkdir -p files/game && tar -C files/game -xf -'" || true
     fi
-    "$ADB" shell "rm -f /sdcard/Android/data/$PKG/files/exit.txt; am start -S -n $PKG/android.app.NativeActivity"
+    "$ADB" shell "rm -f /sdcard/Android/data/$PKG/files/exit.txt; am start -S -n $PKG/com.xnuroid.HostActivity"
 fi

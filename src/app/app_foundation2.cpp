@@ -192,9 +192,15 @@ std::string bundle_dir() {
     }
     return g_bundle_dir;
 }
+static std::string g_documents_dir;   // Documents moved elsewhere (shared storage); empty = inside the sandbox
+void set_documents_dir(const std::string& dir) { g_documents_dir = dir; }
 std::string sandbox_dir(const char* sub) {
     static const std::string root = getenv("LOADER_SANDBOX_DIR") ? getenv("LOADER_SANDBOX_DIR") : "/data/local/tmp/sandbox";
     std::string p = root;
+    if (!g_documents_dir.empty() && sub && std::strncmp(sub, "Documents", 9) == 0 && (sub[9] == 0 || sub[9] == '/')) {
+        p = g_documents_dir;
+        sub = sub[9] ? sub + 10 : nullptr;
+    }
     mkdir(p.c_str(), 0755);
     for (const char* s = sub; s && *s;) {
         const char* slash = strchr(s, '/');
@@ -522,16 +528,53 @@ static id box_scalar(const void* p, char t) {
         default: return nullptr;
     }
 }
-static const char* method_return_type(id o, SEL s) {
-    (void)o; (void)s;
-    return nullptr;
+// The type character of a method's return value (arg < 0) or of its explicit argument `arg`, from its type encoding
+// ("d16@0:8", "v24@0:8d16"); '@' when unknown. Accessors of scalar properties take and return their value in the
+// registers of its type, so KVC has to box and unbox by it, as Foundation does.
+extern "C" const char* app_method_types(Class c, SEL s);   // app_runtime.cpp
+static const char* enc_skip(const char* p) {   // past one type and its frame offset
+    while (*p && strchr("rnNoORV", *p)) ++p;
+    if (*p == '^') return enc_skip(p + 1);
+    if (*p == '@' && p[1] == '?') p += 2;
+    else if (*p == '{' || *p == '(' || *p == '[') {
+        int depth = 0;
+        do {
+            if (*p == '{' || *p == '(' || *p == '[') ++depth;
+            else if (*p == '}' || *p == ')' || *p == ']') --depth;
+            ++p;
+        } while (*p && depth > 0);
+    } else if (*p) {
+        ++p;
+    }
+    while (*p >= '0' && *p <= '9') ++p;
+    return p;
+}
+static char method_type(id o, SEL s, int arg) {
+    const char* p = app_method_types(class_of(o), s);
+    if (!p) return '@';
+    if (arg >= 0)
+        for (int i = 0; i < arg + 3 && *p; ++i) p = enc_skip(p);   // return value, self, _cmd, earlier arguments
+    while (*p && strchr("rnNoORV", *p)) ++p;
+    return *p ? *p : '@';
 }
 static id kvc_get(id self, const std::string& key) {
     if (key.empty()) return nullptr;
     SEL g = sel(key.c_str());
     if (responds(self, g)) {
-        // without type information assume an object getter
-        return send(self, g);
+        switch (method_type(self, g, -1)) {
+            case 'c': return num_i(send<signed char>(self, g));
+            case 'B': return num_b(send<bool>(self, g));
+            case 'C': return num_i(send<unsigned char>(self, g));
+            case 's': return num_i(send<short>(self, g));
+            case 'S': return num_i(send<unsigned short>(self, g));
+            case 'i': return num_i(send<int>(self, g));
+            case 'I': return num_i(send<unsigned>(self, g));
+            case 'l': case 'q': return num_i(send<long long>(self, g));
+            case 'L': case 'Q': return num_u(send<unsigned long long>(self, g));
+            case 'f': return num_f(send<float>(self, g));
+            case 'd': return num_d(send<double>(self, g));
+            default: return send(self, g);
+        }
     }
     SEL is = sel(("is" + cap_first(key)).c_str());
     if (responds(self, is)) return num_b(send<bool>(self, is));
@@ -545,12 +588,23 @@ static id kvc_get(id self, const std::string& key) {
         if (type && type[0] == '@') return *static_cast<id const*>(p);
         return type ? box_scalar(p, type[0]) : nullptr;
     }
-    (void)method_return_type;
     return send(self, "valueForUndefinedKey:", str(key));
 }
 static void kvc_set(id self, const std::string& key, id v) {
     SEL s = sel(("set" + cap_first(key) + ":").c_str());
-    if (responds(self, s)) { send<void>(self, s, v); return; }
+    if (responds(self, s)) {
+        switch (method_type(self, s, 0)) {
+            case 'c': case 'C': send<void>(self, s, static_cast<signed char>(num_ival(v))); break;
+            case 'B': send<void>(self, s, num_ival(v) != 0); break;
+            case 's': case 'S': send<void>(self, s, static_cast<short>(num_ival(v))); break;
+            case 'i': case 'I': send<void>(self, s, static_cast<int>(num_ival(v))); break;
+            case 'l': case 'q': case 'L': case 'Q': send<void>(self, s, static_cast<long long>(num_ival(v))); break;
+            case 'f': send<void>(self, s, static_cast<float>(num_dval(v))); break;
+            case 'd': send<void>(self, s, num_dval(v)); break;
+            default: send<void>(self, s, v); break;
+        }
+        return;
+    }
     for (std::string n : {"_" + key, key}) {
         void* iv = app_class_get_instance_variable(class_of(self), n.c_str());
         if (!iv) continue;
@@ -627,14 +681,15 @@ static id note_new(id name, id object, id info) {
     return autorelease(n);
 }
 static void nc_remove(id observer, id name, id object, bool all) {
-    std::vector<id> blocks;
+    // released after unlocking: a release can deallocate, and every dealloc runs nc_dealloc_hook, which locks g_nc_mu
+    std::vector<id> blocks, names;
     {
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observers) return;
         auto& v = *g_observers;
         for (auto it = v.begin(); it != v.end();) {
             if (it->observer == observer && (all || ((!name || obj_equal(it->name, name)) && (!object || it->object == object)))) {
-                release(it->name);
+                names.push_back(it->name);
                 if (it->block) blocks.push_back(it->block);
                 it = v.erase(it);
             } else {
@@ -645,6 +700,7 @@ static void nc_remove(id observer, id name, id object, bool all) {
         for (auto& o : v) if (o.observer == observer) { still = true; break; }
         if (!still && g_observer_set) g_observer_set->erase(observer);
     }
+    for (id n : names) release(n);
     for (id b : blocks) block_release(b);
 }
 static void nc_dealloc_hook(id o) {
@@ -1284,6 +1340,9 @@ static void init_files() {
     declare_protocol(U, "NSCopying");
     defc(U, "fileURLWithPath:", +[](id, SEL, id p) -> id { return p ? url_make(utf8(p), true) : nullptr; });
     defc(U, "fileURLWithPath:isDirectory:", +[](id, SEL, id p, bool) -> id { return p ? url_make(utf8(p), true) : nullptr; });
+    // picked documents are plain paths here: there is no security scope to enter or leave
+    def(U, "startAccessingSecurityScopedResource", +[](id, SEL) -> bool { return true; });
+    def(U, "stopAccessingSecurityScopedResource", +[](id, SEL) {});
     defc(U, "URLWithString:", +[](id, SEL, id s) -> id {
         if (!s) return nullptr;
         std::string v = utf8(s);

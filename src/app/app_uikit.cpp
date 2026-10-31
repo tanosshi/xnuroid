@@ -11,6 +11,8 @@
 #include <map>
 
 extern "C" ANativeWindow* host_window() __attribute__((weak));
+// the system document picker (android_app.cpp); absent in the command-line host
+extern "C" int host_pick_documents(int folder, int multiple, void (*cb)(void* ctx, const char* const* paths, int count), void* ctx) __attribute__((weak));
 
 namespace app {
 
@@ -427,6 +429,9 @@ static double link_period(LinkExt* e) {
     return std::max<long>(1, e->interval) / 60.0;
 }
 static std::atomic<bool> g_suspended{false};   // app in the background: display links stop, like iOS suspension
+// System UI the host shows over the app (the document picker). Presenting it on iOS leaves the app active, so the
+// Android pause it causes is not reported to the app as resigning / entering the background.
+static std::atomic<int> g_host_modal{0};
 static void link_fire(id link) {
     auto* e = ext_get<LinkExt>(link);
     if (!e->valid || e->paused || g_suspended) return;
@@ -639,13 +644,16 @@ void audio_set_paused(bool paused);                                   // app_aud
 extern "C" void host_audio_units_pause(int paused) __attribute__((weak));   // audio_unit.cpp
 
 extern "C" void app_host_lifecycle(int active) {
+    if (g_host_modal.load() > 0) return;
     // focus and pause/resume both report the same transition; act once per change
     static std::atomic<int> last{-1};
     if (last.exchange(active) == active) return;
-    // act on audio and rendering immediately (the main loop may be busy); the delegate callbacks are queued
-    g_suspended = !active;
+    // audio pauses at once. Display links keep running until the app has handled resigning (iOS suspends an app only
+    // after -applicationWillResignActive: returns; apps that drain their render queue there depend on frames still
+    // coming), and resume before it hears that it is active again.
     audio_set_paused(!active);
     if (host_audio_units_pause) host_audio_units_pause(!active);
+    if (active) g_suspended = false;
     post_main([active] {
         id d = send(g_app, "delegate");
         if (!active) {
@@ -654,6 +662,7 @@ extern "C" void app_host_lifecycle(int active) {
             if (responds(d, sel("applicationDidEnterBackground:"))) send<void>(d, "applicationDidEnterBackground:", g_app);
             post_note("UIApplicationDidEnterBackgroundNotification", g_app, nullptr);
             defaults_flush();
+            if (last.load() == 0) g_suspended = true;   // unless it already came back meanwhile
         } else {
             if (responds(d, sel("applicationWillEnterForeground:"))) send<void>(d, "applicationWillEnterForeground:", g_app);
             post_note("UIApplicationWillEnterForegroundNotification", g_app, nullptr);
@@ -1218,9 +1227,25 @@ static void define_controls() {
     def(SH, "setShadowOffset:", +[](id, SEL, CGSize) {});
     Class AT = def_class("NSAttributedString", "NSObject");
     def_class("NSMutableAttributedString", "NSAttributedString");
-    struct AttrExt : Ext { id s = nullptr; ~AttrExt() override { release(s); } };
+    // one run: the string and a single attribute dictionary covering all of it
+    struct AttrExt : Ext { id s = nullptr, attrs = nullptr; ~AttrExt() override { release(s); release(attrs); } };
     def(AT, "initWithString:", +[](id self, SEL, id s) -> id { ext_get<AttrExt>(self)->s = send(s, "copy"); return self; });
-    def(AT, "initWithString:attributes:", +[](id self, SEL, id s, id) -> id { ext_get<AttrExt>(self)->s = send(s, "copy"); return self; });
+    def(AT, "initWithString:attributes:", +[](id self, SEL, id s, id a) -> id {
+        auto* e = ext_get<AttrExt>(self);
+        e->s = send(s, "copy");
+        e->attrs = send(a, "copy");
+        return self;
+    });
+    def(AT, "attributesAtIndex:effectiveRange:", +[](id self, SEL, NSUInteger, NSRange* r) -> id {
+        auto* e = ext_get<AttrExt>(self);
+        if (r) *r = {0, u16(e->s).size()};
+        return e->attrs;
+    });
+    def(AT, "attribute:atIndex:effectiveRange:", +[](id self, SEL, id name, NSUInteger, NSRange* r) -> id {
+        auto* e = ext_get<AttrExt>(self);
+        if (r) *r = {0, u16(e->s).size()};
+        return e->attrs ? dict_get(e->attrs, name) : nullptr;
+    });
     def(AT, "string", +[](id self, SEL) -> id { return ext_get<AttrExt>(self)->s; });
     def(AT, "length", +[](id self, SEL) -> NSUInteger { return u16(ext_get<AttrExt>(self)->s).size(); });
     def(AT, "addAttribute:value:range:", +[](id, SEL, id, id, NSRange) {});
@@ -1228,6 +1253,73 @@ static void define_controls() {
     def(AT, "setAttributes:range:", +[](id, SEL, id, NSRange) {});
     def(AT, "boundingRectWithSize:options:context:", +[](id self, SEL, CGSize max, NSUInteger, id) -> CGRect { return {{0, 0}, text_size(ext_get<AttrExt>(self)->s, nullptr, max.width)}; });
     def(AT, "size", +[](id self, SEL) -> CGSize { return text_size(ext_get<AttrExt>(self)->s, nullptr, 0); });
+}
+
+// UIDocumentPickerViewController: presenting it opens the system picker; the delegate gets file URLs for what was
+// chosen (documentPicker:didPickDocumentsAtURLs:) or documentPickerWasCancelled:.
+struct PickerState { id delegate = nullptr; bool folder = false, multiple = false; };   // delegate is weak
+static std::mutex g_picker_mu;
+static std::unordered_map<id, PickerState> g_pickers;
+static PickerState& picker(id p) { std::lock_guard<std::mutex> l(g_picker_mu); return g_pickers[p]; }
+
+static void picker_finish(id self, std::vector<std::string> paths) {
+    id d = picker(self).delegate;
+    if (paths.empty()) {
+        if (d && responds(d, sel("documentPickerWasCancelled:"))) send<void>(d, "documentPickerWasCancelled:", self);
+    } else {
+        id urls = send(send_cls(class_named("NSMutableArray"), "alloc"), "init");
+        for (auto& p : paths) send<void>(urls, "addObject:", send_cls(class_named("NSURL"), "fileURLWithPath:", str(p)));
+        if (d && responds(d, sel("documentPicker:didPickDocumentsAtURLs:"))) send<void>(d, "documentPicker:didPickDocumentsAtURLs:", self, urls);
+        else if (d && responds(d, sel("documentPicker:didPickDocumentAtURL:"))) send<void>(d, "documentPicker:didPickDocumentAtURL:", self, send(urls, "firstObject"));
+        release(urls);
+    }
+    { std::lock_guard<std::mutex> l(g_picker_mu); g_pickers.erase(self); }
+    --g_host_modal;
+    release(self);
+}
+
+static void define_document_picker() {
+    Class P = def_class("UIDocumentPickerViewController", "UIViewController");
+    // a folder picker when every requested type is a folder (kUTTypeFolder / UTTypeFolder)
+    auto init_types = +[](id self, SEL, id types, long) -> id {
+        self = send(self, "initWithNibName:bundle:", static_cast<id>(nullptr), static_cast<id>(nullptr));
+        NSUInteger n = send<NSUInteger>(types, "count");
+        bool folder = n > 0;
+        for (NSUInteger i = 0; i < n; ++i) {
+            id t = send(types, "objectAtIndex:", i);
+            std::string s = is_string(t) ? utf8(t) : utf8(send(t, "identifier"));
+            if (s != "public.folder" && s != "public.directory") folder = false;
+        }
+        picker(self).folder = folder;
+        return self;
+    };
+    def(P, "initWithDocumentTypes:inMode:", init_types);
+    def(P, "initForOpeningContentTypes:", +[](id self, SEL, id types) -> id {
+        return reinterpret_cast<id (*)(id, SEL, id, long)>(lookup(self, sel("initWithDocumentTypes:inMode:")))(self, nullptr, types, 0);
+    });
+    def(P, "initForOpeningContentTypes:asCopy:", +[](id self, SEL, id types, bool) -> id {
+        return reinterpret_cast<id (*)(id, SEL, id, long)>(lookup(self, sel("initWithDocumentTypes:inMode:")))(self, nullptr, types, 0);
+    });
+    def(P, "delegate", +[](id self, SEL) -> id { return picker(self).delegate; });
+    def(P, "setDelegate:", +[](id self, SEL, id d) { picker(self).delegate = d; });
+    def(P, "allowsMultipleSelection", +[](id self, SEL) -> bool { return picker(self).multiple; });
+    def(P, "setAllowsMultipleSelection:", +[](id self, SEL, bool b) { picker(self).multiple = b; });
+    def(P, "setDirectoryURL:", +[](id, SEL, id) {});
+    def(P, "setShouldShowFileExtensions:", +[](id, SEL, bool) {});
+    def(P, "_hostPresent", +[](id self, SEL) {
+        retain(self);   // until the delegate has been told
+        ++g_host_modal;
+        PickerState st = picker(self);
+        auto done = [](void* ctx, const char* const* paths, int count) {
+            std::vector<std::string> v(paths, paths + count);
+            id me = static_cast<id>(ctx);
+            post_main([me, v] { picker_finish(me, v); });
+        };
+        if (!host_pick_documents || !host_pick_documents(st.folder, st.multiple, done, self)) {
+            log("UIDocumentPickerViewController: no system picker, reporting a cancel");
+            post_main([self] { picker_finish(self, {}); });
+        }
+    });
 }
 
 static void define_window_vc_app() {
@@ -1327,6 +1419,12 @@ static void define_window_vc_app() {
     def(VC, "modalPresentationStyle", +[](id, SEL) -> long { return 0; });
     auto present = +[](id self, SEL, id vc, bool, id completion) {
         if (!vc) return;
+        // controllers the host shows itself (the system document picker) instead of a view in our window
+        if (responds(vc, sel("_hostPresent"))) {
+            send<void>(vc, "_hostPresent");
+            if (completion) reinterpret_cast<void (*)(id)>(block_invoke_ptr(completion))(completion);
+            return;
+        }
         auto* e = cx(self);
         id old = e->presented;
         e->presented = retain(vc);
@@ -1343,6 +1441,7 @@ static void define_window_vc_app() {
         if (completion) reinterpret_cast<void (*)(id)>(block_invoke_ptr(completion))(completion);
     };
     def(VC, "presentViewController:animated:completion:", present);
+    define_document_picker();
     def(VC, "presentModalViewController:animated:", +[](id self, SEL, id vc, bool a) {
         reinterpret_cast<void (*)(id, SEL, id, bool, id)>(lookup(self, sel("presentViewController:animated:completion:")))(self, nullptr, vc, a, nullptr);
     });
@@ -1516,9 +1615,10 @@ static void define_screen_device() {
     defc(S, "screens", +[](id, SEL) -> id { return arr({main}); });
     def(S, "bounds", +[](id, SEL) -> CGRect { const Screen& s = screen(); return {{0, 0}, {s.w_pt, s.h_pt}}; });
     def(S, "applicationFrame", +[](id, SEL) -> CGRect { const Screen& s = screen(); return {{0, 0}, {s.w_pt, s.h_pt}}; });
-    def(S, "nativeBounds", +[](id, SEL) -> CGRect { const Screen& s = screen(); return {{0, 0}, {std::min(s.w_pt, s.h_pt) * s.scale, std::max(s.w_pt, s.h_pt) * s.scale}}; });
+    // native* describe the real pixels the guest screen occupies on the surface (apps size their backbuffers from them)
+    def(S, "nativeBounds", +[](id, SEL) -> CGRect { const Screen& s = screen(); return {{0, 0}, {std::min(s.content_w, s.content_h), std::max(s.content_w, s.content_h)}}; });
     def(S, "scale", +[](id, SEL) -> double { return screen().scale; });
-    def(S, "nativeScale", +[](id, SEL) -> double { return screen().scale; });
+    def(S, "nativeScale", +[](id, SEL) -> double { const Screen& s = screen(); return s.w_pt > 0 ? s.content_w / s.w_pt : s.scale; });
     def(S, "brightness", +[](id, SEL) -> double { return 0.8; });
     def(S, "setBrightness:", +[](id, SEL, double) {});
     def(S, "maximumFramesPerSecond", +[](id, SEL) -> long { return 60; });
@@ -1539,7 +1639,7 @@ static void define_screen_device() {
     Class D = def_class("UIDevice", "NSObject");
     static id dev = alloc(D);
     defc(D, "currentDevice", +[](id, SEL) -> id { return dev; });
-    def(D, "systemVersion", +[](id, SEL) -> id { const char* v = getenv("LOADER_APP_IOS_VERSION"); return str(v ? v : "8.4"); });
+    def(D, "systemVersion", +[](id, SEL) -> id { return str(ios_version()); });
     def(D, "systemName", +[](id, SEL) -> id { return str("iPhone OS"); });
     def(D, "model", +[](id, SEL) -> id { return str(screen().pad ? "iPad" : "iPhone"); });
     def(D, "localizedModel", +[](id, SEL) -> id { return str(screen().pad ? "iPad" : "iPhone"); });

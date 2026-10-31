@@ -237,7 +237,7 @@ class Adb:
 
     def launch(self, serial: str, package: str) -> str:
         return self.shell(serial, f"rm -f /sdcard/Android/data/{package}/files/exit.txt; "
-                                  f"am start -S -n {package}/android.app.NativeActivity")
+                                  f"am start -S -n {package}/com.xnuroid.HostActivity")
 
     def stop(self, serial: str, package: str) -> None:
         self.shell(serial, f"am force-stop {package}")

@@ -15,7 +15,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <unordered_map>
 
 #include "pvrtc.hpp"
 
@@ -60,6 +65,8 @@ struct CtxState {
     bool scissor = false;
     GLint scissor_box[4] = {0, 0, 0, 0};
     GLint viewport[4] = {0, 0, 0, 0};
+    pid_t tid = 0;          // thread the EGL context is bound on (0: none); under g_egl_mu
+    bool tid_main = false;
 };
 thread_local CtxState* t_ctx = nullptr;
 thread_local id t_current = nullptr;
@@ -108,6 +115,9 @@ GLF(void, glFinish, ())
 GLF(void, glDrawArrays, (GLenum, GLint, GLsizei))
 GLF(void, glDrawElements, (GLenum, GLsizei, GLenum, const void*))
 GLF(GLenum, glGetError, ())
+GLF(void, glGenFramebuffers, (GLsizei, GLuint*))
+GLF(void, glGenRenderbuffers, (GLsizei, GLuint*))
+GLF(const unsigned char*, glGetString, (GLenum))
 static std::atomic<uint64_t> g_draw_calls{0}, g_gl_errors{0}, g_tex_uploads{0};
 static void w_glDrawArrays(GLenum m, GLint f, GLsizei c) { g_draw_calls.fetch_add(1); real_glDrawArrays(m, f, c); }
 static void w_glDrawElements(GLenum m, GLsizei c, GLenum t, const void* i) { g_draw_calls.fetch_add(1); real_glDrawElements(m, c, t, i); }
@@ -119,7 +129,8 @@ void load_all() {
     load_glDeleteRenderbuffersOES(); load_glDeleteRenderbuffers(); load_glRenderbufferStorageOES(); load_glRenderbufferStorage();
     load_glViewport(); load_glScissor(); load_glEnable(); load_glDisable(); load_glClear(); load_glClearColor(); load_glGetIntegerv();
     load_glTexImage2D(); load_glTexSubImage2D(); load_glCompressedTexImage2D(); load_glReadPixels(); load_glIsEnabled(); load_glFinish();
-    load_glDrawArrays(); load_glDrawElements(); load_glGetError();
+    load_glDrawArrays(); load_glDrawElements(); load_glGetError(); load_glGenFramebuffers(); load_glGenRenderbuffers();
+    load_glGetString();
 }
 
 bool content_rect(int& x, int& y, int& w, int& h) {
@@ -191,10 +202,19 @@ void ensure_window_surface() {
 // Reconcile the EGL window surface with the host's current ANativeWindow. On background (or screen off) the host
 // drops the window (host_window() -> null); on return it hands back a new one. The guest's context stays current
 // throughout, on a 1x1 pbuffer while there is no window, so GL calls made meanwhile are not lost and the context
-// is rebound to the new surface. Returns false while there is no window (caller should skip the frame). Main
-// thread only.
+// is rebound to the new surface. Returns false while there is no window (caller should skip the frame). Done by the
+// thread the window surface belongs to: the main thread, or a render thread it was handed to (which keeps it while
+// parked).
+EGLSurface thread_pbuffer();
+extern pid_t g_win_tid;
 bool refresh_window_surface() {
-    if (!on_main_thread() || !host_window) return g_win != EGL_NO_SURFACE;   // command-line host: offscreen for good
+    if (!host_window) return g_win != EGL_NO_SURFACE;   // command-line host: offscreen for good
+    bool owner;
+    {
+        std::lock_guard<std::mutex> l(g_egl_mu);
+        owner = g_win_tid == gettid() || (g_win_tid == 0 && on_main_thread());
+    }
+    if (!owner) return g_win != EGL_NO_SURFACE;
     const unsigned gen = window_generation();
     ANativeWindow* cur = host_window();
     if (g_win != EGL_NO_SURFACE && !g_win_is_pbuffer && gen == g_win_gen && cur == g_win_native) return true;   // unchanged
@@ -205,7 +225,8 @@ bool refresh_window_surface() {
         const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
         g_park = eglCreatePbufferSurface(g_dpy, g_cfg, pb);
     }
-    if (ctx != EGL_NO_CONTEXT && !eglMakeCurrent(g_dpy, g_park, g_park, ctx)) log("park: eglMakeCurrent failed 0x%x", eglGetError());
+    EGLSurface park = on_main_thread() ? g_park : thread_pbuffer();
+    if (ctx != EGL_NO_CONTEXT && !eglMakeCurrent(g_dpy, park, park, ctx)) log("park: eglMakeCurrent failed 0x%x", eglGetError());
     if (g_win != EGL_NO_SURFACE) eglDestroySurface(g_dpy, g_win);
     g_win = EGL_NO_SURFACE;
     g_win_native = cur;
@@ -224,13 +245,52 @@ bool refresh_window_surface() {
     return true;
 }
 
-EGLSurface thread_surface() {
-    if (on_main_thread()) { ensure_window_surface(); return g_win; }
+EGLSurface thread_pbuffer() {
     if (t_pbuffer == EGL_NO_SURFACE) {
         const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
         t_pbuffer = eglCreatePbufferSurface(g_dpy, g_cfg, pb);
     }
     return t_pbuffer;
+}
+
+// The window surface can be bound on one thread at a time. The main thread gets it by default; another thread gets it
+// for a context that owns the drawable (the game's render thread), once no other thread holds it.
+pid_t g_win_tid = 0;   // under g_egl_mu
+EGLSurface surface_for(const CtxState& st) {
+    const bool main = on_main_thread();
+    if (main) ensure_window_surface();
+    std::lock_guard<std::mutex> l(g_egl_mu);
+    const bool win_free = g_win != EGL_NO_SURFACE && (g_win_tid == 0 || g_win_tid == gettid());
+    if (win_free && (main || !st.drawable_rbs.empty())) return g_win;
+    return thread_pbuffer();
+}
+
+// iOS lets one EAGLContext be current on several threads at once; EGL binds a context to a single thread. A game that
+// creates its context on the main thread and then renders on its own thread (Unreal's game/render threads) would get
+// EGL_BAD_ACCESS there, so the main thread lets go of the context and the window surface from its run loop. To the
+// main thread the context stays "current" ([EAGLContext currentContext]), as on iOS.
+bool take_from_main(CtxState* st) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    post_main([st, done] {
+        if (t_ctx == st) {
+            eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            t_ctx = nullptr;
+            log("main thread hands its GL context over to thread %d", static_cast<int>(gettid()));
+        }
+        std::lock_guard<std::mutex> l(g_egl_mu);
+        if (st->tid == gettid()) st->tid = 0;
+        if (g_win_tid == gettid()) g_win_tid = 0;
+        *done = true;
+    });
+    for (int i = 0; i < 600 && !*done; ++i) usleep(5000);   // the main thread may be busy; give up after 3 s
+    return *done;
+}
+
+// this thread no longer has a context bound
+void note_unbound() {
+    std::lock_guard<std::mutex> l(g_egl_mu);
+    if (t_ctx && t_ctx->tid == gettid()) t_ctx->tid = 0;
+    if (g_win_tid == gettid()) g_win_tid = 0;
 }
 
 Class C_EAGLContext, C_EAGLSharegroup;
@@ -264,18 +324,46 @@ id make_context(id self, int api, id sharegroup) {
 
 bool set_current(id ctx) {
     if (!egl_init()) return false;
-    if (ctx == t_current) return true;
+    if (ctx == t_current && (t_ctx || !ctx)) return true;
     if (!ctx) {
         eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        note_unbound();
         release(t_current);
         t_current = nullptr;
         t_ctx = nullptr;
         return true;
     }
     auto* e = ext_get<EaglExt>(ctx);
-    EGLSurface s = thread_surface();
-    if (!eglMakeCurrent(g_dpy, s, s, e->st.egl)) { log("eglMakeCurrent failed: 0x%x", eglGetError()); return false; }
-    if (on_main_thread()) eglSwapInterval(g_dpy, 1);
+    EGLSurface s = surface_for(e->st);
+    bool ok = eglMakeCurrent(g_dpy, s, s, e->st.egl);
+    EGLint err = ok ? EGL_SUCCESS : eglGetError();
+    if (!ok && err == EGL_BAD_ACCESS && !on_main_thread()) {
+        bool main_has_it;
+        { std::lock_guard<std::mutex> l(g_egl_mu); main_has_it = (e->st.tid && e->st.tid_main) || g_win_tid != 0; }
+        if (main_has_it && take_from_main(&e->st)) {
+            s = surface_for(e->st);
+            ok = eglMakeCurrent(g_dpy, s, s, e->st.egl);
+            err = ok ? EGL_SUCCESS : eglGetError();
+        }
+    }
+    if (!ok) {
+        if (err == EGL_BAD_ACCESS) log("eglMakeCurrent: the context is current on thread %d, which keeps it", static_cast<int>(e->st.tid));
+        else log("eglMakeCurrent failed: 0x%x", err);
+        if (on_main_thread() && t_current == nullptr) {   // iOS semantics: the main thread may name it current anyway
+            retain(ctx);
+            t_current = ctx;
+            return true;
+        }
+        return false;
+    }
+    if (t_ctx && t_ctx != &e->st) note_unbound();
+    {
+        std::lock_guard<std::mutex> l(g_egl_mu);
+        e->st.tid = gettid();
+        e->st.tid_main = on_main_thread();
+        if (s == g_win) g_win_tid = gettid();
+    }
+    if (s == g_win) eglSwapInterval(g_dpy, 1);
     retain(ctx);
     release(t_current);
     t_current = ctx;
@@ -479,6 +567,40 @@ static void w_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLe
     real_glReadPixels(x, y, w, h, f, t, p);
 }
 
+// GL_EXTENSIONS as an iOS GPU would list them. iOS games ship textures only in formats iOS GPUs read (PVRTC, plus
+// uncompressed) and pick their texture path from this string; seeing ATC/S3TC/3Dc and no PVRTC sends them down paths
+// never exercised on iOS. So compressed formats iOS never had are left out, and PVRTC (decoded on upload) and BGRA
+// (swizzled on upload) are added.
+static const unsigned char* w_glGetString(GLenum name) {
+    const unsigned char* real = real_glGetString ? real_glGetString(name) : nullptr;
+    if (name != 0x1F03 || !real) return real;   // GL_EXTENSIONS
+    static std::mutex mu;
+    static std::string ios;
+    std::lock_guard<std::mutex> l(mu);
+    if (ios.empty()) {
+        static const char* const drop[] = {"_compressed_ATC_texture", "_texture_compression_atitc", "_texture_compression_s3tc",
+                                           "_texture_compression_dxt", "_texture_compression_3dc", "_texture_compression_latc",
+                                           "_texture_compression_rgtc", "_compressed_3DC_texture",
+                                           "_compressed_ETC1_RGB8_texture"};
+        std::string all = reinterpret_cast<const char*>(real);
+        size_t pos = 0;
+        while (pos < all.size()) {
+            size_t end = all.find(' ', pos);
+            if (end == std::string::npos) end = all.size();
+            std::string ext = all.substr(pos, end - pos);
+            pos = end + 1;
+            if (ext.empty()) continue;
+            bool skip = false;
+            for (const char* d : drop) skip = skip || ext.find(d) != std::string::npos;
+            if (!skip) ios += ext + " ";
+        }
+        for (const char* add : {"GL_IMG_texture_compression_pvrtc", "GL_APPLE_texture_format_BGRA8888", "GL_EXT_texture_format_BGRA8888"})
+            if (ios.find(std::string(add) + " ") == std::string::npos) ios += std::string(add) + " ";
+        log("GL_EXTENSIONS reported iOS-style (%zu of %zu bytes)", ios.size(), all.size());
+    }
+    return reinterpret_cast<const unsigned char*>(ios.c_str());
+}
+
 static void swizzle_bgra(std::vector<uint8_t>& v, const void* src, size_t n) {
     v.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + n);
     for (size_t i = 0; i + 3 < n; i += 4) std::swap(v[i], v[i + 2]);
@@ -549,6 +671,7 @@ void* gl_resolve(const char* name) {
         {"glDrawArrays", reinterpret_cast<void*>(&w_glDrawArrays)},
         {"glDrawElements", reinterpret_cast<void*>(&w_glDrawElements)},
         {"glTexImage2D", reinterpret_cast<void*>(&w_glTexImage2D)},
+        {"glGetString", reinterpret_cast<void*>(&w_glGetString)},
         {"glTexSubImage2D", reinterpret_cast<void*>(&w_glTexSubImage2D)},
         {"glCompressedTexImage2D", reinterpret_cast<void*>(&w_glCompressedTexImage2D)},
         {"glDiscardFramebufferEXT", reinterpret_cast<void*>(&w_glDiscardFramebufferEXT)},
@@ -571,6 +694,190 @@ void* gl_resolve(const char* name) {
 // ---------------------------------------------------------------------------------------------------------------
 // EAGLContext
 // ---------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------
+// GLKit: a GLKView draws into its own drawable framebuffer (the window surface, as with a CAEAGLLayer) around its
+// delegate's -glkView:drawInRect:, and a GLKViewController drives the view's -display from a display link.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+
+struct GlkView {
+    id context = nullptr, delegate = nullptr;   // delegate is weak
+    long color = 0, depth = 0, stencil = 0, multisample = 0;
+    GLuint fbo = 0, rb = 0;
+    bool set_needs_display = true, display_pending = false;
+};
+struct GlkController {
+    id link = nullptr, delegate = nullptr;      // delegate is weak
+    long fps = 30, frames = 0;
+    bool paused = false, pause_on_resign = true, resume_on_active = true;
+    double first = 0, last_resume = 0, last_update = 0, last_draw = 0;
+};
+// Element references stay valid as the maps grow; only the dealloc hook erases (under the lock).
+std::mutex g_glk_mu;
+std::unordered_map<id, GlkView>* g_glk_views;
+std::unordered_map<id, GlkController>* g_glk_vcs;
+Class C_GLKView, C_GLKViewController;
+
+GlkView& glkv(id v) { std::lock_guard<std::mutex> l(g_glk_mu); return (*g_glk_views)[v]; }
+GlkController& glkc(id vc) { std::lock_guard<std::mutex> l(g_glk_mu); return (*g_glk_vcs)[vc]; }
+
+void glk_bind(id self) {
+    GlkView& v = glkv(self);
+    if (!v.context) return;
+    if (t_current != v.context) set_current(v.context);
+    if (!t_ctx || !real_glGenFramebuffers || !real_glGenRenderbuffers) return;
+    if (!v.fbo) {
+        real_glGenFramebuffers(1, &v.fbo);
+        w_glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
+        real_glGenRenderbuffers(1, &v.rb);
+        w_glBindRenderbuffer(GL_RENDERBUFFER, v.rb);
+        send<bool>(v.context, "renderbufferStorage:fromDrawable:", GL_RENDERBUFFER, send(self, "layer"));
+        w_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, v.rb);
+    }
+    w_glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
+    int x, y, w, h;
+    if (content_rect(x, y, w, h)) w_glViewport(0, 0, w, h);
+}
+
+void glk_display(id self) {
+    GlkView& v = glkv(self);
+    v.display_pending = false;
+    id ctx = v.context;
+    if (!ctx) return;
+    glk_bind(self);
+    send<void>(self, "drawRect:", send<CGRect>(self, "bounds"));
+    if (t_current == ctx) present();
+}
+
+void glk_tick(id self) {
+    GlkController& c = glkc(self);
+    if (c.paused) return;
+    double now = now_s();
+    id d = c.delegate;
+    if (d && responds(d, sel("glkViewControllerUpdate:"))) send<void>(d, "glkViewControllerUpdate:", self);
+    else if (responds(self, sel("update"))) send<void>(self, "update");
+    c.last_update = now;
+    id v = send(self, "view");
+    if (is_kind(v, C_GLKView)) send<void>(v, "display");
+    c.last_draw = now;
+    ++c.frames;
+}
+
+void glk_start(id self) {
+    GlkController& c = glkc(self);
+    if (c.link) return;
+    c.link = retain(send_cls(class_named("CADisplayLink"), "displayLinkWithTarget:selector:", self, sel("_glkTick:")));
+    send<void>(c.link, "setPreferredFramesPerSecond:", c.fps);
+    send<void>(c.link, "addToRunLoop:forMode:", send_cls(class_named("NSRunLoop"), "mainRunLoop"), str("kCFRunLoopDefaultMode"));
+    c.first = c.last_resume = now_s();
+    log("GLKViewController %p: display link at %ld fps", static_cast<void*>(self), c.fps);
+}
+
+void init_glkit() {
+    g_glk_views = new std::unordered_map<id, GlkView>();
+    g_glk_vcs = new std::unordered_map<id, GlkController>();
+
+    C_GLKView = def_class("GLKView", "UIView");
+    Class V = C_GLKView;
+    defc(V, "layerClass", +[](id, SEL) -> Class { return class_named("CAEAGLLayer"); });
+    def(V, "initWithFrame:context:", +[](id self, SEL, CGRect f, id ctx) -> id {
+        self = send_super(self, C_GLKView, "initWithFrame:", f);
+        if (self) send<void>(self, "setContext:", ctx);
+        return self;
+    });
+    def(V, "context", +[](id self, SEL) -> id { return glkv(self).context; });
+    def(V, "setContext:", +[](id self, SEL, id ctx) {
+        GlkView& v = glkv(self);
+        if (v.context == ctx) return;
+        v.fbo = v.rb = 0;   // the drawable belonged to the old context
+        id old = v.context;
+        v.context = retain(ctx);
+        release(old);
+    });
+    def(V, "delegate", +[](id self, SEL) -> id { return glkv(self).delegate; });
+    def(V, "setDelegate:", +[](id self, SEL, id d) { glkv(self).delegate = d; });
+    def(V, "drawableColorFormat", +[](id self, SEL) -> long { return glkv(self).color; });
+    def(V, "setDrawableColorFormat:", +[](id self, SEL, long f) { glkv(self).color = f; });
+    def(V, "drawableDepthFormat", +[](id self, SEL) -> long { return glkv(self).depth; });
+    def(V, "setDrawableDepthFormat:", +[](id self, SEL, long f) { glkv(self).depth = f; });
+    def(V, "drawableStencilFormat", +[](id self, SEL) -> long { return glkv(self).stencil; });
+    def(V, "setDrawableStencilFormat:", +[](id self, SEL, long f) { glkv(self).stencil = f; });
+    def(V, "drawableMultisample", +[](id self, SEL) -> long { return glkv(self).multisample; });
+    def(V, "setDrawableMultisample:", +[](id self, SEL, long f) { glkv(self).multisample = f; });
+    // the window surface's depth 24 / stencil 8 serve every format request
+    def(V, "drawableWidth", +[](id, SEL) -> long { int x, y, w, h; content_rect(x, y, w, h); return w; });
+    def(V, "drawableHeight", +[](id, SEL) -> long { int x, y, w, h; content_rect(x, y, w, h); return h; });
+    def(V, "enableSetNeedsDisplay", +[](id self, SEL) -> bool { return glkv(self).set_needs_display; });
+    def(V, "setEnableSetNeedsDisplay:", +[](id self, SEL, bool b) { glkv(self).set_needs_display = b; });
+    def(V, "bindDrawable", +[](id self, SEL) { glk_bind(self); });
+    def(V, "display", +[](id self, SEL) { glk_display(self); });
+    def(V, "drawRect:", +[](id self, SEL, CGRect r) {
+        id d = glkv(self).delegate;
+        if (d && responds(d, sel("glkView:drawInRect:"))) send<void>(d, "glkView:drawInRect:", self, r);
+    });
+    def(V, "setNeedsDisplay", +[](id self, SEL) {
+        GlkView& v = glkv(self);
+        if (!v.set_needs_display || v.display_pending) return;
+        v.display_pending = true;
+        retain(self);
+        post_main([self] { glk_display(self); release(self); });
+    });
+    def(V, "snapshot", +[](id, SEL) -> id { return nullptr; });
+    def(V, "deleteDrawable", +[](id self, SEL) { GlkView& v = glkv(self); v.fbo = v.rb = 0; });
+
+    C_GLKViewController = def_class("GLKViewController", "UIViewController");
+    Class C = C_GLKViewController;
+    def(C, "loadView", +[](id self, SEL) {
+        CGRect f = send<CGRect>(send_cls(class_named("UIScreen"), "mainScreen"), "bounds");
+        id v = send(send_cls(C_GLKView, "alloc"), "initWithFrame:", f);
+        send<void>(v, "setDelegate:", self);
+        send<void>(v, "setEnableSetNeedsDisplay:", false);
+        send<void>(self, "setView:", v);
+        release(v);
+    });
+    def(C, "viewDidAppear:", +[](id self, SEL, bool) { glk_start(self); });
+    def(C, "_glkTick:", +[](id self, SEL, id) { glk_tick(self); });
+    def(C, "preferredFramesPerSecond", +[](id self, SEL) -> long { return glkc(self).fps; });
+    def(C, "setPreferredFramesPerSecond:", +[](id self, SEL, long fps) {
+        GlkController& c = glkc(self);
+        c.fps = fps > 0 ? fps : 30;
+        if (c.link) send<void>(c.link, "setPreferredFramesPerSecond:", c.fps);
+    });
+    def(C, "framesPerSecond", +[](id self, SEL) -> long { return std::min<long>(glkc(self).fps, 60); });
+    def(C, "isPaused", +[](id self, SEL) -> bool { return glkc(self).paused; });
+    def(C, "paused", +[](id self, SEL) -> bool { return glkc(self).paused; });
+    def(C, "setPaused:", +[](id self, SEL, bool p) {
+        GlkController& c = glkc(self);
+        if (c.paused && !p) c.last_resume = now_s();
+        c.paused = p;
+    });
+    def(C, "delegate", +[](id self, SEL) -> id { return glkc(self).delegate; });
+    def(C, "setDelegate:", +[](id self, SEL, id d) { glkc(self).delegate = d; });
+    def(C, "pauseOnWillResignActive", +[](id self, SEL) -> bool { return glkc(self).pause_on_resign; });
+    def(C, "setPauseOnWillResignActive:", +[](id self, SEL, bool b) { glkc(self).pause_on_resign = b; });
+    def(C, "resumeOnDidBecomeActive", +[](id self, SEL) -> bool { return glkc(self).resume_on_active; });
+    def(C, "setResumeOnDidBecomeActive:", +[](id self, SEL, bool b) { glkc(self).resume_on_active = b; });
+    def(C, "framesDisplayed", +[](id self, SEL) -> long { return glkc(self).frames; });
+    def(C, "timeSinceFirstResume", +[](id self, SEL) -> double { return now_s() - glkc(self).first; });
+    def(C, "timeSinceLastResume", +[](id self, SEL) -> double { return now_s() - glkc(self).last_resume; });
+    def(C, "timeSinceLastUpdate", +[](id self, SEL) -> double { GlkController& c = glkc(self); return c.last_update ? now_s() - c.last_update : 0; });
+    def(C, "timeSinceLastDraw", +[](id self, SEL) -> double { GlkController& c = glkc(self); return c.last_draw ? now_s() - c.last_draw : 0; });
+
+    add_dealloc_hook([](id o) {
+        if (!is_kind(o, C_GLKView) && !is_kind(o, C_GLKViewController)) return;
+        id context = nullptr, link = nullptr;
+        {
+            std::lock_guard<std::mutex> l(g_glk_mu);
+            if (auto it = g_glk_views->find(o); it != g_glk_views->end()) { context = it->second.context; g_glk_views->erase(it); }
+            if (auto it = g_glk_vcs->find(o); it != g_glk_vcs->end()) { link = it->second.link; g_glk_vcs->erase(it); }
+        }
+        release(context);
+        if (link) { send<void>(link, "invalidate"); release(link); }
+    });
+}
+
+}  // namespace
+
 void init_gl() {
     C_EAGLSharegroup = def_class("EAGLSharegroup", "NSObject");
     C_EAGLContext = def_class("EAGLContext", "NSObject");
@@ -589,6 +896,14 @@ void init_gl() {
         if (t_ctx != &e->st) { log("renderbufferStorage:fromDrawable: on a context that is not current"); }
         ensure_window_surface();
         e->st.drawable_rbs.insert(e->st.bound_rb);
+        // a render thread that made the context current before it had a drawable is on a pbuffer: move it to the window
+        if (t_ctx == &e->st && eglGetCurrentSurface(EGL_DRAW) != g_win) {
+            EGLSurface s = surface_for(e->st);
+            if (s == g_win && eglMakeCurrent(g_dpy, s, s, e->st.egl)) {
+                std::lock_guard<std::mutex> l(g_egl_mu);
+                g_win_tid = gettid();
+            }
+        }
         if (trace_enabled("gl")) log("renderbuffer %u gets the drawable of layer %p", e->st.bound_rb, static_cast<void*>(layer));
         return true;
     });
@@ -599,6 +914,7 @@ void init_gl() {
     });
     def(C, "presentRenderbuffer:atTime:", +[](id self, SEL, GLenum, double) -> bool { return t_ctx == &ext_get<EaglExt>(self)->st && present(); });
     def(C, "presentRenderbuffer:afterMinimumDuration:", +[](id self, SEL, GLenum, double) -> bool { return t_ctx == &ext_get<EaglExt>(self)->st && present(); });
+    init_glkit();
 }
 
 static id* nsconst(const char* s) { id* slot = new id; *slot = str_new(s); return slot; }

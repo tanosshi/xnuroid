@@ -21,7 +21,7 @@ because the guest opens its bundle with ordinary file calls. Updating the IPA an
 the game on the next launch.
 
 The APK package is `com.xnuroid.<name>`, the native library is `libxnuroid.so`, and the
-activity is `android.app.NativeActivity`. The install script pulls the device's
+activity is `com.xnuroid.HostActivity` (a `NativeActivity` subclass in `android/java` that adds the system document picker and plays AVPlayer/AVAudioPlayer media through `MediaPlayer`, with video in an overlay view). The install script pulls the device's
 `/system/lib64/libc++.so` and ships it as `libsysc++.so`, because an app linker namespace cannot
 open the system C++ library directly.
 

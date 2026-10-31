@@ -2,6 +2,9 @@
 // memory is touched). Keep these small: the general fixes belong in the frameworks.
 #include "app.hpp"
 
+#include <sys/stat.h>
+
+#include <cstdio>
 #include <cstdlib>
 
 namespace app {
@@ -50,12 +53,36 @@ void patch_pocketgod() {
     log("pocketgod %s: skin packs via offline store, bonus pack unlock", ver.c_str());
 }
 
+// ---- PPSSPP (org.ppsspp.*) ----
+// The App Store build defaults to Vulkan through MoltenVK (Metal), which we do not have; its OpenGL ES renderer
+// runs on GLKit. Seed a config that picks OpenGL unless the user already has one.
+void patch_ppsspp() {
+    std::string ini = sandbox_dir("Documents/PSP/SYSTEM") + "/ppsspp.ini", text;
+    read_file(ini, text);
+    size_t at = text.find("\nGraphicsBackend = ");
+    if (at != std::string::npos && text.compare(at + 19, 1, "0") == 0) return;   // already OpenGL
+    if (at != std::string::npos) {
+        size_t eol = text.find('\n', at + 1);
+        text.replace(at + 1, (eol == std::string::npos ? text.size() : eol) - at - 1, "GraphicsBackend = 0 (OPENGL)");
+    } else if ((at = text.find("[Graphics]\n")) != std::string::npos) {
+        text.insert(at + 11, "GraphicsBackend = 0 (OPENGL)\n");
+    } else {
+        text += "[Graphics]\nGraphicsBackend = 0 (OPENGL)\n";
+    }
+    if (FILE* f = fopen(ini.c_str(), "w")) {
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+        log("ppsspp: %s now selects the OpenGL backend", ini.c_str());
+    }
+}
+
 }  // namespace
 
 void apply_game_patches() {
     if (getenv("LOADER_APP_NO_PATCHES")) return;
     std::string bid = utf8(dict_get(info_dictionary(), "CFBundleIdentifier"));
     if (bid == "com.boltcreative.pocketgod") patch_pocketgod();
+    if (bid.rfind("org.ppsspp.", 0) == 0) patch_ppsspp();
 }
 
 }  // namespace app

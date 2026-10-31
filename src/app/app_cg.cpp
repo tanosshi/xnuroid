@@ -6,8 +6,14 @@
 #include <android/imagedecoder.h>
 #include <zlib.h>
 
+#include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <map>
+
+// the host's text engine (android_app.cpp); absent in the command-line host
+extern "C" int host_text_measure(const uint16_t* text, int len, float size, float* width, float* ascent, float* descent, float* leading) __attribute__((weak));
+extern "C" int host_text_draw(const uint16_t* text, int len, float size, uint32_t rgba, uint8_t* dst, int w, int h, float x, float y) __attribute__((weak));
 
 namespace app {
 
@@ -156,7 +162,23 @@ bool decode_image(const uint8_t* p, size_t n, Bitmap& out) {
 Class C_UIImage, C_CGImageRef, C_CGColorSpace, C_CGContext, C_CGDataProvider, C_CGColor, C_CGFont, C_CGGradient, C_CGPath;
 struct ImageExt : Ext { std::shared_ptr<Bitmap> bmp; int orientation = 0; double scale = 1; id cg = nullptr; ~ImageExt() override { release(cg); } };
 struct CGImageExt : Ext { std::shared_ptr<Bitmap> bmp; };
-struct ContextExt : Ext { Bitmap bmp; int bpp = 4; bool gray = false; std::vector<CGAffineTransform> stack; CGAffineTransform ctm{1, 0, 0, 1, 0, 0}; };
+struct ContextExt : Ext {
+    Bitmap bmp;
+    int bpp = 4;
+    bool gray = false;
+    std::vector<CGAffineTransform> stack;
+    CGAffineTransform ctm{1, 0, 0, 1, 0, 0};
+    uint8_t* user = nullptr;      // the caller's backing store (CGBitmapContextCreate data), kept in sync with bmp
+    size_t user_bpr = 0;
+    double fill[4] = {0, 0, 0, 1};
+    CGPoint text_pos{0, 0};
+};
+// Drawing goes to bmp; a context created over the caller's memory mirrors it there, where the caller reads it.
+void sync_user(ContextExt* e) {
+    if (!e->user) return;
+    for (int y = 0; y < e->bmp.h; ++y)
+        std::memcpy(e->user + static_cast<size_t>(y) * e->user_bpr, e->bmp.rgba.data() + static_cast<size_t>(y) * e->bmp.w * 4, static_cast<size_t>(e->bmp.w) * 4);
+}
 struct ProviderExt : Ext { id data = nullptr; ~ProviderExt() override { release(data); } };
 
 std::shared_ptr<Bitmap> image_bitmap(id img);
@@ -322,7 +344,12 @@ static id cg_bitmap_context_create(void* data, size_t w, size_t h, size_t bpc, s
     e->bmp.h = static_cast<int>(h);
     e->gray = cs == reinterpret_cast<void*>(2);
     e->bmp.rgba.assign(static_cast<size_t>(w) * h * 4, 0);
-    (void)data; (void)bpc; (void)bpr; (void)info;
+    if (data && bpc == 8 && bpr >= w * 4 && !e->gray) {   // RGBA8 over the caller's buffer: start from its contents
+        e->user = static_cast<uint8_t*>(data);
+        e->user_bpr = bpr;
+        for (size_t y = 0; y < h; ++y) std::memcpy(e->bmp.rgba.data() + y * w * 4, e->user + y * bpr, w * 4);
+    }
+    (void)info;
     return c;   // +1 (CoreGraphics create rule)
 }
 static id cg_bitmap_context_create_image(id ctx) {
@@ -423,7 +450,81 @@ static void cg_draw_image(id ctx, CGRect r, id img) {
             d[3] = static_cast<uint8_t>(a + d[3] * (255 - a) / 255);
         }
     }
+    sync_user(ce);
 }
+
+// ---- CoreText: CTFont is UIFont (toll-free on iOS), CTLine a run of text; glyphs come from the host's text engine ----
+Class C_CTLine;
+struct LineExt : Ext { std::u16string text; double size = 12; bool has_color = false; double rgba[4] = {0, 0, 0, 1}; };
+
+id attr_any(id attrs, std::initializer_list<const char*> keys) {
+    for (const char* k : keys) if (id v = dict_get(attrs, k)) return v;
+    return nullptr;
+}
+
+id ct_font_create_ui(uint32_t, double size, id) { return retain(send_cls(class_named("UIFont"), "systemFontOfSize:", size > 0 ? size : 12.0)); }
+id ct_font_create_with_name(id name, double size, const void*) { return retain(send_cls(class_named("UIFont"), "fontWithName:size:", name, size > 0 ? size : 12.0)); }
+double ct_font_get_size(id font) { return send<double>(font, "pointSize"); }
+
+id ct_line_create(id as) {
+    id line = alloc(C_CTLine);
+    auto* e = ext_get<LineExt>(line);
+    e->text = u16(send(as, "string"));
+    id attrs = send(as, "attributesAtIndex:effectiveRange:", static_cast<NSUInteger>(0), static_cast<NSRange*>(nullptr));
+    e->has_color = true;   // CoreText's default foreground is black
+    if (attrs) {
+        if (id font = attr_any(attrs, {"kCTFontAttributeName", "NSFont", "NSFontAttributeName"})) e->size = send<double>(font, "pointSize");
+        if (attr_any(attrs, {"kCTForegroundColorFromContextAttributeName", "CTForegroundColorFromContext"})) e->has_color = false;   // the fill color
+        else if (id color = attr_any(attrs, {"kCTForegroundColorAttributeName", "CTForegroundColor", "NSColor", "NSForegroundColorAttributeName"})) color_components(color, e->rgba);
+    }
+    return line;   // +1 (create rule)
+}
+
+void line_metrics(const LineExt* e, double& w, double& ascent, double& descent, double& leading) {
+    float fw, fa, fd, fl;
+    if (host_text_measure && host_text_measure(reinterpret_cast<const uint16_t*>(e->text.data()), static_cast<int>(e->text.size()), static_cast<float>(e->size), &fw, &fa, &fd, &fl)) {
+        w = fw; ascent = fa; descent = fd; leading = fl;
+        return;
+    }
+    w = 0.55 * e->size * static_cast<double>(e->text.size());   // no text engine (command-line host): an estimate
+    ascent = 0.8 * e->size;
+    descent = 0.2 * e->size;
+    leading = 0;
+}
+double ct_line_typographic_bounds(id line, double* ascent, double* descent, double* leading) {
+    auto* e = ext_as<LineExt>(line);
+    double w = 0, a = 0, d = 0, l = 0;
+    if (e) line_metrics(e, w, a, d, l);
+    if (ascent) *ascent = a;
+    if (descent) *descent = d;
+    if (leading) *leading = l;
+    return w;
+}
+
+void ct_line_draw(id line, id ctx) {
+    auto* le = ext_as<LineExt>(line);
+    auto* ce = ext_as<ContextExt>(ctx);
+    if (!le || !ce || le->text.empty() || !host_text_draw) return;
+    const double* c = le->has_color ? le->rgba : ce->fill;
+    auto byte = [](double v) { return static_cast<uint32_t>(std::lround(std::clamp(v, 0.0, 1.0) * 255)); };
+    uint32_t rgba = byte(c[0]) << 24 | byte(c[1]) << 16 | byte(c[2]) << 8 | byte(c[3]);
+    // the text position is in CoreGraphics space (origin bottom-left, through the CTM); bitmap row 0 is the top
+    const CGAffineTransform& m = ce->ctm;
+    double x = m.a * ce->text_pos.x + m.c * ce->text_pos.y + m.tx;
+    double y = m.b * ce->text_pos.x + m.d * ce->text_pos.y + m.ty;
+    host_text_draw(reinterpret_cast<const uint16_t*>(le->text.data()), static_cast<int>(le->text.size()), static_cast<float>(le->size), rgba,
+                   ce->bmp.rgba.data(), ce->bmp.w, ce->bmp.h, static_cast<float>(x), static_cast<float>(ce->bmp.h - y));
+    double w, a, d, l;
+    line_metrics(le, w, a, d, l);
+    ce->text_pos.x += w;   // drawing advances the text position
+    sync_user(ce);
+}
+
+void cg_set_fill_color(id ctx, id color) { if (auto* e = ext_as<ContextExt>(ctx)) color_components(color, e->fill); }
+void cg_set_rgb_fill(id ctx, double r, double g, double b, double a) { if (auto* e = ext_as<ContextExt>(ctx)) { e->fill[0] = r; e->fill[1] = g; e->fill[2] = b; e->fill[3] = a; } }
+void cg_set_gray_fill(id ctx, double v, double a) { cg_set_rgb_fill(ctx, v, v, v, a); }
+void cg_set_text_position(id ctx, double x, double y) { if (auto* e = ext_as<ContextExt>(ctx)) e->text_pos = {x, y}; }
+CGPoint cg_get_text_position(id ctx) { auto* e = ext_as<ContextExt>(ctx); return e ? e->text_pos : CGPoint{0, 0}; }
 }
 
 namespace app {
@@ -431,6 +532,7 @@ namespace app {
 static id* cg_const(const char* s) { id* slot = new id; *slot = str_new(s); return slot; }
 
 void init_cg() {
+    C_CTLine = def_class("CTLine", "NSObject");
     C_UIImage = def_class("UIImage", "NSObject");
     Class I = C_UIImage;
     defc(I, "imageNamed:", +[](id, SEL, id n) -> id { return n ? image_named(utf8(n)) : nullptr; });
@@ -609,18 +711,53 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
                           "_CGContextAddArc", "_CGContextAddCurveToPoint", "_CGContextDrawLinearGradient", "_CGContextDrawRadialGradient",
                           "_CGContextSetTextMatrix", "_CGContextSetTextPosition", "_CGContextSetInterpolationQuality", "_CGContextSetShouldAntialias",
                           "_CGContextSetFont", "_CGContextSetFontSize", "_CGContextFillEllipseInRect", "_CGContextStrokeEllipseInRect", "_CGContextSetLineDash",
-                          "_CGContextDrawTiledImage", "_CGContextBeginTransparencyLayer", "_CGContextEndTransparencyLayer"})
+                          "_CGContextDrawTiledImage", "_CGContextBeginTransparencyLayer", "_CGContextEndTransparencyLayer",
+                          "_CGContextAddArcToPoint", "_CGContextAddLines", "_CGContextDrawPath", "_CGContextSetStrokeColorSpace",
+                          "_CGContextSetFillColorSpace", "_CGContextStrokeLineSegments", "_CGContextAddQuadCurveToPoint", "_CGContextStrokeRectWithWidth"})
         r(n, reinterpret_cast<void (*)()>(&cg_context_noop));
     r("_CGContextGetCTM", +[](id) -> CGAffineTransform { return {1, 0, 0, 1, 0, 0}; });
+    r("_CGContextSetFillColorWithColor", &cg_set_fill_color);
+    r("_CGContextSetRGBFillColor", &cg_set_rgb_fill);
+    r("_CGContextSetGrayFillColor", &cg_set_gray_fill);
+    r("_CGContextSetTextPosition", &cg_set_text_position);
+    r("_CGContextGetTextPosition", &cg_get_text_position);
+    r("_CGContextRelease", +[](id ctx) { release(ctx); });
+    r("_CTFontCreateUIFontForLanguage", &ct_font_create_ui);
+    r("_CTFontCreateWithName", &ct_font_create_with_name);
+    r("_CTFontGetSize", &ct_font_get_size);
+    r("_CTLineCreateWithAttributedString", &ct_line_create);
+    r("_CTLineGetTypographicBounds", &ct_line_typographic_bounds);
+    r("_CTLineDraw", &ct_line_draw);
     r("_CGPathCreateMutable", +[]() -> void* { return reinterpret_cast<void*>(0x9); });
     r("_CGPathCreateWithRect", +[](CGRect, const void*) -> void* { return reinterpret_cast<void*>(0x9); });
     r("_CGPathCreateWithEllipseInRect", +[](CGRect, const void*) -> void* { return reinterpret_cast<void*>(0x9); });
     r("_CGPathRelease", &cg_release_noop);
     r("_CGPathRetain", +[](void* p) -> void* { return p; });
     for (const char* n : {"_CGPathMoveToPoint", "_CGPathAddLineToPoint", "_CGPathAddRect", "_CGPathCloseSubpath", "_CGPathAddArc", "_CGPathAddCurveToPoint",
-                          "_CGPathAddRoundedRect", "_CGPathAddEllipseInRect"})
+                          "_CGPathAddRoundedRect", "_CGPathAddEllipseInRect", "_CGPathAddArcToPoint", "_CGPathAddPath", "_CGPathAddLines",
+                          "_CGPathAddQuadCurveToPoint", "_CGPathAddRects"})
         r(n, reinterpret_cast<void (*)()>(&cg_context_noop));
     r("_CGPathIsEmpty", +[](void*) -> bool { return true; });
+    // CGRectDivide: cut `amount` off the given edge (MinX, MinY, MaxX, MaxY) into slice; the rest is remainder
+    r("_CGRectDivide", +[](CGRect rect, CGRect* slice, CGRect* rem, double amount, uint32_t edge) {
+        if (rect.size.width < 0) { rect.origin.x += rect.size.width; rect.size.width = -rect.size.width; }
+        if (rect.size.height < 0) { rect.origin.y += rect.size.height; rect.size.height = -rect.size.height; }
+        bool horizontal = edge == 0 || edge == 2;
+        double dim = horizontal ? rect.size.width : rect.size.height;
+        amount = std::max(0.0, std::min(amount, dim));
+        CGRect a = rect, b = rect;
+        if (horizontal) {
+            a.size.width = amount;
+            b.size.width = dim - amount;
+            if (edge == 0) b.origin.x += amount; else a.origin.x += dim - amount;
+        } else {
+            a.size.height = amount;
+            b.size.height = dim - amount;
+            if (edge == 1) b.origin.y += amount; else a.origin.y += dim - amount;
+        }
+        if (slice) *slice = a;
+        if (rem) *rem = b;
+    });
     // UIGraphics
     static id ctx_stack_key = nullptr;
     (void)ctx_stack_key;

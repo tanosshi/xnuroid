@@ -798,8 +798,10 @@ extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* 
 // Guest dlopen/dlsym: Apple frameworks resolve to a fake handle; MTLCreateSystemDefaultDevice returns a fake device.
 static char g_fake_framework_handle[16];
 extern "C" void* native_mtl_create_system_default_device();
+static void* guest_dlsym_lookup(const char* name);   // after resolve_symbol
 extern "C" void* native_guest_dlopen(const char* path, int flags) {
-    if (path && (std::strstr(path, "/System/Library/") || std::strstr(path, ".framework"))) {
+    if (path && (std::strstr(path, "/System/Library/") || std::strstr(path, ".framework") || std::strncmp(path, "/usr/lib/", 9) == 0 ||
+                 (!std::strchr(path, '/') && std::strstr(path, ".dylib")))) {
         fprintf(stderr, "[DLOPEN] fake framework handle for %s\n", path);
         return g_fake_framework_handle;
     }
@@ -810,7 +812,7 @@ extern "C" void* native_guest_dlsym(void* handle, const char* name) {
         fprintf(stderr, "[DLSYM] fake framework: %s\n", name ? name : "(null)");
         if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
             return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
-        return nullptr;
+        return name ? guest_dlsym_lookup(name) : nullptr;
     }
     if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
         return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
@@ -818,6 +820,8 @@ extern "C" void* native_guest_dlsym(void* handle, const char* name) {
     intptr_t h = reinterpret_cast<intptr_t>(handle);
     if (h == -2 || h == -3 || h == -5) handle = RTLD_DEFAULT;
     else if (h == -1) handle = RTLD_NEXT;
+    if (handle == RTLD_DEFAULT && name)   // the process-wide namespace includes what the loader provides
+        if (void* p = guest_dlsym_lookup(name)) return p;
     return dlsym(handle, name);
 }
 
@@ -1103,6 +1107,30 @@ extern "C" int native_mach_port_deallocate(uint32_t task, uint32_t name) { retur
 extern "C" int native_mach_port_insert_right(uint32_t task, uint32_t name, uint32_t poly, uint32_t polyPoly) { return 0; }
 extern "C" int native_mach_port_mod_refs(uint32_t task, uint32_t name, int right, int delta) { return 0; }
 
+// sysconf: Darwin numbers its _SC_* names differently (_SC_PAGESIZE is 29 there, 39 in bionic); a guest asking
+// for the page size would otherwise get an unrelated limit. Unknown names fail as an unsupported option would.
+extern "C" long native_sysconf_darwin(int name) {
+    switch (name) {
+        case 1: return sysconf(_SC_ARG_MAX);
+        case 2: return sysconf(_SC_CHILD_MAX);
+        case 3: return sysconf(_SC_CLK_TCK);
+        case 4: return sysconf(_SC_NGROUPS_MAX);
+        case 5: return sysconf(_SC_OPEN_MAX);
+        case 15: return sysconf(_SC_LINE_MAX);
+        case 29: return sysconf(_SC_PAGESIZE);
+        case 56: return sysconf(_SC_IOV_MAX);
+        case 57: return sysconf(_SC_NPROCESSORS_CONF);
+        case 58: return sysconf(_SC_NPROCESSORS_ONLN);
+        case 70: return sysconf(_SC_GETGR_R_SIZE_MAX);
+        case 71: return sysconf(_SC_GETPW_R_SIZE_MAX);
+        case 72: return sysconf(_SC_HOST_NAME_MAX);
+        case 73: return sysconf(_SC_LOGIN_NAME_MAX);
+        case 93: return sysconf(_SC_THREAD_STACK_MIN);
+        case 200: return sysconf(_SC_PHYS_PAGES);
+        default: errno = EINVAL; return -1;
+    }
+}
+
 extern "C" int native_vm_allocate(uint32_t task, uintptr_t* address, size_t size, int flags) {
     void* p = mmap(reinterpret_cast<void*>(*address), size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (p == MAP_FAILED) return 1;
@@ -1172,6 +1200,32 @@ static inline va_list guest_va(const CallFrame& f) {
 static inline va_list darwin_va(void* darwin_ap) {
     return make_va_list(darwin_ap);
 }
+
+// ---- SQLite: iOS ships libsqlite3, and an Android app cannot load the platform copy, so the amalgamation is built
+// in (src/third_party/sqlite) and exported. Plain API functions bind by name (sqlite_symbol); the variadic ones read
+// Darwin's stack-passed arguments.
+#include "../third_party/sqlite/sqlite3.h"
+static void* sqlite_symbol(const char* name) {
+    static void* self = [] {
+        Dl_info info{};
+        void* h = dladdr(reinterpret_cast<void*>(&sqlite3_libversion), &info) && info.dli_fname ? dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD) : nullptr;
+        return h ? h : dlopen(nullptr, RTLD_NOW);
+    }();
+    return self ? dlsym(self, name) : nullptr;
+}
+extern "C" char* native_sqlite3_mprintf(const char* fmt, const void* va) { va_list ap = make_va_list(va); return sqlite3_vmprintf(fmt, ap); }
+extern "C" char* native_sqlite3_snprintf(int n, char* buf, const char* fmt, const void* va) { va_list ap = make_va_list(va); return sqlite3_vsnprintf(n, buf, fmt, ap); }
+extern "C" char* native_sqlite3_vmprintf(const char* fmt, void* dap) { va_list ap = darwin_va(dap); return sqlite3_vmprintf(fmt, ap); }
+extern "C" char* native_sqlite3_vsnprintf(int n, char* buf, const char* fmt, void* dap) { va_list ap = darwin_va(dap); return sqlite3_vsnprintf(n, buf, fmt, ap); }
+extern "C" void native_sqlite3_log(int err, const char* fmt, const void* va) { char* m = native_sqlite3_mprintf(fmt, va); sqlite3_log(err, "%s", m ? m : ""); sqlite3_free(m); }
+// config / db_config take a few pointer-or-int arguments after the opcode
+extern "C" int native_sqlite3_config(int op, const uint64_t* a) { return sqlite3_config(op, a[0], a[1], a[2], a[3]); }
+extern "C" int native_sqlite3_db_config(sqlite3* db, int op, const uint64_t* a) { return sqlite3_db_config(db, op, a[0], a[1], a[2], a[3]); }
+APP_VARIADIC(th_sqlite3_mprintf, native_sqlite3_mprintf, 1)
+APP_VARIADIC(th_sqlite3_snprintf, native_sqlite3_snprintf, 3)
+APP_VARIADIC(th_sqlite3_log, native_sqlite3_log, 2)
+APP_VARIADIC(th_sqlite3_config, native_sqlite3_config, 1)
+APP_VARIADIC(th_sqlite3_db_config, native_sqlite3_db_config, 2)
 
 static inline void set_ret_int(CallFrame& f, int v) {
     f.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(v));
@@ -2317,6 +2371,24 @@ int32_t native_au_get_property(void* u, uint32_t prop, uint32_t, uint32_t, void*
 int32_t native_au_zero(void*);
 int32_t native_au_start(void* u);
 int32_t native_au_stop(void* u);
+int32_t native_au_set_parameter(void*, uint32_t, uint32_t, uint32_t, float, uint32_t);
+int32_t native_au_get_parameter(void*, uint32_t, uint32_t, uint32_t, float*);
+int32_t native_au_render(void*, uint32_t*, const void*, uint32_t, uint32_t, void*);
+int32_t native_augraph_new(void**);
+int32_t native_augraph_add_node(void*, const uint32_t*, int32_t*);
+int32_t native_augraph_open(void*);
+int32_t native_augraph_node_info(void*, int32_t, uint32_t*, void**);
+int32_t native_augraph_set_node_input_callback(void*, int32_t, uint32_t, const void*);
+int32_t native_augraph_connect(void*, int32_t, uint32_t, int32_t, uint32_t);
+int32_t native_augraph_disconnect(void*, int32_t, uint32_t);
+int32_t native_augraph_start(void*);
+int32_t native_augraph_stop(void*);
+int32_t native_augraph_is_running(void*, uint8_t*);
+int32_t native_augraph_node_count(void*, uint32_t*);
+int32_t native_augraph_ind_node(void*, uint32_t, int32_t*);
+int32_t native_augraph_dispose(void*);
+int32_t native_augraph_zero(void*);
+int32_t native_augraph_cpu_load(void*, float*);
 } // extern "C"
 
 
@@ -2525,6 +2597,28 @@ static void register_darwin_framework_stubs() {
     reg("_AudioUnitUninitialize", reinterpret_cast<void*>(&native_au_zero));
     reg("_AudioOutputUnitStart", reinterpret_cast<void*>(&native_au_start));
     reg("_AudioOutputUnitStop", reinterpret_cast<void*>(&native_au_stop));
+    reg("_AudioUnitSetParameter", reinterpret_cast<void*>(&native_au_set_parameter));
+    reg("_AudioUnitGetParameter", reinterpret_cast<void*>(&native_au_get_parameter));
+    reg("_AudioUnitRender", reinterpret_cast<void*>(&native_au_render));
+    reg("_NewAUGraph", reinterpret_cast<void*>(&native_augraph_new));
+    reg("_AUGraphAddNode", reinterpret_cast<void*>(&native_augraph_add_node));
+    reg("_AUGraphOpen", reinterpret_cast<void*>(&native_augraph_open));
+    reg("_AUGraphNodeInfo", reinterpret_cast<void*>(&native_augraph_node_info));
+    reg("_AUGraphSetNodeInputCallback", reinterpret_cast<void*>(&native_augraph_set_node_input_callback));
+    reg("_AUGraphConnectNodeInput", reinterpret_cast<void*>(&native_augraph_connect));
+    reg("_AUGraphDisconnectNodeInput", reinterpret_cast<void*>(&native_augraph_disconnect));
+    reg("_AUGraphStart", reinterpret_cast<void*>(&native_augraph_start));
+    reg("_AUGraphStop", reinterpret_cast<void*>(&native_augraph_stop));
+    reg("_AUGraphIsRunning", reinterpret_cast<void*>(&native_augraph_is_running));
+    reg("_AUGraphGetNodeCount", reinterpret_cast<void*>(&native_augraph_node_count));
+    reg("_AUGraphGetIndNode", reinterpret_cast<void*>(&native_augraph_ind_node));
+    reg("_DisposeAUGraph", reinterpret_cast<void*>(&native_augraph_dispose));
+    reg("_AUGraphInitialize", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphUninitialize", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphClose", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphUpdate", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_CAShow", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphGetCPULoad", reinterpret_cast<void*>(&native_augraph_cpu_load));
     // AudioQueue / AudioFile: report failure so the caller falls back or skips
     for (const char* n : {"_AudioQueueAllocateBuffer", "_AudioQueueAllocateBufferWithPacketDescriptions", "_AudioQueueDispose",
                           "_AudioQueueEnqueueBuffer", "_AudioQueueFlush", "_AudioQueueNewOutput", "_AudioQueueOfflineRender",
@@ -2720,6 +2814,14 @@ static void init_custom_shims() {
     g_custom_shims["_mach_port_insert_right"] = reinterpret_cast<void*>(&native_mach_port_insert_right);
     g_custom_shims["_mach_port_mod_refs"] = reinterpret_cast<void*>(&native_mach_port_mod_refs);
     g_custom_shims["_vm_allocate"] = reinterpret_cast<void*>(&native_vm_allocate);
+    g_custom_shims["_sysconf"] = reinterpret_cast<void*>(&native_sysconf_darwin);
+    g_custom_shims["_sqlite3_mprintf"] = reinterpret_cast<void*>(&th_sqlite3_mprintf);
+    g_custom_shims["_sqlite3_snprintf"] = reinterpret_cast<void*>(&th_sqlite3_snprintf);
+    g_custom_shims["_sqlite3_vmprintf"] = reinterpret_cast<void*>(&native_sqlite3_vmprintf);
+    g_custom_shims["_sqlite3_vsnprintf"] = reinterpret_cast<void*>(&native_sqlite3_vsnprintf);
+    g_custom_shims["_sqlite3_log"] = reinterpret_cast<void*>(&th_sqlite3_log);
+    g_custom_shims["_sqlite3_config"] = reinterpret_cast<void*>(&th_sqlite3_config);
+    g_custom_shims["_sqlite3_db_config"] = reinterpret_cast<void*>(&th_sqlite3_db_config);
     g_custom_shims["_vm_deallocate"] = reinterpret_cast<void*>(&native_vm_deallocate);
 
     // Dynamic ObjC message dispatch; engine mode already bound the guest-runtime dispatchers, which must win.
@@ -2738,6 +2840,28 @@ static void init_custom_shims() {
         g_custom_shims["_AudioUnitUninitialize"] = reinterpret_cast<void*>(&native_au_zero);
         g_custom_shims["_AudioOutputUnitStart"] = reinterpret_cast<void*>(&native_au_start);
         g_custom_shims["_AudioOutputUnitStop"] = reinterpret_cast<void*>(&native_au_stop);
+        g_custom_shims["_AudioUnitSetParameter"] = reinterpret_cast<void*>(&native_au_set_parameter);
+        g_custom_shims["_AudioUnitGetParameter"] = reinterpret_cast<void*>(&native_au_get_parameter);
+        g_custom_shims["_AudioUnitRender"] = reinterpret_cast<void*>(&native_au_render);
+        g_custom_shims["_NewAUGraph"] = reinterpret_cast<void*>(&native_augraph_new);
+        g_custom_shims["_AUGraphAddNode"] = reinterpret_cast<void*>(&native_augraph_add_node);
+        g_custom_shims["_AUGraphOpen"] = reinterpret_cast<void*>(&native_augraph_open);
+        g_custom_shims["_AUGraphNodeInfo"] = reinterpret_cast<void*>(&native_augraph_node_info);
+        g_custom_shims["_AUGraphSetNodeInputCallback"] = reinterpret_cast<void*>(&native_augraph_set_node_input_callback);
+        g_custom_shims["_AUGraphConnectNodeInput"] = reinterpret_cast<void*>(&native_augraph_connect);
+        g_custom_shims["_AUGraphDisconnectNodeInput"] = reinterpret_cast<void*>(&native_augraph_disconnect);
+        g_custom_shims["_AUGraphStart"] = reinterpret_cast<void*>(&native_augraph_start);
+        g_custom_shims["_AUGraphStop"] = reinterpret_cast<void*>(&native_augraph_stop);
+        g_custom_shims["_AUGraphIsRunning"] = reinterpret_cast<void*>(&native_augraph_is_running);
+        g_custom_shims["_AUGraphGetNodeCount"] = reinterpret_cast<void*>(&native_augraph_node_count);
+        g_custom_shims["_AUGraphGetIndNode"] = reinterpret_cast<void*>(&native_augraph_ind_node);
+        g_custom_shims["_DisposeAUGraph"] = reinterpret_cast<void*>(&native_augraph_dispose);
+        g_custom_shims["_AUGraphInitialize"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphUninitialize"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphClose"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphUpdate"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_CAShow"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphGetCPULoad"] = reinterpret_cast<void*>(&native_augraph_cpu_load);
     }
 
     // Data symbols
@@ -2778,6 +2902,17 @@ static void init_custom_shims() {
 }
 
 // Resolver for dyld bindings
+// A guest dlsym sees what imports bind to: app-mode frameworks, the shims and the built-in SQLite. Unknown names stay
+// null (apps probe for optional APIs this way), unlike an import, which gets a stub.
+static void* guest_dlsym_lookup(const char* name) {
+    std::string n = std::string("_") + name;
+    if (g_app_mode) if (void* p = app::resolve_symbol(n)) return p;
+    auto it = g_custom_shims.find(n);
+    if (it != g_custom_shims.end()) return it->second;
+    if (n.rfind("_sqlite3_", 0) == 0) return sqlite_symbol(name);
+    return nullptr;
+}
+
 static void* resolve_symbol(const std::string& name) {
     auto cache_it = g_resolved_cache.find(name);
     if (cache_it != g_resolved_cache.end()) return cache_it->second;
@@ -2789,6 +2924,18 @@ static void* resolve_symbol(const std::string& name) {
             g_resolved_cache[name] = p;
             return p;
         }
+    }
+
+    // Darwin symbol variants (_fopen$DARWIN_EXTSN, _open$NOCANCEL, ...) without a dedicated shim take the base symbol
+    size_t dollar = name.find('$');
+    if (dollar != std::string::npos && dollar > 1 && name.rfind("_OBJC_", 0) != 0 && !g_custom_shims.count(name)) {   // not Swift's _$s...
+        void* p = resolve_symbol(name.substr(0, dollar));
+        g_resolved_cache[name] = p;
+        return p;
+    }
+
+    if (name.rfind("_sqlite3_", 0) == 0 && !g_custom_shims.count(name)) {
+        if (void* p = sqlite_symbol(name.c_str() + 1)) { g_resolved_cache[name] = p; return p; }
     }
 
     auto it = g_custom_shims.find(name);
@@ -2874,6 +3021,9 @@ static void* resolve_symbol(const std::string& name) {
                                                           : reinterpret_cast<void*>(fake_make(7, name.substr(18)));
         g_resolved_cache[name] = obj;
         return obj;
+    }
+    if (!is_fn && g_app_mode) {
+        if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
     }
     if (!is_fn) {
         // DATA import: PROT_NONE poison slot, so the first touch names the symbol.
@@ -3123,6 +3273,13 @@ extern "C" int loader_main(int argc, char** argv) {
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);  // std::terminate / abort() -> full dump
     sigaction(SIGILL, &sa, nullptr);
+    // SIGUSR2 to any thread prints its stack to stderr (e.g. `run-as <package> kill -USR2 <tid>` on a hung app)
+    {
+        struct sigaction sa{};
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sa.sa_sigaction = thread_dump_handler;
+        sigaction(SIGUSR2, &sa, nullptr);
+    }
     if (const char* wd = getenv("LOADER_WATCHDOG")) start_watchdog(static_cast<unsigned>(atoi(wd)));
 
     printf("=== Native ARM64 Mach-O Android Loader ===\n");
@@ -3219,6 +3376,7 @@ extern "C" int loader_main(int argc, char** argv) {
     uint64_t objc_selrefs_vm = 0, objc_selrefs_size = 0, objc_protolist_vm = 0, objc_protolist_size = 0;
     uint64_t lc_main_entryoff = 0;
     uint64_t mod_init_vm_scan = 0, mod_init_size_scan = 0;
+    uint64_t tlv_lo = UINT64_MAX, tlv_hi = 0, tlv_data_vm = 0, tlv_data_size = 0;
 
     for (uint32_t i = 0; i < ncmds; ++i) {
         uint32_t cmd = *reinterpret_cast<uint32_t*>(file_data + cur);
@@ -3247,6 +3405,13 @@ extern "C" int loader_main(int argc, char** argv) {
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_selrefs", 16) == 0) { objc_selrefs_vm = saddr; objc_selrefs_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_protolist", 16) == 0) { objc_protolist_vm = saddr; objc_protolist_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__mod_init_func", 16) == 0) { mod_init_vm_scan = saddr; mod_init_size_scan = ssize; }
+                // S_THREAD_LOCAL_REGULAR / S_THREAD_LOCAL_ZEROFILL: the thread-local template, in address order
+                uint32_t stype = *reinterpret_cast<const uint32_t*>(sp + 64) & 0xff;
+                if (stype == 0x11 || stype == 0x12) {
+                    tlv_lo = std::min(tlv_lo, saddr);
+                    tlv_hi = std::max(tlv_hi, saddr + ssize);
+                    if (stype == 0x11) { tlv_data_vm = saddr; tlv_data_size = ssize; }
+                }
             }
         } else if (cmd == 0x80000028) { // LC_MAIN
             lc_main_entryoff = *reinterpret_cast<uint64_t*>(file_data + cur + 8);
@@ -3658,6 +3823,7 @@ extern "C" int loader_main(int argc, char** argv) {
         ai.selrefs = rt(objc_selrefs_vm); ai.selrefs_size = objc_selrefs_size;
         ai.methname = rt(objc_methname_vm); ai.methname_size = objc_methname_size;
         ai.protolist = rt(objc_protolist_vm); ai.protolist_size = objc_protolist_size;
+        if (tlv_hi > tlv_lo) { ai.tlv_start = rt(tlv_lo); ai.tlv_size = tlv_hi - tlv_lo; ai.tlv_data = rt(tlv_data_vm); ai.tlv_data_size = tlv_data_size; }
         app::boot(ai);
         if (mod_init_size_scan) {
             uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm_scan - min_vm));

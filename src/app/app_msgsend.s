@@ -98,3 +98,70 @@ app_forward_thunk:
     RESTORE_ARGS
     b app_objc_msgSend
     .size app_forward_thunk, .-app_forward_thunk
+
+// Darwin thread-local variable thunk (bound to _tlv_bootstrap): compiled code calls it through the variable's
+// TLVDescriptor with x0 = &descriptor and expects the address for this thread back in x0, every other register
+// intact. app_tlv_resolve (app_darwin.cpp) does the work; everything it may clobber is saved around it.
+    .globl app_tlv_get_addr
+    .type app_tlv_get_addr, %function
+    .p2align 4
+app_tlv_get_addr:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sub sp, sp, #528
+    stp x1, x2, [sp, #0]
+    stp x3, x4, [sp, #16]
+    stp x5, x6, [sp, #32]
+    stp x7, x8, [sp, #48]
+    stp x9, x10, [sp, #64]
+    stp x11, x12, [sp, #80]
+    stp x13, x14, [sp, #96]
+    stp x15, x16, [sp, #112]
+    stp x17, x18, [sp, #128]
+    stp q0, q1, [sp, #144]
+    stp q2, q3, [sp, #176]
+    stp q4, q5, [sp, #208]
+    stp q6, q7, [sp, #240]
+    stp q16, q17, [sp, #272]
+    stp q18, q19, [sp, #304]
+    stp q20, q21, [sp, #336]
+    stp q22, q23, [sp, #368]
+    stp q24, q25, [sp, #400]
+    stp q26, q27, [sp, #432]
+    stp q28, q29, [sp, #464]
+    stp q30, q31, [sp, #496]
+    bl app_tlv_resolve
+    ldp q30, q31, [sp, #496]
+    ldp q28, q29, [sp, #464]
+    ldp q26, q27, [sp, #432]
+    ldp q24, q25, [sp, #400]
+    ldp q22, q23, [sp, #368]
+    ldp q20, q21, [sp, #336]
+    ldp q18, q19, [sp, #304]
+    ldp q16, q17, [sp, #272]
+    ldp q6, q7, [sp, #240]
+    ldp q4, q5, [sp, #208]
+    ldp q2, q3, [sp, #176]
+    ldp q0, q1, [sp, #144]
+    ldp x17, x18, [sp, #128]
+    ldp x15, x16, [sp, #112]
+    ldp x13, x14, [sp, #96]
+    ldp x11, x12, [sp, #80]
+    ldp x9, x10, [sp, #64]
+    ldp x7, x8, [sp, #48]
+    ldp x5, x6, [sp, #32]
+    ldp x3, x4, [sp, #16]
+    ldp x1, x2, [sp, #0]
+    add sp, sp, #528
+    ldp x29, x30, [sp], #16
+    ret
+    .size app_tlv_get_addr, .-app_tlv_get_addr
+
+// ___chkstk_darwin: the stack probe called (x15 = size / 16) before frames over a page. Android stacks are mapped up
+// front, so there is nothing to touch; it only has to leave every register alone.
+    .globl app_chkstk_darwin
+    .type app_chkstk_darwin, %function
+    .p2align 2
+app_chkstk_darwin:
+    ret
+    .size app_chkstk_darwin, .-app_chkstk_darwin

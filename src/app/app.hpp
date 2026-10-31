@@ -179,6 +179,7 @@ bool json_write(id root, std::string& out, bool pretty);
 // ---- environment ----
 std::string bundle_dir();                        // the .app directory
 std::string sandbox_dir(const char* sub);        // writable container subdirectory, created on demand
+void set_documents_dir(const std::string& dir);  // put the container's Documents elsewhere (before the app runs)
 std::string remap_path(const std::string& p);    // guest absolute paths -> device paths
 id info_dictionary();                            // parsed Info.plist (immortal)
 bool read_file(const std::string& path, std::string& out);
@@ -205,6 +206,7 @@ void init_foundation2();         // app_foundation2.cpp
 void init_uikit();               // app_uikit.cpp
 void init_gl();                  // app_gl.cpp
 void init_audio();               // app_audio.cpp
+void init_av();       // app_av.cpp: AVPlayer, AVAudioPlayer
 void init_cg();                  // app_cg.cpp
 void init_misc();                // app_misc.cpp
 void register_c_symbols(std::unordered_map<std::string, void*>& m);   // every module adds its C functions/data
@@ -216,6 +218,13 @@ void register_gl_symbols(std::unordered_map<std::string, void*>& m);
 void register_audio_symbols(std::unordered_map<std::string, void*>& m);
 void register_cg_symbols(std::unordered_map<std::string, void*>& m);
 void register_misc_symbols(std::unordered_map<std::string, void*>& m);
+void register_darwin_symbols(std::unordered_map<std::string, void*>& m);   // app_darwin.cpp
+void* data_constant(const std::string& name);   // an unresolved framework data import, made an NSString constant
+void register_crypto_symbols(std::unordered_map<std::string, void*>& m);   // CommonCrypto (app_crypto.cpp)
+
+// iOS version reported to the app ("15.0"), and packed as 0xMMMMmmpp for availability checks (app_darwin.cpp)
+const std::string& ios_version();
+uint32_t ios_version_packed();
 
 }  // namespace app
 
@@ -238,7 +247,10 @@ struct ImageInfo {
     uintptr_t selrefs = 0, selrefs_size = 0;
     uintptr_t methname = 0, methname_size = 0;
     uintptr_t protolist = 0, protolist_size = 0;
+    uintptr_t tlv_start = 0, tlv_size = 0;          // thread-local template (__thread_data + __thread_bss)
+    uintptr_t tlv_data = 0, tlv_data_size = 0;      // its initialized part
 };
+void tlv_setup(const ImageInfo& info);           // app_darwin.cpp
 void prepare();                                   // register native classes + C symbols (idempotent)
 void* resolve_symbol(const std::string& name);    // null if app mode does not provide it
 void boot(const ImageInfo& info);                 // after binds: register classes, attach categories, +load

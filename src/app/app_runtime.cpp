@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cstdarg>
@@ -98,6 +99,9 @@ struct RClass {
     std::atomic<int> init_state{0};               // 0 none, 1 running, 2 done
     pthread_t init_thread{};
     uintptr_t ro = 0;                             // guest class_ro_t
+    // .cxx_construct of each class from the root down / .cxx_destruct from this class up (C++ ivars, ARC ivars)
+    std::atomic<bool> cxx_ready{false};
+    std::vector<IMP> cxx_ctors, cxx_dtors;
 };
 
 static std::recursive_mutex g_rt;
@@ -241,17 +245,57 @@ constexpr uint32_t kClsMagic = 0x0b1ec7ed;
 constexpr int32_t kImmortal = 1 << 30;
 constexpr int32_t kDeallocating = 1 << 29;
 
-static inline Header* hdr(id o) { return reinterpret_cast<Header*>(o) - 1; }
+// iOS ignores the top byte of a pointer (TBI), and guest code uses it: our objects come back with flags there. The
+// memory behind an object is always addressed through its canonical pointer, and anything outside the user address
+// range (a scalar mistaken for an object) is not one of ours.
+static inline id canon(id o) { return reinterpret_cast<id>(reinterpret_cast<uintptr_t>(o) & 0x00ffffffffffffffull); }
+static inline Header* hdr(id o) { return reinterpret_cast<Header*>(canon(o)) - 1; }
 bool has_header(id o) {
+    o = canon(o);
     if (!o || in_image(o)) return false;
-    if (reinterpret_cast<uintptr_t>(o) & 7) return false;
+    uintptr_t a = reinterpret_cast<uintptr_t>(o);
+    if ((a & 7) || a < 0x10000 || a >= (1ull << 48)) return false;
     uint32_t m = hdr(o)->magic;
     return m == kObjMagic || m == kClsMagic;
 }
-Ext*& ext_slot(id o) { return hdr(o)->ext; }
+// The Ext pointer sits in the last 8 bytes before the object, and something sets bits in its top byte (a stray byte
+// write at object - 1). A heap pointer never has bits there, so they are cleared on every access; the first few
+// occurrences are reported with the object's class and the header bytes, to find the writer.
+static void scrub_ext(id o, Header* h) {
+    uintptr_t v = reinterpret_cast<uintptr_t>(h->ext);
+    if (!(v >> 56)) return;
+    static std::atomic<int> reported{0};
+    if (reported++ < 6) {
+        const auto* b = reinterpret_cast<const uint8_t*>(h);
+        log("object %p (%s): header ext %p had top-byte bits; header %02x%02x%02x%02x rc=%d", static_cast<void*>(canon(o)),
+            class_name(canon(o)->isa), reinterpret_cast<void*>(v), b[0], b[1], b[2], b[3], h->rc.load());
+    }
+    h->ext = reinterpret_cast<Ext*>(v & 0x00ffffffffffffffull);
+}
+Ext*& ext_slot(id o) {
+    Header* h = hdr(o);
+    scrub_ext(o, h);
+    return h->ext;
+}
 
 static bool g_no_free = false;
 static bool g_zombies = false;
+
+// The compiler emits .cxx_construct / .cxx_destruct for classes whose ivars need it (C++ members, ARC strong
+// references); the runtime runs every class's own one around the object's lifetime.
+static void cxx_structors(RClass* r) {
+    if (!r || r->cxx_ready.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::recursive_mutex> l(g_rt);
+    if (r->cxx_ready.load(std::memory_order_relaxed)) return;
+    SEL ctor = sel(".cxx_construct"), dtor = sel(".cxx_destruct");
+    for (RClass* k = r; k; k = k->super) {
+        auto c = k->methods.find(ctor);
+        if (c != k->methods.end()) r->cxx_ctors.insert(r->cxx_ctors.begin(), c->second->imp);
+        auto d = k->methods.find(dtor);
+        if (d != k->methods.end()) r->cxx_dtors.push_back(d->second->imp);
+    }
+    r->cxx_ready.store(true, std::memory_order_release);
+}
 
 id alloc(Class c) {
     RClass* r = rc_of_class(c);
@@ -263,6 +307,11 @@ id alloc(Class c) {
     h->rc.store(1, std::memory_order_relaxed);
     id o = reinterpret_cast<id>(mem + sizeof(Header));
     o->isa = c;
+    if (r && !r->is_meta) {
+        cxx_structors(r);
+        SEL s = sel(".cxx_construct");
+        for (IMP imp : r->cxx_ctors) reinterpret_cast<id (*)(id, SEL)>(imp)(o, s);
+    }
     return o;
 }
 
@@ -325,12 +374,47 @@ static void clear_side_tables(id o) {
 static std::vector<void (*)(id)> g_dealloc_hooks;
 void add_dealloc_hook(void (*hook)(id)) { g_dealloc_hooks.push_back(hook); }
 
+// reads memory that may not be mapped, without faulting
+static bool peek(const void* at, void* out, size_t n) {
+    iovec local{out, n}, remote{const_cast<void*>(at), n};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(n);
+}
+
+// An Ext is polymorphic, so a live one starts with a vtable pointer into this library. Anything else means the
+// object's header was overwritten, by a heap overflow from the memory in front of it. That is reported, with the bytes
+// found there, and the object is leaked rather than handing the allocator a corrupted chunk.
+static bool ext_intact(id o, Ext* e) {
+    static const uintptr_t lib = [] {
+        Dl_info info{};
+        return dladdr(reinterpret_cast<void*>(&dealloc_object), &info) ? reinterpret_cast<uintptr_t>(info.dli_fbase) : 0;
+    }();
+    uintptr_t vt = 0;
+    if (!e) return true;
+    if ((reinterpret_cast<uintptr_t>(e) & 7) == 0 && peek(e, &vt, sizeof vt) && lib && vt >= lib && vt < lib + (256u << 20)) return true;
+    uint8_t before[64] = {};
+    peek(reinterpret_cast<uint8_t*>(o) - sizeof before, before, sizeof before);
+    char hex[3 * sizeof before + 1];
+    for (size_t i = 0; i < sizeof before; ++i) snprintf(hex + 3 * i, 4, "%02x ", before[i]);
+    log("heap overflow: object %p (%s) has a corrupted header (ext=%p); 64 bytes before it: %s", static_cast<void*>(o),
+        class_name(o->isa), static_cast<void*>(e), hex);
+    return false;
+}
+
 void dealloc_object(id o) {
     if (!has_header(o)) return;
+    o = canon(o);   // side tables and the allocator know the canonical pointer
     Header* h = hdr(o);
     if (h->magic == kClsMagic) return;
+    if (RClass* r = rc_of_class(o->isa); r && !r->is_meta) {
+        cxx_structors(r);
+        SEL s = sel(".cxx_destruct");
+        for (IMP imp : r->cxx_dtors) reinterpret_cast<void (*)(id, SEL)>(imp)(o, s);
+    }
+    scrub_ext(o, h);
+    if (!ext_intact(o, h->ext)) return;   // leaked: freeing it would abort in the allocator
     for (auto hook : g_dealloc_hooks) hook(o);
     clear_side_tables(o);
+    scrub_ext(o, h);
     Ext* e = h->ext;
     h->ext = nullptr;
     delete e;
@@ -990,7 +1074,15 @@ static void rt_set_property(id self, SEL, ptrdiff_t off, id v, bool, signed char
 }
 static void rt_set_property_atomic_copy(id self, SEL s, id v, ptrdiff_t off) { rt_set_property(self, s, off, v, true, 1); }
 static void rt_set_property_nonatomic_copy(id self, SEL s, id v, ptrdiff_t off) { rt_set_property(self, s, off, v, false, 1); }
+static void rt_set_property_atomic(id self, SEL s, id v, ptrdiff_t off) { rt_set_property(self, s, off, v, true, 0); }
+static void rt_set_property_nonatomic(id self, SEL s, id v, ptrdiff_t off) { rt_set_property(self, s, off, v, false, 0); }
 static void rt_copy_struct(void* dst, const void* src, ptrdiff_t n, bool, bool) { std::memmove(dst, src, n); }
+// atomic property of a C++ type: the compiler passes the type's copy (assignment) helper
+static void rt_copy_cpp_object_atomic(void* dst, const void* src, void (*copy_helper)(void* dst, const void* src)) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> l(mu);
+    copy_helper(dst, src);
+}
 
 static std::recursive_mutex* sync_mutex(id o) {
     std::lock_guard<std::mutex> l(g_side_mu);
@@ -1061,6 +1153,11 @@ static MethodEntry* method_for(Class c, SEL s) {
     return r ? find_method_locked(r, s) : nullptr;
 }
 static void* rt_class_get_instance_method(Class c, SEL s) { return method_for(c, s); }
+// the type encoding of an instance method ("d16@0:8"), null when unknown (native methods carry none)
+extern "C" const char* app_method_types(Class c, SEL s) {
+    MethodEntry* m = method_for(c, s);
+    return m ? m->types : nullptr;
+}
 static void* rt_class_get_class_method(Class c, SEL s) { return method_for(app::metaclass_of(c), s); }
 static IMP rt_class_get_method_implementation(Class c, SEL s) {
     MethodEntry* m = method_for(c, s);
@@ -1097,7 +1194,124 @@ static bool rt_class_conforms(Class c, uintptr_t proto) {
     return n && app::class_conforms(c, n);
 }
 static bool rt_class_add_property(Class, const char*, const void*, unsigned) { return true; }
-static void* rt_property_copy_attribute_list(void*, unsigned* out) { if (out) *out = 0; return nullptr; }
+
+// properties: objc_property_t is the guest's property_t {name, attributes} inside class_ro_t's property list
+static void* rt_class_copy_property_list(Class c, unsigned* out) {
+    RClass* r = rc_of_class(c);
+    uintptr_t list = r && r->ro ? rd(r->ro + 64) : 0;
+    uint32_t n = list ? rd32(list + 4) : 0, esz = list ? std::max<uint32_t>(rd32(list) & 0xffff, 16) : 16;
+    if (out) *out = n;
+    if (!n) return nullptr;
+    auto* v = static_cast<uintptr_t*>(calloc(n + 1, sizeof(uintptr_t)));
+    for (uint32_t i = 0; i < n; ++i) v[i] = list + 8 + i * esz;
+    return v;
+}
+static void* rt_class_get_property(Class c, const char* name) {
+    if (!name) return nullptr;
+    for (RClass* r = rc_of_class(c); r; r = r->super) {
+        uintptr_t list = r->ro ? rd(r->ro + 64) : 0;
+        if (!list) continue;
+        uint32_t n = rd32(list + 4), esz = std::max<uint32_t>(rd32(list) & 0xffff, 16);
+        for (uint32_t i = 0; i < n; ++i) {
+            const char* nm = reinterpret_cast<const char*>(rd(list + 8 + i * esz));
+            if (nm && std::strcmp(nm, name) == 0) return reinterpret_cast<void*>(list + 8 + i * esz);
+        }
+    }
+    return nullptr;
+}
+static const char* rt_property_get_name(void* p) { return p ? reinterpret_cast<const char*>(rd(reinterpret_cast<uintptr_t>(p))) : nullptr; }
+static const char* rt_property_get_attributes(void* p) { return p ? reinterpret_cast<const char*>(rd(reinterpret_cast<uintptr_t>(p) + 8)) : nullptr; }
+// "T@\"NSString\",&,N,V_name" -> {T, @"NSString"}, {&, ""}, {N, ""}, {V, _name}; one malloc block, as libobjc returns
+static void* rt_property_copy_attribute_list(void* p, unsigned* out) {
+    if (out) *out = 0;
+    const char* a = rt_property_get_attributes(p);
+    if (!a || !*a) return nullptr;
+    std::vector<std::pair<char, std::string>> attrs;
+    for (const char* s = a; *s;) {
+        const char* e = s;
+        int depth = 0;   // commas inside a quoted class name or struct type do not separate attributes
+        while (*e && (*e != ',' || depth)) {
+            if (*e == '"') depth ^= 1;
+            ++e;
+        }
+        attrs.push_back({*s, std::string(s + 1, e)});
+        s = *e ? e + 1 : e;
+    }
+    size_t bytes = (attrs.size() + 1) * 16;
+    for (auto& at : attrs) bytes += 2 + at.second.size() + 1;
+    auto* block = static_cast<char*>(calloc(1, bytes));
+    auto* ents = reinterpret_cast<const char**>(block);
+    char* strs = block + (attrs.size() + 1) * 16;
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        ents[2 * i] = strs;
+        *strs++ = attrs[i].first;
+        *strs++ = 0;
+        ents[2 * i + 1] = strs;
+        std::memcpy(strs, attrs[i].second.c_str(), attrs[i].second.size() + 1);
+        strs += attrs[i].second.size() + 1;
+    }
+    if (out) *out = static_cast<unsigned>(attrs.size());
+    return block;
+}
+
+// guest protocol_t: {isa, name, protocols, instanceMethods, classMethods, optionalInstanceMethods, optionalClassMethods, ...}
+static bool rt_protocol_conforms_to_protocol(uintptr_t p, uintptr_t other) {
+    const char* want = other ? reinterpret_cast<const char*>(rd(other + 8)) : nullptr;
+    if (!p || !want) return false;
+    std::vector<uintptr_t> todo{p};
+    for (size_t k = 0; k < todo.size() && k < 256; ++k) {
+        const char* n = reinterpret_cast<const char*>(rd(todo[k] + 8));
+        if (n && std::strcmp(n, want) == 0) return true;
+        uintptr_t list = rd(todo[k] + 16);
+        if (rd(todo[k]) != app::class_named("Protocol") && list)   // native stand-ins have no lists
+            for (uint64_t i = 0, cnt = rd(list); i < cnt; ++i) todo.push_back(rd(list + 8 + 8 * i));
+    }
+    return false;
+}
+static bool rt_protocol_is_equal(uintptr_t a, uintptr_t b) {
+    return a == b || (a && b && std::strcmp(reinterpret_cast<const char*>(rd(a + 8)), reinterpret_cast<const char*>(rd(b + 8))) == 0);
+}
+static void* rt_protocol_copy_protocol_list(uintptr_t p, unsigned* out) {
+    if (out) *out = 0;
+    uintptr_t list = p && rd(p) != app::class_named("Protocol") ? rd(p + 16) : 0;
+    uint64_t n = list ? rd(list) : 0;
+    if (!n) return nullptr;
+    auto* v = static_cast<uintptr_t*>(calloc(n + 1, sizeof(uintptr_t)));
+    for (uint64_t i = 0; i < n; ++i) v[i] = rd(list + 8 + 8 * i);
+    if (out) *out = static_cast<unsigned>(n);
+    return v;
+}
+// objc_method_description {SEL name; char* types}
+static void* rt_protocol_copy_method_description_list(uintptr_t p, bool required, bool instance, unsigned* out) {
+    if (out) *out = 0;
+    if (!p || rd(p) == app::class_named("Protocol")) return nullptr;
+    uintptr_t list = rd(p + (required ? (instance ? 24 : 32) : (instance ? 40 : 48)));
+    if (!list) return nullptr;
+    uint32_t ent = rd32(list), n = rd32(list + 4);
+    bool rel = ent & 0x80000000u;
+    uint32_t esz = rel ? 12 : std::max<uint32_t>(ent & 0xfffc, 24);
+    if (!n) return nullptr;
+    auto* v = static_cast<uintptr_t*>(calloc(2 * n + 2, sizeof(uintptr_t)));
+    for (uint32_t i = 0; i < n; ++i) {
+        uintptr_t e = list + 8 + i * esz;
+        const char* name = rel ? reinterpret_cast<const char*>(rd(e + rdi32(e))) : reinterpret_cast<const char*>(rd(e));
+        const char* types = rel ? reinterpret_cast<const char*>(e + 4 + rdi32(e + 4)) : reinterpret_cast<const char*>(rd(e + 8));
+        v[2 * i] = reinterpret_cast<uintptr_t>(app::sel(name));
+        v[2 * i + 1] = reinterpret_cast<uintptr_t>(types);
+    }
+    if (out) *out = n;
+    return v;
+}
+static void* rt_class_copy_protocol_list(Class c, unsigned* out) {
+    if (out) *out = 0;
+    RClass* r = rc_of_class(c);
+    if (!r || r->protocols.empty()) return nullptr;
+    std::lock_guard<std::recursive_mutex> l(g_rt);
+    auto* v = static_cast<uintptr_t*>(calloc(r->protocols.size() + 1, sizeof(uintptr_t)));
+    for (size_t i = 0; i < r->protocols.size(); ++i) v[i] = r->protocols[i];
+    if (out) *out = static_cast<unsigned>(r->protocols.size());
+    return v;
+}
 static IMP rt_method_get_implementation(MethodEntry* m) { return m ? m->imp : nullptr; }
 static SEL rt_method_get_name(MethodEntry* m) { return m ? m->name : nullptr; }
 static const char* rt_method_get_type_encoding(MethodEntry* m) { return m ? m->types : nullptr; }
@@ -1228,7 +1442,10 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("_objc_setProperty", &rt_set_property);
     r("_objc_setProperty_atomic_copy", &rt_set_property_atomic_copy);
     r("_objc_setProperty_nonatomic_copy", &rt_set_property_nonatomic_copy);
+    r("_objc_setProperty_atomic", &rt_set_property_atomic);
+    r("_objc_setProperty_nonatomic", &rt_set_property_nonatomic);
     r("_objc_copyStruct", &rt_copy_struct);
+    r("_objc_copyCppObjectAtomic", &rt_copy_cpp_object_atomic);
     r("_objc_sync_enter", &rt_sync_enter);
     r("_objc_sync_exit", &rt_sync_exit);
     r("_objc_setAssociatedObject", &rt_set_assoc);
@@ -1258,6 +1475,15 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("_class_getInstanceVariable", &rt_class_get_instance_variable);
     r("_class_createInstance", &rt_class_create_instance);
     r("_property_copyAttributeList", &rt_property_copy_attribute_list);
+    r("_class_copyPropertyList", &rt_class_copy_property_list);
+    r("_class_getProperty", &rt_class_get_property);
+    r("_property_getName", &rt_property_get_name);
+    r("_property_getAttributes", &rt_property_get_attributes);
+    r("_class_copyProtocolList", &rt_class_copy_protocol_list);
+    r("_protocol_conformsToProtocol", &rt_protocol_conforms_to_protocol);
+    r("_protocol_isEqual", &rt_protocol_is_equal);
+    r("_protocol_copyProtocolList", &rt_protocol_copy_protocol_list);
+    r("_protocol_copyMethodDescriptionList", &rt_protocol_copy_method_description_list);
     r("_method_getImplementation", &rt_method_get_implementation);
     r("_method_getName", &rt_method_get_name);
     r("_method_getTypeEncoding", &rt_method_get_type_encoding);
@@ -1341,8 +1567,8 @@ void init_runtime_classes() {
     def(c, "class", +[](id self, SEL) -> Class { return is_class_object(self) ? reinterpret_cast<Class>(self) : self->isa; });
     def(c, "superclass", +[](id self, SEL) -> Class { return superclass_of(self->isa); });
     def(c, "isProxy", +[](id, SEL) -> bool { return false; });
-    def(c, "hash", +[](id self, SEL) -> NSUInteger { return reinterpret_cast<NSUInteger>(self) >> 4; });
-    def(c, "isEqual:", +[](id self, SEL, id o) -> bool { return self == o; });
+    def(c, "hash", +[](id self, SEL) -> NSUInteger { return reinterpret_cast<NSUInteger>(canon(self)) >> 4; });
+    def(c, "isEqual:", +[](id self, SEL, id o) -> bool { return canon(self) == canon(o); });
     def(c, "description", +[](id self, SEL) -> id { return str(default_description(self)); });
     def(c, "debugDescription", +[](id self, SEL) -> id { return send(self, "description"); });
     def(c, "isKindOfClass:", +[](id self, SEL, Class k) -> bool {

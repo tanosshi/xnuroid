@@ -5,6 +5,11 @@
 //   app::run_main(entry)   call the guest main(), which calls UIApplicationMain and never returns
 #include "app.hpp"
 
+#include <fcntl.h>
+#include <ftw.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <mutex>
 
 namespace app {
@@ -63,6 +68,7 @@ void build_symbols() {
     register_audio_symbols(*g_symbols);
     register_cg_symbols(*g_symbols);
     register_misc_symbols(*g_symbols);
+    register_darwin_symbols(*g_symbols);
 }
 
 }  // namespace
@@ -105,10 +111,25 @@ void prepare() {
         init_nib();
         init_gl();
         init_audio();
+        init_av();
         init_misc();
         build_symbols();
         log("app mode ready: native classes and %zu C symbols registered", g_symbols->size());
     });
+}
+
+// A framework class we do not implement: on iOS a weak-linked class missing at runtime is simply absent, and code
+// that uses it anyway gets nil from every message. A stub class (with the closest UIKit base by name) keeps that
+// behavior while letting alloc/init and superclass wiring work.
+static Class stub_class(const char* name) {
+    if (Class c = class_named(name)) return c;
+    std::string n = name;
+    auto ends = [&](const char* s) { size_t k = strlen(s); return n.size() >= k && n.compare(n.size() - k, k, s) == 0; };
+    const char* super = ends("GestureRecognizer") ? "UIGestureRecognizer" : ends("ViewController") ? "UIViewController"
+                        : ends("Layer") ? "CALayer" : ends("View") ? "UIView" : "NSObject";
+    if (!class_named(super)) super = "NSObject";
+    log("stub class %s : %s", name, super);
+    return def_class(strdup(name), super);
 }
 
 void* resolve_symbol(const std::string& name) {
@@ -117,12 +138,10 @@ void* resolve_symbol(const std::string& name) {
     if (it != g_symbols->end()) return it->second;
     // Objective-C class / metaclass descriptors -> our native class objects
     if (name.rfind("_OBJC_CLASS_$_", 0) == 0) {
-        Class c = class_named(name.c_str() + 14);
-        return c ? reinterpret_cast<void*>(c) : nullptr;
+        return reinterpret_cast<void*>(stub_class(name.c_str() + 14));
     }
     if (name.rfind("_OBJC_METACLASS_$_", 0) == 0) {
-        Class c = class_named(name.c_str() + 18);
-        return c ? reinterpret_cast<void*>(metaclass_of(c)) : nullptr;
+        return reinterpret_cast<void*>(metaclass_of(stub_class(name.c_str() + 18)));
     }
     // Compile-time @"..." string literals (__NSCFConstantString instances in the image) bind their isa to this
     // symbol; point it at the real constant-string class so messages to literals dispatch.
@@ -135,8 +154,49 @@ void* resolve_symbol(const std::string& name) {
     return nullptr;
 }
 
+// With all-files access the host passes the shared storage root (LOADER_SHARED_STORAGE); the app's Documents then
+// live in <root>/xnuroid/<display name>, where the user can reach them (like an iOS app's folder in Files). The
+// first time, whatever the app already had in its private Documents is copied there.
+static std::string g_copy_from, g_copy_to;
+static int copy_entry(const char* path, const struct stat*, int type, struct FTW*) {
+    std::string out = g_copy_to + (path + g_copy_from.size());
+    if (type == FTW_D) { mkdir(out.c_str(), 0775); return 0; }
+    if (type != FTW_F) return 0;
+    int in = open(path, O_RDONLY | O_CLOEXEC), o = open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0664);
+    char buf[1 << 16];
+    ssize_t n;
+    while (in >= 0 && o >= 0 && (n = read(in, buf, sizeof buf)) > 0) if (write(o, buf, static_cast<size_t>(n)) != n) break;
+    if (in >= 0) close(in);
+    if (o >= 0) close(o);
+    return 0;
+}
+static void choose_documents_dir() {
+    const char* root = getenv("LOADER_SHARED_STORAGE");
+    if (!root || !*root) return;
+    id info = info_dictionary();
+    std::string name = utf8(dict_get(info, "CFBundleDisplayName"));
+    if (name.empty()) name = utf8(dict_get(info, "CFBundleName"));
+    if (name.empty()) name = "App";
+    for (char& c : name) if (c == '/' || c == ':') c = '_';
+    std::string base = std::string(root) + "/xnuroid", dir = base + "/" + name;
+    struct stat st;
+    bool fresh = stat(dir.c_str(), &st) != 0;
+    mkdir(base.c_str(), 0775);
+    mkdir(dir.c_str(), 0775);
+    if (access(dir.c_str(), W_OK) != 0) { log("documents: %s is not writable, keeping them private", dir.c_str()); return; }
+    if (fresh) {
+        g_copy_from = sandbox_dir("Documents");
+        g_copy_to = dir;
+        nftw(g_copy_from.c_str(), copy_entry, 16, FTW_PHYS);
+    }
+    set_documents_dir(dir);
+    log("documents: %s%s", dir.c_str(), fresh ? " (private documents copied)" : "");
+}
+
 void boot(const ImageInfo& info) {
     prepare();
+    choose_documents_dir();
+    tlv_setup(info);
     if (info.protolist) register_guest_protocols(info.protolist, info.protolist_size);
     // boot_guest (app_runtime.cpp) reads class/category/selector sections and wires superclasses to the native
     // classes already bound into the image by dyld; the guest classes must exist before we can neuter any.
