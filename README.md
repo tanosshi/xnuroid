@@ -64,8 +64,9 @@ every function or only offsets listed in a file.
 ## Requirements
 
 - Windows with Git Bash/MSYS (the build scripts use `cygpath`) and a working `adb`
+- **Python 3.10+** (required for the helper GUI, APK branding, and tools)
 - Android NDK `28.2.13676358`
-- Android SDK build-tools `36.1.0` and platform `android-36`
+- Android SDK build-tools `36.1.0` (or newer; scripts will fallback to the newest installed version) and platform `android-36`
 - An arm64 Android device, API 31 or newer
 - A **decrypted** IPA containing an arm64 Unity IL2CPP build (FairPlay encryption is not handled)
 
@@ -108,7 +109,7 @@ without a terminal. Put the exe in the repository folder and open it, or drop an
 ./build_cli.sh
 ```
 
-This produces `xnuroid_loader` in the repository root. It links EGL, GLESv3, zlib, and AAudio.
+This produces `xnuroid_loader` in the repository root. It links EGL, GLESv3, zlib, AAudio, android, jnigraphics, and dl.
 
 For the Android app host (build and run), see the [Android app host](docs/android-app.md) document.
 
@@ -117,9 +118,21 @@ For the Android app host (build and run), see the [Android app host](docs/androi
 
 ## Running
 
-### Command-line loader
+## Running
 
-Copy the app bundle to `/data/local/tmp/game` on the device:
+### 1. Playable APK Host (Recommended)
+
+The standard way to run the game on your device is through the Android APK, which automatically packages your app bundle into `assets/game/`. 
+
+You can run this entirely through the **Helper app** (see above), or from the terminal:
+```bash
+./build_apk.sh install
+```
+There is no need to manually push bundle files via `adb` when using the APK host.
+
+### 2. Command-line loader (Diagnostic)
+
+If you are running the diagnostic CLI (`xnuroid_loader`) instead of the APK, you must manually stage the loader and the bundle on the device:
 
 ```bash
 adb push xnuroid_loader /data/local/tmp/
@@ -132,6 +145,9 @@ adb shell /data/local/tmp/xnuroid_loader
 
 Override the bundle root with `LOADER_GAME_DIR`. The default writable container is
 `/data/local/tmp/sandbox`; override it with `LOADER_SANDBOX_DIR`.
+
+### 3. Desktop Harness
+For desktop-side Mach-O testing, use `tools/macho_runner.py`. This is a Unicorn-based desktop harness for the Mach-O, which powers scripts like `test_unity.py` and `headless_il2cpp.py`.
 
 ### Launch stages
 
@@ -159,7 +175,8 @@ See the [environment variables](docs/environment-variables.md) reference.
 run_matrix.txt defines device runs as name|environment. The current entries are the default run
 and an engine-7/FDE run.
 run_phases.ps1 builds, deploys, runs the matrix, and writes device_logs\<timestamp>\SUMMARY.txt.
-Its compile command predates the current source list. Prefer building with `build_cli.sh`, then run:
+
+> **Warning:** Its compile command predates the current source list and only targets `android_loader.cpp`, `apple_string.cpp`, and `trampolines.s`. Prefer building with `build_cli.sh`, then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File run_phases.ps1 -SkipBuild
