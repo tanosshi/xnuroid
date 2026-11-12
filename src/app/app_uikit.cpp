@@ -112,7 +112,13 @@ struct LayerExt : Ext {
     id drawable_props = nullptr, contents = nullptr, background = nullptr;
     std::vector<id> sublayers;
     id superlayer = nullptr;          // weak
-    ~LayerExt() override { release(drawable_props); release(contents); release(background); for (id l : sublayers) release(l); }
+    ~LayerExt() override {
+        release(drawable_props); release(contents); release(background);
+        for (id l : sublayers) {
+            if (auto* sub = ext_as<LayerExt>(l)) sub->superlayer = nullptr;   // a sublayer the app still holds must not point at this one
+            release(l);
+        }
+    }
 };
 
 struct ViewExt : Ext {
@@ -205,7 +211,9 @@ extern "C" void app_host_touch(int pid, int phase, float nx, float ny) {
         g_host_touches.back().y = ny;
         return;
     }
+    if (g_host_touches.size() >= 4096) g_host_touches.clear();   // nobody is draining: the engine-mode queue owns the input
     g_host_touches.push_back({pid, phase, nx, ny});
+    run_loop_wake();   // delivered on the main loop's next pass, which should not wait out its sleep first
 }
 
 static id hit_test(id view, CGPoint p_window);
@@ -1456,7 +1464,7 @@ static void define_window_vc_app() {
             view_will_appear(vc, false);
             if (id v = cx(vc)->view) remove_from_superview(v);
             cx(vc)->presenting = nullptr;
-            release(vc);
+            autorelease(vc);   // usually the caller itself ([self dismiss...]), which goes on using self
         }
         if (completion) reinterpret_cast<void (*)(id)>(block_invoke_ptr(completion))(completion);
     };
@@ -1516,7 +1524,7 @@ static void define_window_vc_app() {
     });
     def(NC, "popToRootViewControllerAnimated:", +[](id self, SEL, bool) -> id {
         auto& ch = cx(self)->children;
-        while (ch.size() > 1) { id vc = ch.back(); ch.pop_back(); if (id v = cx(vc)->view) remove_from_superview(v); release(vc); }
+        while (ch.size() > 1) { id vc = ch.back(); ch.pop_back(); if (id v = cx(vc)->view) remove_from_superview(v); autorelease(vc); }
         return arr({});
     });
     def(NC, "viewControllers", +[](id self, SEL) -> id { return arr(cx(self)->children); });
@@ -1808,9 +1816,9 @@ static void define_layers() {
         auto* e = ext_get<LinkExt>(self);
         if (!e->valid) return;
         e->valid = false;
-        link_unschedule(self);
         id t = e->target;
         e->target = nullptr;
+        link_unschedule(self);   // may drop the last reference (the run loop's): the link is not touched after this
         release(t);
     });
     def(DL, "isPaused", +[](id self, SEL) -> bool { return ext_get<LinkExt>(self)->paused; });
@@ -1820,13 +1828,13 @@ static void define_layers() {
     def(DL, "setFrameInterval:", +[](id self, SEL, long n) {
         auto* e = ext_get<LinkExt>(self);
         e->interval = std::max<long>(1, n);
-        if (e->scheduled) { link_unschedule(self); link_schedule(self); }
+        if (e->scheduled) { retain(self); link_unschedule(self); link_schedule(self); release(self); }
     });
     def(DL, "preferredFramesPerSecond", +[](id self, SEL) -> long { return ext_get<LinkExt>(self)->preferred_fps; });
     def(DL, "setPreferredFramesPerSecond:", +[](id self, SEL, long n) {
         auto* e = ext_get<LinkExt>(self);
         e->preferred_fps = n;
-        if (e->scheduled) { link_unschedule(self); link_schedule(self); }
+        if (e->scheduled) { retain(self); link_unschedule(self); link_schedule(self); release(self); }
     });
     def(DL, "timestamp", +[](id self, SEL) -> double { return ext_get<LinkExt>(self)->timestamp; });
     def(DL, "targetTimestamp", +[](id self, SEL) -> double { auto* e = ext_get<LinkExt>(self); return e->timestamp + link_period(e); });

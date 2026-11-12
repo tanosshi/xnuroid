@@ -38,8 +38,10 @@ mkdir -p "$OUT/lib/arm64-v8a"
 # Pulled again when a different phone (build fingerprint) is connected; kept when none is.
 FINGERPRINT=$("$ADB" shell getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
 if [ ! -f build/libsysc++.so ] || { [ -n "$FINGERPRINT" ] && [ "$FINGERPRINT" != "$(cat build/libsysc++.device 2>/dev/null)" ]; }; then
-    "$ADB" pull /system/lib64/libc++.so build/libsysc++.so >/dev/null ||
-        { echo "connect the arm64 device once so build/libsysc++.so can be pulled" >&2; exit 1; }
+    # Pulled under another name first: an interrupted pull must not leave a partial file that later builds reuse.
+    "$ADB" pull /system/lib64/libc++.so build/libsysc++.so.part >/dev/null ||
+        { rm -f build/libsysc++.so.part; echo "connect the arm64 device once so build/libsysc++.so can be pulled" >&2; exit 1; }
+    mv -f build/libsysc++.so.part build/libsysc++.so
     echo "$FINGERPRINT" > build/libsysc++.device
 fi
 cp build/libsysc++.so "$OUT/lib/arm64-v8a/libsysc++.so"

@@ -204,7 +204,10 @@ void cc_hmac_init(Hmac* h, uint32_t alg, const void* key, size_t key_len) {
 void cc_hmac_update(Hmac* h, const void* d, size_t n) { if (digest_len(h->alg)) hmac_feed(*h, false, d, n); }
 void cc_hmac_final(Hmac* h, uint8_t* mac) {
     size_t len = digest_len(h->alg);
-    if (!len) { std::memset(mac, 0, 64); return; }
+    if (!len) {   // not implemented: zeros, as many as that algorithm's digest has (SHA384, SHA512, SHA224)
+        std::memset(mac, 0, h->alg == 3 ? 48 : h->alg == 4 ? 64 : h->alg == 5 ? 28 : 0);
+        return;
+    }
     uint8_t inner[32];
     hmac_digest(*h, false, inner);
     hmac_feed(*h, true, inner, len);

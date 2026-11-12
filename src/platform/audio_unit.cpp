@@ -160,12 +160,37 @@ aaudio_data_callback_result_t on_audio(AAudioStream*, void* user, void* data, in
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-void on_error(AAudioStream*, void*, aaudio_result_t err) { fprintf(stderr, "[AUDIO] AAudio stream error %d\n", err); }
+bool open_aaudio(Unit* u);
+void run_pump(Unit* u);
+
+// The output device went away (headphones unplugged, Bluetooth route change): the stream is dead and its data
+// callback is not called again. A new stream is opened on the current default device, from a thread of its own
+// because AAudio does not allow closing a stream inside its callbacks.
+void reopen_after_disconnect(Unit* u, AAudioStream* dead) {
+    {
+        std::lock_guard<std::mutex> l(g_units_mu);
+        if (!g_units.count(u) || u->stream != dead) return;   // stopped or disposed in the meantime
+        u->stream = nullptr;
+    }
+    AAudioStream_requestStop(dead);
+    AAudioStream_close(dead);   // outside the lock, like native_au_stop
+    std::lock_guard<std::mutex> l(g_units_mu);
+    if (!g_units.count(u) || !u->running || u->stream) return;
+    if (open_aaudio(u) && (g_paused || AAudioStream_requestStart(u->stream) == AAUDIO_OK)) return;
+    if (u->stream) { AAudioStream_close(u->stream); u->stream = nullptr; }
+    fprintf(stderr, "[AUDIO] output not reopened after the route change: rendering into the void\n");
+    if (!u->pump.joinable()) u->pump = std::thread(run_pump, u);
+}
+
+void on_error(AAudioStream* stream, void* user, aaudio_result_t err) {
+    fprintf(stderr, "[AUDIO] AAudio stream error %d\n", err);
+    if (err == AAUDIO_ERROR_DISCONNECTED) std::thread(reopen_after_disconnect, static_cast<Unit*>(user), stream).detach();
+}
 
 bool open_aaudio(Unit* u) {
     const char* e = getenv("LOADER_AUDIO");
     if (e && e[0] == '0') return false;
-    if (!u->is_float && u->bits != 16) return false;   // AAudio takes I16 or float
+    if (u->is_float ? u->bits != 32 : u->bits != 16) return false;   // AAudio takes I16 or 32-bit float
     AAudioStreamBuilder* b = nullptr;
     if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
@@ -249,7 +274,9 @@ uint8_t* sample_ptr(void* abl, const Fmt& f, uint32_t i, uint32_t c) {
 
 // Calls a bus's callback for `frames` frames and appends them to its pending input as stereo float.
 void pull_bus(Bus& b, uint32_t index, uint32_t frames) {
-    const Fmt& f = b.fmt;
+    // by value: the guest may set a new format or callback from another thread while this pull is running
+    const Fmt f = b.fmt;
+    const RenderCallback cb = b.cb;
     const uint32_t bps = f.bps(), nbufs = f.planar() ? f.channels : 1, per_buf = f.planar() ? 1 : f.channels;
     // slack past the buffers, checked after the callback: a callback that writes more than it was given is reported
     // once instead of corrupting the heap
@@ -265,7 +292,7 @@ void pull_bus(Bus& b, uint32_t index, uint32_t frames) {
     std::memcpy(ts, &b.sample_time, 8);
     uint32_t ts_flags = 1, action = 0;
     std::memcpy(ts + 56, &ts_flags, 4);
-    b.cb.proc(b.cb.refcon, &action, ts, index, frames, b.abl.data());
+    if (cb.proc) cb.proc(cb.refcon, &action, ts, index, frames, b.abl.data());   // unset meanwhile: silence
     b.sample_time += frames;
     for (size_t i = bytes; i < bytes + kSlack; ++i)
         if (b.raw[i] != 0xa5) {
@@ -474,6 +501,12 @@ int32_t native_au_set_property(void* p, uint32_t prop, uint32_t scope, uint32_t 
     if (prop == 23 && size >= sizeof(RenderCallback)) {   // kAudioUnitProperty_SetRenderCallback
         std::memcpy(&u->cb, data, sizeof(RenderCallback));
     } else if (prop == 8 && size >= 40) {                 // kAudioUnitProperty_StreamFormat
+        // Element 1 is the microphone side of a RemoteIO unit, not what gets played. And a stream that is already
+        // open keeps its format: render() fills AAudio's buffer by these fields.
+        if (element == 1 || u->running) {
+            fprintf(stderr, "[AUDIO] stream format for %s ignored\n", element == 1 ? "the input element" : "a running unit");
+            return 0;
+        }
         double rate;
         uint32_t fl, ch, bits;
         std::memcpy(&rate, data, 8);

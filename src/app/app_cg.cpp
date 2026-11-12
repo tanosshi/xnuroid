@@ -85,10 +85,7 @@ bool decode_png(const uint8_t* p, size_t n, Bitmap& out) {
         }
         i += 12 + len;
     }
-    if (w <= 0 || h <= 0 || depth != 8 || interlaced) {
-        if (interlaced) log("PNG: interlaced images are not supported");
-        return false;
-    }
+    if (w <= 0 || h <= 0 || depth != 8 || interlaced) return false;   // decode_image falls back to the platform decoder
     int channels = color == 2 ? 3 : color == 6 ? 4 : color == 0 ? 1 : color == 4 ? 2 : color == 3 ? 1 : 0;
     if (!channels) return false;
     int stride = w * channels;
@@ -154,7 +151,9 @@ bool decode_android(const uint8_t* p, size_t n, Bitmap& out) {
 }
 
 bool decode_image(const uint8_t* p, size_t n, Bitmap& out) {
-    if (n >= 8 && p[0] == 137 && p[1] == 'P') return decode_png(p, n, out);
+    // decode_png is there for Apple's CgBI variant and reads plain 8-bit PNGs on the way; palette depths below 8,
+    // 16-bit and interlaced files go to the platform decoder like every other format
+    if (n >= 8 && p[0] == 137 && p[1] == 'P' && decode_png(p, n, out)) return true;
     return decode_android(p, n, out);
 }
 
@@ -170,16 +169,48 @@ struct ContextExt : Ext {
     CGAffineTransform ctm{1, 0, 0, 1, 0, 0};
     uint8_t* user = nullptr;      // the caller's backing store (CGBitmapContextCreate data), kept in sync with bmp
     size_t user_bpr = 0;
+    int order = 0;                // byte order of a pixel in the backing store, from the bitmap info (kPixelOrder)
+    std::vector<uint8_t> own;     // the backing store of a context made without one, when its order is not RGBA
     double fill[4] = {0, 0, 0, 1};
     CGPoint text_pos{0, 0};
 };
 // Drawing goes to bmp; a context created over the caller's memory mirrors it there, where the caller reads it.
+// Where R, G, B and A sit in a pixel: RGBA (alpha last), BGRA (alpha first, 32-bit little endian: the native iOS
+// layout), ARGB (alpha first), ABGR (alpha last, little endian). bmp itself is always RGBA.
+const uint8_t kPixelOrder[4][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}, {1, 2, 3, 0}, {3, 2, 1, 0}};
+// The other way, before drawing or snapshotting: the app also writes pixels into its buffer directly.
+void load_user(ContextExt* e) {
+    if (!e->user) return;
+    const uint8_t* o = kPixelOrder[e->order];
+    for (int y = 0; y < e->bmp.h; ++y) {
+        uint8_t* d = e->bmp.rgba.data() + static_cast<size_t>(y) * e->bmp.w * 4;
+        const uint8_t* s = e->user + static_cast<size_t>(y) * e->user_bpr;
+        if (!e->order) { std::memcpy(d, s, static_cast<size_t>(e->bmp.w) * 4); continue; }
+        for (int x = 0; x < e->bmp.w; ++x, d += 4, s += 4) { d[0] = s[o[0]]; d[1] = s[o[1]]; d[2] = s[o[2]]; d[3] = s[o[3]]; }
+    }
+}
 void sync_user(ContextExt* e) {
     if (!e->user) return;
-    for (int y = 0; y < e->bmp.h; ++y)
-        std::memcpy(e->user + static_cast<size_t>(y) * e->user_bpr, e->bmp.rgba.data() + static_cast<size_t>(y) * e->bmp.w * 4, static_cast<size_t>(e->bmp.w) * 4);
+    const uint8_t* o = kPixelOrder[e->order];
+    for (int y = 0; y < e->bmp.h; ++y) {
+        uint8_t* d = e->user + static_cast<size_t>(y) * e->user_bpr;
+        const uint8_t* s = e->bmp.rgba.data() + static_cast<size_t>(y) * e->bmp.w * 4;
+        if (!e->order) { std::memcpy(d, s, static_cast<size_t>(e->bmp.w) * 4); continue; }
+        for (int x = 0; x < e->bmp.w; ++x, d += 4, s += 4) { d[o[0]] = s[0]; d[o[1]] = s[1]; d[o[2]] = s[2]; d[o[3]] = s[3]; }
+    }
 }
-struct ProviderExt : Ext { id data = nullptr; ~ProviderExt() override { release(data); } };
+struct ProviderExt : Ext {
+    id data = nullptr;
+    // CGDataProviderCreateWithData: the caller's buffer and the callback that gives it back
+    void (*free_cb)(void*, const void*, size_t) = nullptr;
+    void* free_info = nullptr;
+    const void* free_data = nullptr;
+    size_t free_size = 0;
+    ~ProviderExt() override {
+        release(data);
+        if (free_cb) free_cb(free_info, free_data, free_size);
+    }
+};
 
 std::shared_ptr<Bitmap> image_bitmap(id img);
 
@@ -220,11 +251,13 @@ std::shared_ptr<Bitmap> load_bitmap_file(const std::string& path) {
 id image_named(const std::string& name) {
     std::string base = bundle_dir() + "/";
     std::string stem = name, ext;
-    size_t dot = name.rfind('.');
-    if (dot != std::string::npos && name.find('/') < dot) { stem = name.substr(0, dot); ext = name.substr(dot); }
+    size_t dot = name.rfind('.'), slash = name.rfind('/');
+    // an extension is a dot in the last path component ("foo.png", "ui/foo.png", but not "ui.v2/foo")
+    if (dot != std::string::npos && (slash == std::string::npos || slash < dot)) { stem = name.substr(0, dot); ext = name.substr(dot); }
     if (ext.empty()) ext = ".png";
     double scale = 1;
-    std::vector<std::pair<std::string, double>> tries = {{stem + "@2x" + ext, 2}, {stem + ext, 1}};
+    std::vector<std::pair<std::string, double>> tries = {{stem + "@2x~iphone" + ext, 2}, {stem + "@2x" + ext, 2},
+                                                         {stem + "~iphone" + ext, 1}, {stem + ext, 1}};
     for (auto& [cand, sc] : tries) {
         auto b = load_bitmap_file(base + cand);
         if (b) { scale = sc; return make_uiimage(b, scale); }
@@ -294,7 +327,11 @@ static CGRect cg_rect_integral(CGRect r) {
 }
 static CGRect cg_rect_inset(CGRect r, double dx, double dy) { return {{r.origin.x + dx, r.origin.y + dy}, {r.size.width - 2 * dx, r.size.height - 2 * dy}}; }
 static CGRect cg_rect_offset(CGRect r, double dx, double dy) { return {{r.origin.x + dx, r.origin.y + dy}, r.size}; }
+// CGRectNull: origin at infinity. The union with it is the other rectangle, and no intersection gives it back.
+static bool cg_rect_is_null(CGRect r) { return std::isinf(r.origin.x) || std::isinf(r.origin.y); }
 static CGRect cg_rect_union(CGRect a, CGRect b) {
+    if (cg_rect_is_null(a)) return b;
+    if (cg_rect_is_null(b)) return a;
     a = cg_rect_standardize(a); b = cg_rect_standardize(b);
     double minx = std::min(a.origin.x, b.origin.x), miny = std::min(a.origin.y, b.origin.y);
     double maxx = std::max(a.origin.x + a.size.width, b.origin.x + b.size.width), maxy = std::max(a.origin.y + a.size.height, b.origin.y + b.size.height);
@@ -304,7 +341,7 @@ static CGRect cg_rect_intersection(CGRect a, CGRect b) {
     a = cg_rect_standardize(a); b = cg_rect_standardize(b);
     double x = std::max(a.origin.x, b.origin.x), y = std::max(a.origin.y, b.origin.y);
     double r = std::min(a.origin.x + a.size.width, b.origin.x + b.size.width), bot = std::min(a.origin.y + a.size.height, b.origin.y + b.size.height);
-    if (r < x || bot < y) return {{0, 0}, {0, 0}};   // CGRectNull is treated as empty
+    if (cg_rect_is_null(a) || cg_rect_is_null(b) || r < x || bot < y) return {{INFINITY, INFINITY}, {0, 0}};   // CGRectNull
     return {{x, y}, {r - x, bot - y}};
 }
 static bool cg_rect_contains_point(CGRect r, CGPoint p) { r = cg_rect_standardize(r); return p.x >= r.origin.x && p.x < r.origin.x + r.size.width && p.y >= r.origin.y && p.y < r.origin.y + r.size.height; }
@@ -344,30 +381,43 @@ static id cg_bitmap_context_create(void* data, size_t w, size_t h, size_t bpc, s
     e->bmp.h = static_cast<int>(h);
     e->gray = cs == reinterpret_cast<void*>(2);
     e->bmp.rgba.assign(static_cast<size_t>(w) * h * 4, 0);
-    if (data && bpc == 8 && bpr >= w * 4 && !e->gray) {   // RGBA8 over the caller's buffer: start from its contents
+    // kCGImageAlphaPremultipliedFirst / First / NoneSkipFirst put alpha in front; kCGBitmapByteOrder32Little reverses the bytes
+    const uint32_t alpha = info & 0x1f;
+    const bool alpha_first = alpha == 2 || alpha == 4 || alpha == 6, little = (info & 0x7000) == 0x2000;
+    e->order = e->gray ? 0 : alpha_first ? (little ? 1 : 2) : (little ? 3 : 0);
+    if (data && bpc == 8 && bpr >= w * 4 && !e->gray) {   // 8-bit color over the caller's buffer: start from its contents
         e->user = static_cast<uint8_t*>(data);
         e->user_bpr = bpr;
-        for (size_t y = 0; y < h; ++y) std::memcpy(e->bmp.rgba.data() + y * w * 4, e->user + y * bpr, w * 4);
+        load_user(e);
+    } else if (!data && e->order) {   // CoreGraphics allocates the store: the app reads it through CGBitmapContextGetData
+        e->own.assign(static_cast<size_t>(w) * h * 4, 0);
+        e->user = e->own.data();
+        e->user_bpr = w * 4;
     }
-    (void)info;
     return c;   // +1 (CoreGraphics create rule)
 }
 static id cg_bitmap_context_create_image(id ctx) {
     auto* e = ext_as<ContextExt>(ctx);
     if (!e) return nullptr;
+    load_user(e);
     auto b = std::make_shared<Bitmap>(e->bmp);
     id img = alloc(C_CGImageRef);
     ext_get<CGImageExt>(img)->bmp = b;
     return img;   // +1
 }
-static void* cg_bitmap_context_get_data(id ctx) { auto* e = ext_as<ContextExt>(ctx); return e ? e->bmp.rgba.data() : nullptr; }
+static void* cg_bitmap_context_get_data(id ctx) { auto* e = ext_as<ContextExt>(ctx); return !e ? nullptr : e->user ? e->user : e->bmp.rgba.data(); }
 static size_t cg_bitmap_context_get_width(id ctx) { auto* e = ext_as<ContextExt>(ctx); return e ? e->bmp.w : 0; }
 static size_t cg_bitmap_context_get_height(id ctx) { auto* e = ext_as<ContextExt>(ctx); return e ? e->bmp.h : 0; }
-static size_t cg_bitmap_context_get_bpr(id ctx) { auto* e = ext_as<ContextExt>(ctx); return e ? static_cast<size_t>(e->bmp.w) * 4 : 0; }
+static size_t cg_bitmap_context_get_bpr(id ctx) { auto* e = ext_as<ContextExt>(ctx); return !e ? 0 : e->user ? e->user_bpr : static_cast<size_t>(e->bmp.w) * 4; }
 
-static id cg_provider_with_data(void*, const void* data, size_t size, void*) {
+static id cg_provider_with_data(void* info, const void* data, size_t size, void (*release_data)(void*, const void*, size_t)) {
     id p = alloc(C_CGDataProvider);
-    ext_get<ProviderExt>(p)->data = retain(data_new(data, size));
+    auto* e = ext_get<ProviderExt>(p);
+    e->data = retain(data_new(data, size));
+    e->free_cb = release_data;
+    e->free_info = info;
+    e->free_data = data;
+    e->free_size = size;
     return p;
 }
 static id cg_provider_with_cfdata(id cfdata) {
@@ -434,6 +484,7 @@ static void cg_draw_image(id ctx, CGRect r, id img) {
     auto* ce = ext_as<ContextExt>(ctx);
     auto b = image_bitmap(img);
     if (!ce || !b) return;
+    load_user(ce);
     int dx = static_cast<int>(r.origin.x), dy = static_cast<int>(r.origin.y), dw = static_cast<int>(r.size.width), dh = static_cast<int>(r.size.height);
     for (int y = 0; y < dh; ++y) {
         int ty = dy + y;
@@ -451,6 +502,21 @@ static void cg_draw_image(id ctx, CGRect r, id img) {
         }
     }
     sync_user(ce);
+}
+
+// CGContextClearRect: transparent black. Texture loaders clear the buffer they malloc'ed before drawing into it;
+// without this the transparent parts of the image keep whatever the heap had there.
+static void cg_clear_rect(id ctx, CGRect r) {
+    auto* e = ext_as<ContextExt>(ctx);
+    if (!e) return;
+    load_user(e);
+    r = cg_rect_standardize(r);
+    const double w = e->bmp.w, h = e->bmp.h;
+    const int x0 = static_cast<int>(std::clamp(std::floor(r.origin.x), 0.0, w)), x1 = static_cast<int>(std::clamp(std::ceil(r.origin.x + r.size.width), 0.0, w));
+    // CoreGraphics y runs up from the bottom row
+    const int y0 = static_cast<int>(std::clamp(h - std::ceil(r.origin.y + r.size.height), 0.0, h)), y1 = static_cast<int>(std::clamp(h - std::floor(r.origin.y), 0.0, h));
+    for (int y = y0; y < y1 && x1 > x0; ++y) std::memset(e->bmp.rgba.data() + (static_cast<size_t>(y) * e->bmp.w + x0) * 4, 0, static_cast<size_t>(x1 - x0) * 4);
+    sync_user(e);
 }
 
 // ---- CoreText: CTFont is UIFont (toll-free on iOS), CTLine a run of text; glyphs come from the host's text engine ----
@@ -505,6 +571,7 @@ void ct_line_draw(id line, id ctx) {
     auto* le = ext_as<LineExt>(line);
     auto* ce = ext_as<ContextExt>(ctx);
     if (!le || !ce || le->text.empty() || !host_text_draw) return;
+    load_user(ce);
     const double* c = le->has_color ? le->rgba : ce->fill;
     auto byte = [](double v) { return static_cast<uint32_t>(std::lround(std::clamp(v, 0.0, 1.0) * 255)); };
     uint32_t rgba = byte(c[0]) << 24 | byte(c[1]) << 16 | byte(c[2]) << 8 | byte(c[3]);
@@ -629,7 +696,7 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CGRectContainsRect", &cg_rect_contains_rect);
     r("_CGRectIntersectsRect", &cg_rect_intersects);
     r("_CGRectIsEmpty", &cg_rect_is_empty);
-    r("_CGRectIsNull", &cg_rect_is_empty);
+    r("_CGRectIsNull", &cg_rect_is_null);
     r("_CGRectEqualToRect", &cg_rect_equal);
     r("_CGPointEqualToPoint", &cg_point_equal);
     r("_CGSizeEqualToSize", &cg_size_equal);
@@ -662,7 +729,7 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CGContextRetain", &cg_retain_id);
     r("_CGContextDrawImage", &cg_draw_image);
     // images
-    r("_CGImageRelease", &cg_release_noop);
+    r("_CGImageRelease", +[](id img) { release(img); });   // the Create functions and CGImageRetain return +1
     r("_CGImageRetain", &cg_retain_id);
     r("_CGImageCreateCopy", &cg_image_create_copy);
     r("_CGImageCreateWithImageInRect", &cg_image_create_with_image_in_rect);
@@ -681,7 +748,7 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CGDataProviderCreateWithData", &cg_provider_with_data);
     r("_CGDataProviderCreateWithCFData", &cg_provider_with_cfdata);
     r("_CGDataProviderCreateWithFilename", &cg_provider_with_file);
-    r("_CGDataProviderRelease", &cg_release_noop);
+    r("_CGDataProviderRelease", +[](id provider) { release(provider); });
     r("_CGDataProviderRetain", &cg_retain_id);
     // colors / fonts / gradients: inert handles (the game's own GL path does the real drawing)
     r("_CGColorCreate", &cg_color_create);
@@ -716,6 +783,7 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
                           "_CGContextSetFillColorSpace", "_CGContextStrokeLineSegments", "_CGContextAddQuadCurveToPoint", "_CGContextStrokeRectWithWidth"})
         r(n, reinterpret_cast<void (*)()>(&cg_context_noop));
     r("_CGContextGetCTM", +[](id) -> CGAffineTransform { return {1, 0, 0, 1, 0, 0}; });
+    r("_CGContextClearRect", &cg_clear_rect);
     r("_CGContextSetFillColorWithColor", &cg_set_fill_color);
     r("_CGContextSetRGBFillColor", &cg_set_rgb_fill);
     r("_CGContextSetGrayFillColor", &cg_set_gray_fill);

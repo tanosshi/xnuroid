@@ -115,17 +115,45 @@ static bool cf_string_get_cstr(id s, char* buf, long size, uint32_t) {
     std::memcpy(buf, u.c_str(), u.size() + 1);
     return true;
 }
-static long cf_string_get_bytes(id s, NSRange r, uint32_t, uint8_t, bool, uint8_t* buf, long max, long* used) {
-    std::string u = utf8(s);
-    long n = std::min<long>(max, static_cast<long>(u.size()));
-    if (buf) std::memcpy(buf, u.data(), n);
-    if (used) *used = n;
-    return n;
+// CFStringEncoding -> NSStringEncoding. external: with a byte order mark, as CFString writes the plain UTF-16 and
+// UTF-32 encodings only when asked for the external representation.
+static NSUInteger cf_to_ns_encoding(uint32_t cf, bool external = true) {
+    switch (cf) {
+        case 0x08000100: return 4;                            // UTF-8
+        case 0x0600: return 1;                                // ASCII
+        case 0x0201: return 5;                                // ISO Latin 1
+        case 0x0500: return 12;                               // Windows Latin 1
+        case 0: return 30;                                    // MacRoman
+        case 0x0100: return external ? 10 : 0x94000100;       // UTF-16
+        case 0x0c000100: return external ? 0x8c000100 : 0x9c000100;   // UTF-32
+        default: return cf | 0x80000000u;                     // UTF-16/32 with a fixed byte order: the same number, top bit set
+    }
+}
+// Converts as many characters of the range as fit in the buffer (all of them without one); returns that count and
+// stores the bytes they take. Engines read strings out this way into their own UTF-32 or UTF-16 arrays.
+static long cf_string_get_bytes(id s, NSRange r, uint32_t enc, uint8_t, bool external, uint8_t* buf, long max, long* used) {
+    if (used) *used = 0;
+    if (!is_string(s)) return 0;
+    const NSUInteger len = send<NSUInteger>(s, "length"), ns_enc = cf_to_ns_encoding(enc, external);
+    if (r.location > len) return 0;
+    NSUInteger count = std::min(r.length, len - r.location);
+    for (;;) {
+        id d = send(send(s, "substringWithRange:", NSRange{r.location, count}), "dataUsingEncoding:", ns_enc);
+        const long bytes = static_cast<long>(data_len(d));
+        if (!buf || bytes <= max || !count) {
+            if (buf && bytes <= max) std::memcpy(buf, data_bytes(d), static_cast<size_t>(bytes));
+            if (used) *used = !buf || bytes <= max ? bytes : 0;
+            return static_cast<long>(!buf || bytes <= max ? count : 0);
+        }
+        count = std::min<NSUInteger>(count - 1, count * static_cast<NSUInteger>(std::max<long>(max, 0)) / static_cast<NSUInteger>(bytes));
+    }
 }
 static id cf_string_create_with_cstr(void*, const char* c, uint32_t) { return c ? str_new(c) : nullptr; }
 static id cf_string_create_with_bytes(void*, const uint8_t* b, long n, uint32_t enc, bool) {
+    if (!b || n < 0) return nullptr;
     if (enc == 0x08000100 || enc == 0x0600) return str_new(std::string(reinterpret_cast<const char*>(b), n));
-    return str_new(std::string(reinterpret_cast<const char*>(b), n));
+    return send(send_cls(class_named("NSString"), "alloc"), "initWithBytes:length:encoding:", static_cast<const void*>(b), static_cast<NSUInteger>(n),
+                cf_to_ns_encoding(enc));   // +1 (create rule)
 }
 static id cf_string_create_copy(void*, id s) { return s ? str16_new(u16(s)) : nullptr; }
 static id cf_string_create_mutable(void*, long) { return str16_new(u"", true); }
@@ -164,21 +192,25 @@ static id cf_data_create(void*, const uint8_t* b, long n) { return data_new(b, n
 
 // CFNumber
 static id cf_number_create(void*, int type, const void* v) {
+    // CFNumberType: 1 SInt8, 2 SInt16, 3 SInt32, 4 SInt64, 5 Float32, 6 Float64, 7 char, 8 short, 9 int, 10 long,
+    // 11 long long, 12 float, 13 double, 14 CFIndex, 15 NSInteger, 16 CGFloat
     switch (type) {
-        case 1: case 2: case 3: case 9: return retain(num_i(*static_cast<const int*>(v)));
-        case 4: case 10: return retain(num_i(*static_cast<const long long*>(v)));
+        case 1: case 7: return retain(num_i(*static_cast<const int8_t*>(v)));
+        case 2: case 8: return retain(num_i(*static_cast<const int16_t*>(v)));
+        case 3: case 9: return retain(num_i(*static_cast<const int32_t*>(v)));
         case 5: case 12: return retain(num_f(*static_cast<const float*>(v)));
-        case 6: case 13: return retain(num_d(*static_cast<const double*>(v)));
-        default: return retain(num_i(*static_cast<const long*>(v)));
+        case 6: case 13: case 16: return retain(num_d(*static_cast<const double*>(v)));
+        default: return retain(num_i(*static_cast<const long long*>(v)));
     }
 }
 static bool cf_number_get_value(id n, int type, void* out) {
-    switch (type) {
-        case 1: case 2: case 3: case 9: *static_cast<int*>(out) = static_cast<int>(num_ival(n)); break;
-        case 4: case 10: *static_cast<long long*>(out) = num_ival(n); break;
+    switch (type) {   // exactly as wide as the caller's variable
+        case 1: case 7: *static_cast<int8_t*>(out) = static_cast<int8_t>(num_ival(n)); break;
+        case 2: case 8: *static_cast<int16_t*>(out) = static_cast<int16_t>(num_ival(n)); break;
+        case 3: case 9: *static_cast<int32_t*>(out) = static_cast<int32_t>(num_ival(n)); break;
         case 5: case 12: *static_cast<float*>(out) = static_cast<float>(num_dval(n)); break;
-        case 6: case 13: *static_cast<double*>(out) = num_dval(n); break;
-        default: *static_cast<long*>(out) = static_cast<long>(num_ival(n)); break;
+        case 6: case 13: case 16: *static_cast<double*>(out) = num_dval(n); break;
+        default: *static_cast<long long*>(out) = num_ival(n); break;
     }
     return true;
 }
@@ -808,6 +840,7 @@ void register_misc_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CFStringGetCStringPtr", &cf_string_get_cstr_ptr);
     r("_CFStringGetCString", &cf_string_get_cstr);
     r("_CFStringGetBytes", &cf_string_get_bytes);
+    r("_CFStringConvertEncodingToNSStringEncoding", +[](uint32_t cf) -> NSUInteger { return cf_to_ns_encoding(cf); });
     r("_CFStringCreateWithCString", &cf_string_create_with_cstr);
     r("_CFStringCreateWithBytes", &cf_string_create_with_bytes);
     r("_CFStringCreateCopy", &cf_string_create_copy);

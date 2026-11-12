@@ -223,7 +223,14 @@ void start_loader() {
 
 // Touches: positions normalized to the window, phases in UIKit terms (0 began, 1 moved, 3 ended, 4 cancelled).
 int32_t on_input(android_app* app, AInputEvent* ev) {
+    if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY) {
+        // Gamepad buttons are swallowed: left unhandled, the system turns B into BACK, which closes the game.
+        const int32_t key = AKeyEvent_getKeyCode(ev);
+        return (key >= AKEYCODE_BUTTON_A && key <= AKEYCODE_BUTTON_MODE) || (key >= AKEYCODE_BUTTON_1 && key <= AKEYCODE_BUTTON_16);
+    }
     if (AInputEvent_getType(ev) != AINPUT_EVENT_TYPE_MOTION || !app->window) return 0;
+    // Touchscreen, mouse, stylus. A joystick also sends ACTION_MOVE, with axis values where a pointer has pixels.
+    if (!(AInputEvent_getSource(ev) & AINPUT_SOURCE_CLASS_POINTER)) return 0;
     const float w = static_cast<float>(ANativeWindow_getWidth(app->window)), h = static_cast<float>(ANativeWindow_getHeight(app->window));
     if (w <= 0 || h <= 0) return 0;
     const int32_t action = AMotionEvent_getAction(ev), kind = action & AMOTION_EVENT_ACTION_MASK;
@@ -248,14 +255,28 @@ int32_t on_input(android_app* app, AInputEvent* ev) {
     return 1;
 }
 
-// Vibrator.vibrate(VibrationEffect.createOneShot(ms, amplitude)) through JNI; the calling thread stays attached.
 JavaVM* g_vm = nullptr;
+// JNIEnv of the calling thread. A thread that was not attached yet stays attached until it ends: the key
+// destructor detaches it, because ART aborts when an attached thread exits.
+JNIEnv* jni_env() {
+    JNIEnv* env = nullptr;
+    if (!g_vm) return nullptr;
+    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK) return env;
+    static pthread_key_t key;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, [] { pthread_key_create(&key, [](void*) { g_vm->DetachCurrentThread(); }); });
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+    pthread_setspecific(key, &key);
+    return env;
+}
+
+// Vibrator.vibrate(VibrationEffect.createOneShot(ms, amplitude)) through JNI.
 jobject g_vibrator = nullptr;
 jmethodID g_vibrate = nullptr, g_one_shot = nullptr;
 jclass g_effect_class = nullptr;
 void jni_vibrate(int ms, int amplitude) {
-    JNIEnv* env = nullptr;
-    if (!g_vm || !g_vibrator || g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    JNIEnv* env = g_vibrator ? jni_env() : nullptr;
+    if (!env) return;
     jobject effect = env->CallStaticObjectMethod(g_effect_class, g_one_shot, static_cast<jlong>(ms), static_cast<jint>(amplitude));
     if (effect) env->CallVoidMethod(g_vibrator, g_vibrate, effect);
     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -325,16 +346,7 @@ void setup_text(android_app* app) {
 }
 
 struct JniCall {
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    JniCall() {
-        if (!g_vm) return;
-        if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK) return;
-        env = nullptr;
-        if (g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) attached = true;
-        else env = nullptr;
-    }
-    ~JniCall() { if (attached) g_vm->DetachCurrentThread(); }
+    JNIEnv* env = jni_env();
 };
 
 // "All files access" (MANAGE_EXTERNAL_STORAGE) for apps whose documents should live on shared storage.

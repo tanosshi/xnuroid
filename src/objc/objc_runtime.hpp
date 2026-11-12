@@ -53,7 +53,8 @@ inline int32_t rdi32(uint64_t a) { return *reinterpret_cast<const int32_t*>(a); 
 
 inline const char* intern_locked(const char* sel) {
     auto pc = g_sel_ptr_cache.find(sel);
-    if (pc != g_sel_ptr_cache.end()) return pc->second;
+    // A hit only counts while the bytes still spell that selector: sel_registerName may be handed a reused buffer.
+    if (pc != g_sel_ptr_cache.end() && std::strcmp(sel, pc->second) == 0) return pc->second;
     std::string s(sel);
     auto it = g_sel_intern.find(s);
     const char* canon;
@@ -63,7 +64,7 @@ inline const char* intern_locked(const char* sel) {
     } else {
         canon = it->second;
     }
-    g_sel_ptr_cache.emplace(sel, canon);
+    g_sel_ptr_cache[sel] = canon;
     return canon;
 }
 inline const char* intern(const char* sel) {

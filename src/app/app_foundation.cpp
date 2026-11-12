@@ -109,6 +109,24 @@ static bool decode_bytes(const void* bytes, size_t n, NSUInteger enc, std::u16st
             }
             return true;
         }
+        case 0x8c000100: case 0x98000100: case 0x9c000100: {   // UTF-32 (BOM), BE, LE: how a wchar_t string comes in
+            bool le = enc != 0x98000100;
+            auto* b = static_cast<const uint8_t*>(bytes);
+            size_t i = 0;
+            if (n >= 4 && enc == 0x8c000100) {
+                if (b[0] == 0xff && b[1] == 0xfe && !b[2] && !b[3]) { le = true; i = 4; }
+                else if (!b[0] && !b[1] && b[2] == 0xfe && b[3] == 0xff) { le = false; i = 4; }
+            }
+            out.clear();
+            for (; i + 3 < n; i += 4) {
+                uint32_t c = le ? b[i] | b[i + 1] << 8 | b[i + 2] << 16 | static_cast<uint32_t>(b[i + 3]) << 24
+                                : static_cast<uint32_t>(b[i]) << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3];
+                if (c < 0x10000) out.push_back(static_cast<char16_t>(c));
+                else if (c <= 0x10ffff) { c -= 0x10000; out.push_back(static_cast<char16_t>(0xd800 + (c >> 10))); out.push_back(static_cast<char16_t>(0xdc00 + (c & 0x3ff))); }
+                else out.push_back(u'�');
+            }
+            return true;
+        }
         default:
             out = to16(std::string(p, n));
             return true;
@@ -132,6 +150,20 @@ static std::string encode_string(const std::u16string& s, NSUInteger enc, bool* 
             for (char16_t c : s) {
                 if (enc == 0x90000100) { o.push_back(static_cast<char>(c >> 8)); o.push_back(static_cast<char>(c)); }
                 else { o.push_back(static_cast<char>(c)); o.push_back(static_cast<char>(c >> 8)); }
+            }
+            return o;
+        }
+        case 0x8c000100: case 0x98000100: case 0x9c000100: {   // UTF-32 (BOM), BE, LE
+            std::string o;
+            const bool be = enc == 0x98000100;
+            auto put = [&](uint32_t c) {
+                for (int k = 0; k < 4; ++k) o.push_back(static_cast<char>(c >> (be ? 24 - 8 * k : 8 * k)));
+            };
+            if (enc == 0x8c000100) put(0xfeff);
+            for (size_t i = 0; i < s.size(); ++i) {
+                uint32_t c = s[i];
+                if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.size() && s[i + 1] >= 0xdc00 && s[i + 1] < 0xe000) c = 0x10000 + ((c - 0xd800) << 10) + (s[++i] - 0xdc00);
+                put(c);
             }
             return o;
         }
@@ -282,6 +314,60 @@ static std::string num_string(NumExt* e) {
 // ---------------------------------------------------------------------------------------------------------------
 // values
 // ---------------------------------------------------------------------------------------------------------------
+// Size and alignment of an Objective-C type encoding on arm64: "{CGRect={CGPoint=dd}{CGSize=dd}}" is 32 and 8.
+// Returns the position after the type.
+static const char* encoding_size(const char* t, size_t& size, size_t& align) {
+    while (*t && std::strchr("rnNoORV", *t)) ++t;   // const, in, out, ... qualifiers
+    size = align = 8;
+    auto up = [](size_t n, size_t a) { return (n + a - 1) / a * a; };
+    switch (*t) {
+        case 0: return t;
+        case 'c': case 'C': case 'B': size = align = 1; return t + 1;
+        case 's': case 'S': size = align = 2; return t + 1;
+        case 'i': case 'I': case 'l': case 'L': case 'f': size = align = 4; return t + 1;
+        case 'v': size = 0; align = 1; return t + 1;
+        case 'b':   // bit-field: counted as an int
+            for (++t; isdigit(static_cast<unsigned char>(*t)); ++t) {}
+            size = align = 4;
+            return t;
+        case '^': {   // pointer: the pointee only has to be skipped
+            size_t s, a;
+            return encoding_size(t + 1, s, a);
+        }
+        case '[': {
+            size_t count = strtoul(t + 1, const_cast<char**>(&t), 10), s = 0, a = 1;
+            t = encoding_size(t, s, a);
+            size = count * s;
+            align = a;
+            return *t == ']' ? t + 1 : t;
+        }
+        case '{': case '(': {
+            const bool is_union = *t == '(';
+            const char close = is_union ? ')' : '}';
+            size = 0;
+            align = 1;
+            for (++t; *t && *t != '=' && *t != close; ++t) {}   // the name
+            if (*t == '=') ++t;
+            while (*t && *t != close) {
+                if (*t == '"') {   // a field name
+                    for (++t; *t && *t != '"'; ++t) {}
+                    if (*t) ++t;
+                    continue;
+                }
+                size_t s = 0, a = 1;
+                const char* next = encoding_size(t, s, a);
+                if (next == t) break;
+                t = next;
+                size = is_union ? std::max(size, s) : up(size, a) + s;
+                align = std::max(align, a);
+            }
+            size = up(size, align);
+            return *t ? t + 1 : t;
+        }
+        default: return t + 1;   // q Q d D @ # : * ? and anything unknown: 8 bytes
+    }
+}
+
 struct ValExt : Ext { std::string type; std::vector<uint8_t> bytes; };
 id value_bytes(const void* p, size_t n, const char* t) {
     id o = alloc(C_NSValue);
@@ -367,17 +453,20 @@ std::string format(const std::string& fmt, const uint64_t* va) {
         i = j;
         char buf[512];
         uint64_t v;
+        // a string conversion, however long the result (a shader source or a JSON blob through %s or %@)
+        auto put_str = [&](const std::string& s) {
+            if (spec.size() == 1) { out += s; return; }   // no width or precision
+            spec += "s";
+            int n = snprintf(buf, sizeof buf, spec.c_str(), s.c_str());
+            if (n < static_cast<int>(sizeof buf)) { out += buf; return; }
+            std::string big(static_cast<size_t>(n) + 1, '\0');
+            snprintf(&big[0], big.size(), spec.c_str(), s.c_str());
+            out.append(big.data(), static_cast<size_t>(n));
+        };
         switch (conv) {
             case '@': {
                 id o = reinterpret_cast<id>(arg(pos));
-                std::string d = describe(o);
-                if (spec.size() > 1) {   // width/precision on %@
-                    spec += "s";
-                    snprintf(buf, sizeof buf, spec.c_str(), d.c_str());
-                    out += buf;
-                } else {
-                    out += d;
-                }
+                put_str(describe(o));
                 break;
             }
             case 'd': case 'i': {
@@ -420,9 +509,7 @@ std::string format(const std::string& fmt, const uint64_t* va) {
             }
             case 's': {
                 auto* s = reinterpret_cast<const char*>(arg(pos));
-                spec += "s";
-                snprintf(buf, sizeof buf, spec.c_str(), s ? s : "(null)");
-                out += buf;
+                put_str(s ? s : "(null)");
                 break;
             }
             case 'S': {
@@ -746,8 +833,13 @@ static long compare16(const std::u16string& a, const std::u16string& b, NSUInteg
             size_t ie = i, je = j;
             while (ie < a.size() && isdigit(a[ie])) ++ie;
             while (je < b.size() && isdigit(b[je])) ++je;
-            unsigned long long na = std::stoull(to8(a.substr(i, ie - i))), nb = std::stoull(to8(b.substr(j, je - j)));
-            if (na != nb) return na < nb ? -1 : 1;
+            // compared as digit strings, since a run can be longer than any integer: after the leading zeros,
+            // the shorter one is the smaller number
+            size_t ia = i, jb = j;
+            while (ia + 1 < ie && a[ia] == u'0') ++ia;
+            while (jb + 1 < je && b[jb] == u'0') ++jb;
+            if (ie - ia != je - jb) return ie - ia < je - jb ? -1 : 1;
+            if (int c = a.compare(ia, ie - ia, b, jb, je - jb)) return c < 0 ? -1 : 1;
             i = ie; j = je;
             continue;
         }
@@ -1301,11 +1393,9 @@ static void init_numbers() {
     defc(V, "valueWithPointer:", +[](id, SEL, const void* p) -> id { return value_bytes(&p, sizeof p, "^v"); });
     defc(V, "valueWithNonretainedObject:", +[](id, SEL, id p) -> id { return value_bytes(&p, sizeof p, "@"); });
     defc(V, "valueWithBytes:objCType:", +[](id, SEL, const void* p, const char* t) -> id {
-        size_t n = 8;
-        if (t && t[0] == '{') n = std::strstr(t, "CGRect") ? 32 : std::strstr(t, "CGAffine") ? 48 : 16;
-        else if (t && (t[0] == 'c' || t[0] == 'C' || t[0] == 'B')) n = 1;
-        else if (t && (t[0] == 'i' || t[0] == 'I' || t[0] == 'f')) n = 4;
-        return value_bytes(p, n, t);
+        size_t n = 8, align = 8;
+        if (t && *t) encoding_size(t, n, align);
+        return value_bytes(p, n ? n : 8, t);
     });
     def(V, "CGPointValue", +[](id self, SEL) -> CGPoint { return val_get<CGPoint>(self); });
     def(V, "CGSizeValue", +[](id self, SEL) -> CGSize { return val_get<CGSize>(self); });
@@ -1316,6 +1406,12 @@ static void init_numbers() {
     def(V, "getValue:", +[](id self, SEL, void* out) { if (ValExt* e = vx(self)) std::memcpy(out, e->bytes.data(), e->bytes.size()); });
     def(V, "objCType", +[](id self, SEL) -> const char* { ValExt* e = vx(self); return e ? e->type.c_str() : ""; });
     def(V, "isEqual:", +[](id self, SEL, id o) -> bool { ValExt* a = vx(self); ValExt* b = vx(o); return self == o || (a && b && a->bytes == b->bytes); });
+    // equal values must hash alike, or a dictionary keyed by valueWithPointer: never finds its entries
+    def(V, "hash", +[](id self, SEL) -> NSUInteger {
+        NSUInteger h = 1469598103934665603ull;
+        if (ValExt* e = vx(self)) for (uint8_t b : e->bytes) h = (h ^ b) * 1099511628211ull;
+        return h;
+    });
     def(V, "copyWithZone:", +[](id self, SEL, void*) -> id { return retain(self); });
 
     C_NSNull = def_class("NSNull", "NSObject");
@@ -1813,8 +1909,9 @@ static void init_dicts() {
         if (o) e->put_owned(retain(o), nullptr);
         return s;
     });
-    def(S, "isSubsetOfSet:", +[](id self, SEL, id o) -> bool { for (id x : setx(self)->keys()) if (!setx(o)->get(x)) return false; return true; });
-    def(S, "intersectsSet:", +[](id self, SEL, id o) -> bool { for (id x : setx(self)->keys()) if (setx(o)->get(x)) return true; return false; });
+    // nil (or anything that is not a set) counts as the empty set
+    def(S, "isSubsetOfSet:", +[](id self, SEL, id o) -> bool { DictExt* other = is_set_obj(o) ? setx(o) : nullptr; for (id x : setx(self)->keys()) if (!other || !other->get(x)) return false; return true; });
+    def(S, "intersectsSet:", +[](id self, SEL, id o) -> bool { if (!is_set_obj(o)) return false; for (id x : setx(self)->keys()) if (setx(o)->get(x)) return true; return false; });
     def(S, "makeObjectsPerformSelector:", +[](id self, SEL, SEL s) { for (id x : setx(self)->keys()) send(x, s); });
     def(S, "makeObjectsPerformSelector:withObject:", +[](id self, SEL, SEL s, id o) { for (id x : setx(self)->keys()) send(x, s, o); });
     def(S, "enumerateObjectsUsingBlock:", +[](id self, SEL, id block) {
@@ -1845,7 +1942,7 @@ static void init_dicts() {
     def(MS, "addObjectsFromArray:", +[](id self, SEL, id a) { for (id o : arr_items(a)) setx(self)->put_owned(retain(o), nullptr); });
     def(MS, "unionSet:", +[](id self, SEL, id o) { if (is_set_obj(o)) for (id x : setx(o)->keys()) setx(self)->put_owned(retain(x), nullptr); });
     def(MS, "minusSet:", +[](id self, SEL, id o) { if (is_set_obj(o)) for (id x : setx(o)->keys()) setx(self)->remove(x); });
-    def(MS, "intersectSet:", +[](id self, SEL, id o) { for (id x : setx(self)->keys()) if (!setx(o)->get(x)) setx(self)->remove(x); });
+    def(MS, "intersectSet:", +[](id self, SEL, id o) { DictExt* other = is_set_obj(o) ? setx(o) : nullptr; for (id x : setx(self)->keys()) if (!other || !other->get(x)) setx(self)->remove(x); });
     def(MS, "removeObject:", +[](id self, SEL, id o) { setx(self)->remove(o); });
     def(MS, "removeAllObjects", +[](id self, SEL) { setx(self)->clear(); });
     def(MS, "setSet:", +[](id self, SEL, id o) {

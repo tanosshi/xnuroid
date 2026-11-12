@@ -198,6 +198,7 @@ void run_loop_once(double max_wait_s);           // main thread: run due work, w
 void mark_main_thread();
 void add_dealloc_hook(void (*hook)(id));
 void set_frame_hook(void (*hook)());             // called once per main-loop pass (touch delivery)
+void run_loop_wake();                            // ends the main loop's current sleep (any thread)
 // spawns a thread that can run guest code (Apple TSD bound, autorelease pool)
 void spawn_thread(std::function<void()> fn, const char* name = nullptr);
 

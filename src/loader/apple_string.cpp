@@ -195,7 +195,26 @@ void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmP
     str->assign(tmp.c_str(), tmp.size());
     return t;
 }
-void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm(void* t, size_t old_cap, size_t delta, size_t, size_t, size_t, size_t) { S(t)->reserve(old_cap + delta); return t; }
+// __grow_by(old_cap, delta_cap, old_sz, n_copy, n_del, n_add): the guest's inlined insert/replace/append asks for new
+// storage that keeps [0, n_copy), leaves a gap of n_add for what it writes next, and moves the rest (after the n_del
+// characters being dropped) behind the gap. libc++ leaves the size to the caller.
+void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm(void* t, size_t old_cap, size_t delta, size_t old_sz, size_t n_copy, size_t n_del, size_t n_add) {
+    auto* str = S(t);
+    if (n_copy > old_sz) n_copy = old_sz;
+    if (n_del > old_sz - n_copy) n_del = old_sz - n_copy;
+    const size_t tail = old_sz - n_copy - n_del;
+    size_t p = 32;
+    while (p < std::max({old_cap + delta, 2 * old_cap, n_copy + n_add + tail}) + 1) p <<= 1;
+    const size_t new_cap = p - 1;
+    char* buf = static_cast<char*>(malloc(new_cap + 1));
+    const char* old = str->c_str();
+    if (n_copy) std::memcpy(buf, old, n_copy);
+    if (tail) std::memcpy(buf + n_copy + n_add, old + n_copy + n_del, tail);
+    buf[n_copy + n_add + tail] = 0;
+    str->free_buffer();
+    str->set_long(buf, n_copy + n_add + tail, new_cap);
+    return t;
+}
 
 size_t __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm(const void* t, char c, size_t pos) { return CS(t)->find(c, pos); }
 size_t __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm(const void* t, char c, size_t pos) { return CS(t)->rfind(c, pos); }

@@ -99,16 +99,15 @@ inline void defaults_save(FakeObjcObj* d) {
     if (log) printf("[DEFAULTS] saving %zu keys\n", saved);
     const std::string path = defaults_path(), tmp = path + ".tmp";
     FILE* fp = fopen(tmp.c_str(), "wb");
+    g_defaults_saved_at = now_s();   // also after a failure: an unwritable sandbox is retried once a second, not every tick
     if (!fp) { printf("[DEFAULTS] cannot write %s\n", tmp.c_str()); return; }
     std::string doc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n" + body + "</dict>\n</plist>\n";
     bool ok = fwrite(doc.data(), 1, doc.size(), fp) == doc.size();
     ok = fflush(fp) == 0 && ok;
     fsync(fileno(fp));
     fclose(fp);
-    if (ok && rename(tmp.c_str(), path.c_str()) == 0) {
-        g_defaults_dirty = false;
-        g_defaults_saved_at = now_s();
-    }
+    if (ok && rename(tmp.c_str(), path.c_str()) == 0) g_defaults_dirty = false;
+    else unlink(tmp.c_str());
 }
 
 inline void defaults_load(FakeObjcObj* d) {
@@ -171,7 +170,12 @@ inline void defaults_store(FakeObjcObj* d, uint64_t key, uint64_t value) {
 inline bool defaults_message(CallFrame& frame, FakeObjcObj* d, const std::string& sel) {
     float f;
     std::memcpy(&f, &g_objc_in_d[0], 4);
-    if (sel == "setInteger:forKey:") { defaults_store(d, frame.x[3], make_number(static_cast<double>(static_cast<int64_t>(frame.x[2])), false)); return true; }
+    if (sel == "setInteger:forKey:") {
+        uint64_t n = make_number(static_cast<double>(static_cast<int64_t>(frame.x[2])), false);
+        fake_lookup(n)->props["value"] = frame.x[2];   // exact; the double only holds 53 bits
+        defaults_store(d, frame.x[3], n);
+        return true;
+    }
     if (sel == "setBool:forKey:") { defaults_store(d, frame.x[3], make_number((frame.x[2] & 0xff) ? 1 : 0, false)); return true; }
     if (sel == "setFloat:forKey:") { defaults_store(d, frame.x[2], make_number(f, true)); return true; }
     if (sel == "setDouble:forKey:") { defaults_store(d, frame.x[2], make_number(g_objc_in_d[0], true)); return true; }

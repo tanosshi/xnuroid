@@ -11,6 +11,7 @@ from pathlib import Path
 NDK_VERSION = "28.2.13676358"
 PLATFORM = "android-36"
 MIN_PHONE_SDK = 31
+MIN_BUILD_TOOLS = 35   # zipalign -P (16 KB pages) first shipped in Build-Tools 35
 SDK_PACKAGES = [f"ndk;{NDK_VERSION}", "build-tools;36.1.0", f"platforms;{PLATFORM}", "platform-tools"]
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -85,6 +86,36 @@ def find_keytool() -> Path | None:
                                  shutil.which("keytool")])
 
 
+def java_env() -> dict | None:
+    """Variables that let the build find a JDK: {} when javac is on PATH, None when there is no JDK at all.
+
+    build_apk.sh runs javac (JAVAC), and d8/apksigner run java (JAVA_HOME). Android Studio bundles a JDK but
+    does not put it on PATH.
+    """
+    if shutil.which("javac"):
+        return {}
+    keytool = find_keytool()
+    javac = keytool.parent / "javac.exe" if keytool else None
+    if javac is None or not javac.is_file():
+        return None
+    extra = {"JAVAC": javac.as_posix()}
+    if not os.environ.get("JAVA_HOME"):
+        extra["JAVA_HOME"] = str(javac.parent.parent)
+    return extra
+
+
+def has_build_tools(sdk: Path) -> bool:
+    """The build uses the newest Build-Tools installed, so one recent enough version is all it takes."""
+    folder = sdk / "build-tools"
+    if not folder.is_dir():
+        return False
+    for entry in folder.iterdir():
+        major = re.match(r"\d+", entry.name)
+        if major and int(major[0]) >= MIN_BUILD_TOOLS and (entry / "zipalign.exe").is_file():
+            return True
+    return False
+
+
 def find_sdkmanager(sdk: Path) -> Path | None:
     tools = sdk / "cmdline-tools"
     candidates = [tools / "latest" / "bin" / "sdkmanager.bat"]
@@ -132,9 +163,8 @@ def check_computer() -> tuple[list[Check], dict]:
         missing = []
         if not (sdk / "ndk" / NDK_VERSION).is_dir():
             missing.append(f"NDK {NDK_VERSION}")
-        build_tools = sdk / "build-tools"
-        if not build_tools.is_dir() or not any(build_tools.iterdir()):
-            missing.append("Build-Tools")
+        if not has_build_tools(sdk):
+            missing.append(f"Build-Tools {MIN_BUILD_TOOLS} or newer")
         if not (sdk / "platforms" / PLATFORM / "android.jar").is_file():
             missing.append(f"SDK Platform {PLATFORM}")
         if not found["adb"].is_file():
@@ -145,6 +175,11 @@ def check_computer() -> tuple[list[Check], dict]:
     else:
         adb = shutil.which("adb")
         found["adb"] = Path(adb) if adb else None
+
+    java = java_env()
+    checks.append(Check("java", "Java (JDK)", java is not None,
+                        "Installed" if java is not None else "Needed to build the app. Android Studio brings one",
+                        "" if java is not None else "studio"))
 
     keystore = debug_keystore()
     checks.append(Check("keystore", "App signing key", keystore.is_file(),
@@ -222,9 +257,15 @@ class Adb:
             phone.model = model.replace("_", " ")
             if phone.state == "device":
                 if phone.serial not in self._details:
-                    abi = self.shell(phone.serial, "getprop ro.product.cpu.abi", timeout=10)
-                    sdk = self.shell(phone.serial, "getprop ro.build.version.sdk", timeout=10)
-                    self._details[phone.serial] = (abi, int(sdk) if sdk.isdigit() else 0)
+                    abi = self.run("shell", "getprop ro.product.cpu.abi", serial=phone.serial, timeout=10)
+                    sdk = self.run("shell", "getprop ro.build.version.sdk", serial=phone.serial, timeout=10)
+                    abi_text, sdk_text = abi.stdout.strip(), sdk.stdout.strip()
+                    # A phone that is still coming up answers with an error text; ask again on the next poll.
+                    if abi.returncode or sdk.returncode or not sdk_text.isdigit() or not re.fullmatch(r"[\w-]+", abi_text):
+                        phone.state = "offline"
+                        phones.append(phone)
+                        continue
+                    self._details[phone.serial] = (abi_text, int(sdk_text))
                 phone.abi, phone.sdk = self._details[phone.serial]
             phones.append(phone)
         return phones

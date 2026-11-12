@@ -24,10 +24,6 @@ uint32_t u32(const uint8_t* p) {
 uint64_t u64(const uint8_t* p) {
   return static_cast<uint64_t>(u32(p)) | (static_cast<uint64_t>(u32(p + 4)) << 32);
 }
-int64_t sign_extend(uint64_t value, unsigned bits) {
-  const uint64_t sign = uint64_t{1} << (bits - 1);
-  return static_cast<int64_t>((value ^ sign) - sign);
-}
 bool add_signed(uint64_t value, int64_t delta, uint64_t& out) {
   if (delta >= 0) {
     const auto d = static_cast<uint64_t>(delta);
@@ -127,7 +123,7 @@ bool fix_chain(const FixupOptions& o, ImageSink& image, uint64_t page_start,
     if (bind) {
       const uint32_t ordinal = static_cast<uint32_t>(raw & 0xffffff);
       if (ordinal >= imports.size()) { error = "chained bind import ordinal is out of range"; return false; }
-      const int64_t embedded_addend = sign_extend((raw >> 24) & 0xff, 8);
+      const int64_t embedded_addend = static_cast<int64_t>((raw >> 24) & 0xff);   // unsigned in dyld_chained_ptr_64_bind: 0..255
       uint64_t resolved = 0;
       if (!o.resolve_import || !o.resolve_import(imports[ordinal], resolved)) {
         if (!imports[ordinal].weak) { error = "unresolved non-weak chained import: " + imports[ordinal].symbol; return false; }

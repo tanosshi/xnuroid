@@ -274,6 +274,16 @@ std::string shm_path(const char* name) {
 }  // namespace
 
 extern "C" int app_shm_open_impl(const char* name, int oflag, const uint64_t* va) {
+    // A shared memory object on iOS lives in kernel memory and is gone after a reboot. A file would carry it
+    // into every later launch, so the first open of a name in this process starts from nothing. (PPSSPP counts
+    // its running instances in one; with the counts of all earlier launches still there it took itself for a
+    // second instance and muted its audio.)
+    {
+        static std::mutex mu;
+        static std::unordered_map<std::string, bool> opened;
+        std::lock_guard<std::mutex> l(mu);
+        if (opened.emplace(shm_path(name), true).second) unlink(shm_path(name).c_str());
+    }
     int f = oflag & 3;
     if (oflag & 0x200) f |= O_CREAT;
     if (oflag & 0x400) f |= O_TRUNC;

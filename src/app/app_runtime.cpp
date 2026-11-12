@@ -18,6 +18,8 @@ extern "C" void app_objc_msgSendSuper2();
 extern "C" void app_objc_msgSendSuper();
 extern "C" void app_nil_imp();
 extern "C" void app_forward_thunk();
+extern "C" void* app_Block_copy(const void* arg);
+extern "C" void app_Block_release(const void* arg);
 
 namespace app {
 
@@ -135,11 +137,6 @@ Class class_of(id o) { return o ? o->isa : 0; }
 Class superclass_of(Class c) { RClass* r = rc_of_class(c); return r && r->super ? r->super->cls : 0; }
 const char* class_name(Class c) { RClass* r = rc_of_class(c); return r ? r->name.c_str() : "?"; }
 bool is_meta(Class c) { RClass* r = rc_of_class(c); return r && r->is_meta; }
-bool is_class_object(id o) {
-    if (!o) return false;
-    RClass* r = rc_of_class(reinterpret_cast<Class>(o));
-    return r != nullptr;
-}
 Class metaclass_of(Class c) { RClass* r = rc_of_class(c); return r && r->meta ? r->meta->cls : 0; }
 bool is_subclass(Class c, Class of) {
     for (RClass* r = rc_of_class(c); r; r = r->super)
@@ -242,6 +239,7 @@ struct Header { uint32_t magic; std::atomic<int32_t> rc; Ext* ext; };
 static_assert(sizeof(Header) == 16, "header");
 constexpr uint32_t kObjMagic = 0xa110c8ed;
 constexpr uint32_t kClsMagic = 0x0b1ec7ed;
+constexpr uint32_t kBlkMagic = 0xb10cc0de;   // in front of a heap block: counted in the block's own flags, not here
 constexpr int32_t kImmortal = 1 << 30;
 constexpr int32_t kDeallocating = 1 << 29;
 
@@ -257,6 +255,21 @@ bool has_header(id o) {
     if ((a & 7) || a < 0x10000 || a >= (1ull << 48)) return false;
     uint32_t m = hdr(o)->magic;
     return m == kObjMagic || m == kClsMagic;
+}
+bool is_class_object(id o) {
+    if (!o) return false;
+    // One of our own instances is not a class, and must not be looked at as one: rc_of_class follows the word at
+    // +16, which in an instance is an ivar (two floats, a double) or already the next allocation.
+    if (has_header(o) && hdr(o)->magic == kObjMagic) return false;
+    return rc_of_class(reinterpret_cast<Class>(canon(o))) != nullptr;
+}
+// A block copied to the heap (app_Block_copy). Retaining, releasing and autoreleasing one as an object counts in
+// the block's flags, so a block kept in an array or an ARC ivar lives exactly as long as its owners.
+static bool heap_block(id o) {
+    o = canon(o);
+    uintptr_t a = reinterpret_cast<uintptr_t>(o);
+    if (!o || (a & 7) || a < 0x10000 || a >= (1ull << 48) || in_image(o)) return false;
+    return hdr(o)->magic == kBlkMagic;
 }
 // The Ext pointer sits in the last 8 bytes before the object, and something sets bits in its top byte (a stray byte
 // write at object - 1). A heap pointer never has bits there, so they are cleared on every access; the first few
@@ -318,7 +331,10 @@ id alloc_extra(Class c, size_t extra) {
 }
 
 id retain(id o) {
-    if (!has_header(o)) return o;
+    if (!has_header(o)) {
+        if (heap_block(o)) app_Block_copy(canon(o));
+        return o;
+    }
     Header* h = hdr(o);
     if (h->rc.load(std::memory_order_relaxed) >= kDeallocating) return o;
     h->rc.fetch_add(1, std::memory_order_relaxed);
@@ -326,7 +342,10 @@ id retain(id o) {
 }
 
 void release(id o) {
-    if (!has_header(o)) return;
+    if (!has_header(o)) {
+        if (heap_block(o)) app_Block_release(canon(o));
+        return;
+    }
     Header* h = hdr(o);
     int32_t v = h->rc.load(std::memory_order_relaxed);
     if (v >= kDeallocating) return;
@@ -449,7 +468,7 @@ static thread_local std::vector<id>* t_pool;
 static std::vector<id>& pool() { if (!t_pool) t_pool = new std::vector<id>(); return *t_pool; }
 id autorelease(id o) {
     if (!o) return o;
-    if (!has_header(o)) return o;
+    if (!has_header(o) && !heap_block(o)) return o;
     pool().push_back(o);
     return o;
 }
@@ -951,7 +970,7 @@ extern "C" void* app_Block_copy(const void* arg) {
     // heap blocks get an object header so retain/release/autorelease treat them as objects
     auto* mem = static_cast<uint8_t*>(malloc(16 + size));
     auto* h = reinterpret_cast<uint32_t*>(mem);
-    h[0] = 0;   // no refcount header: blocks count in their own flags
+    h[0] = app::kBlkMagic;   // not an object header: blocks count in their own flags (see heap_block)
     auto* nb = reinterpret_cast<BlockLayout*>(mem + 16);
     std::memcpy(static_cast<void*>(nb), b, size);
     nb->isa = g_malloc_block_cls;
@@ -967,6 +986,7 @@ extern "C" void app_Block_release(const void* arg) {
     if (!(f & BLOCK_NEEDS_FREE)) return;
     if ((b->flags.fetch_sub(2) & BLOCK_REFCOUNT_MASK) == 2) {
         if (f & BLOCK_HAS_COPY_DISPOSE) b->desc->dispose(b);
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(b) - 16) = 0;
         free(reinterpret_cast<uint8_t*>(b) - 16);
     }
 }
@@ -1543,6 +1563,11 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("__Block_release", &app_Block_release);
     r("__Block_object_assign", &app_Block_object_assign);
     r("__Block_object_dispose", &app_Block_object_dispose);
+    // A block literal carries one of these as its isa. Without a class behind it every message to a stack or
+    // global block answers nil, [handler copy] included.
+    m["__NSConcreteStackBlock"] = reinterpret_cast<void*>(class_named("__NSStackBlock__"));
+    m["__NSConcreteGlobalBlock"] = reinterpret_cast<void*>(class_named("__NSGlobalBlock__"));
+    m["__NSConcreteMallocBlock"] = reinterpret_cast<void*>(class_named("__NSMallocBlock__"));
     static uintptr_t empty_cache[4] = {0}, empty_vtable[4] = {0};
     m["__objc_empty_cache"] = empty_cache;
     m["__objc_empty_vtable"] = empty_vtable;
@@ -1622,12 +1647,9 @@ void init_runtime_classes() {
     Class nsblock = def_class("NSBlock", "NSObject");
     def(nsblock, "copy", +[](id self, SEL) -> id { return block_copy(self); });
     def(nsblock, "copyWithZone:", +[](id self, SEL, void*) -> id { return block_copy(self); });
-    def(nsblock, "retain", +[](id self, SEL) -> id { return block_copy(self); });
+    def(nsblock, "retain", +[](id self, SEL) -> id { return retain(self); });   // counts a heap block; a stack block stays as it is
     def(nsblock, "release", +[](id self, SEL) { block_release(self); });
-    def(nsblock, "autorelease", +[](id self, SEL) -> id {
-        // blocks count in their flags; balance with a deferred release on the main loop pool
-        return self;
-    });
+    def(nsblock, "autorelease", +[](id self, SEL) -> id { return autorelease(self); });   // a heap block: released by the pool
     def(nsblock, "retainCount", +[](id self, SEL) -> NSUInteger { return 1; });
     def(nsblock, "invoke", +[](id self, SEL) { reinterpret_cast<void (*)(id)>(block_invoke_ptr(self))(self); });
     def_class("__NSStackBlock__", "NSBlock");

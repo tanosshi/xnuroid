@@ -89,9 +89,10 @@ public class HostActivity extends NativeActivity {
                 int colon = id.indexOf(':');
                 String volume = id.substring(0, colon), rest = id.substring(colon + 1);
                 String root = "primary".equalsIgnoreCase(volume) ? Environment.getExternalStorageDirectory().getPath() : "/storage/" + volume;
-                return rest.isEmpty() ? root : root + "/" + rest;
+                String path = rest.isEmpty() ? root : root + "/" + rest;
+                if (usable(path)) return path;
             }
-            if ("com.android.providers.downloads.documents".equals(authority) && id.startsWith("raw:")) return id.substring(4);
+            if ("com.android.providers.downloads.documents".equals(authority) && id.startsWith("raw:") && usable(id.substring(4))) return id.substring(4);
             // Downloads ("msf:N") and media ("video:N", "document:N") documents are MediaStore rows with a path
             boolean downloads = "com.android.providers.downloads.documents".equals(authority) && id.startsWith("msf:");
             if (downloads || "com.android.providers.media.documents".equals(authority)) {
@@ -109,6 +110,11 @@ public class HostActivity extends NativeActivity {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    // Without all-files access the real path of a picked file cannot be opened; the descriptor fallback still can.
+    private boolean usable(String path) {
+        return pickingFolder || new File(path).canRead();
     }
 
     // ---- media ----
