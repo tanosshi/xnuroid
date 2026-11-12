@@ -81,10 +81,27 @@ static bool objc_string_value(uint64_t p, std::string& out) {
     uint64_t base = reinterpret_cast<uint64_t>(g_loaded_image_base);
     uint64_t end = base + g_loaded_image_size;
     if (p < base || p + 32 > end) return false;
+    const bool utf16 = (*reinterpret_cast<uint32_t*>(p + 8) & 0x10) != 0;   // __kCFIsUnicode: a literal with non-ASCII text
     uint64_t data = *reinterpret_cast<uint64_t*>(p + 16);
-    uint64_t len = *reinterpret_cast<uint64_t*>(p + 24);
-    if (data < base || data >= end || len > 4096) return false;
-    out.assign(reinterpret_cast<const char*>(data), static_cast<size_t>(len));
+    uint64_t len = *reinterpret_cast<uint64_t*>(p + 24);   // bytes, or UTF-16 code units
+    if (data < base || data >= end || len > 4096 || data + len * (utf16 ? 2 : 1) > end) return false;
+    if (!utf16) {
+        out.assign(reinterpret_cast<const char*>(data), static_cast<size_t>(len));
+        return true;
+    }
+    out.clear();
+    auto unit = [&](uint64_t i) { uint16_t u; std::memcpy(&u, reinterpret_cast<const void*>(data + i * 2), 2); return u; };
+    for (uint64_t i = 0; i < len; ++i) {
+        uint32_t c = unit(i);
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < len && unit(i + 1) >= 0xDC00 && unit(i + 1) < 0xE000) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (unit(i + 1) - 0xDC00);
+            ++i;
+        }
+        if (c < 0x80) out += static_cast<char>(c);
+        else if (c < 0x800) { out += static_cast<char>(0xC0 | (c >> 6)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+        else if (c < 0x10000) { out += static_cast<char>(0xE0 | (c >> 12)); out += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+        else { out += static_cast<char>(0xF0 | (c >> 18)); out += static_cast<char>(0x80 | ((c >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    }
     return true;
 }
 // kind 3 = generic fake Metal object (device, queue, buffer, texture, library, ...): capability queries say yes,
@@ -267,8 +284,10 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         uint64_t h; FakeObjcObj* d = fake_metal_bag(&h);
         d->props["pixelFormat"] = frame.x[2];
         d->props["width"] = frame.x[3];
-        if (sel[7] == '2') { d->props["height"] = frame.x[4]; d->props["textureType"] = 2; d->props["mipmapLevelCount"] = frame.x[5] ? 1 + 10 : 1; }
-        else if (sel[7] == 'C') { d->props["height"] = frame.x[3]; d->props["textureType"] = 5; d->props["mipmapLevelCount"] = frame.x[4] ? 1 + 10 : 1; }
+        // mipmapped:YES means the full chain for that size: 1 + floor(log2(largest side))
+        auto full_chain = [](uint64_t side) { uint64_t n = 1; for (; side > 1; side >>= 1) ++n; return n; };
+        if (sel[7] == '2') { d->props["height"] = frame.x[4]; d->props["textureType"] = 2; d->props["mipmapLevelCount"] = (frame.x[5] & 0xff) ? full_chain(std::max(frame.x[3], frame.x[4])) : 1; }
+        else if (sel[7] == 'C') { d->props["height"] = frame.x[3]; d->props["textureType"] = 5; d->props["mipmapLevelCount"] = (frame.x[4] & 0xff) ? full_chain(frame.x[3]) : 1; }
         d->props["depth"] = 1; d->props["arrayLength"] = 1; d->props["sampleCount"] = 1;
         frame.ret_x0 = h; return true;
     }

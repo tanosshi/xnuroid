@@ -68,9 +68,11 @@ void main() {
 // Decodes a 4 bpp level into tex (RGBA8 storage). False when compute is unavailable; the caller then uses the CPU.
 inline bool pvrtc_gpu_decode(GLuint tex, GLenum target, int level, int slice, const uint8_t* src, int w, int h) {
     static std::mutex mu;
-    static GLuint prog = 0;
     static bool failed = false;
-    static GLint loc_blocks = -1, loc_size = -1, loc_minbits = -1;
+    // One program per thread: uniforms live in the program object, which contexts share, so two threads
+    // decoding at once would otherwise dispatch with each other's sizes.
+    thread_local GLuint prog = 0;
+    thread_local GLint loc_blocks = -1, loc_size = -1, loc_minbits = -1;
     {
         std::lock_guard<std::mutex> l(mu);
         if (failed) return false;

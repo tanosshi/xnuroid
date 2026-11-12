@@ -273,6 +273,8 @@ objc_msgSend_guest:
     mov x1, #0
     movi v0.2d, #0
     movi v1.2d, #0
+    movi v2.2d, #0      // a CGRect comes back in d0-d3: [nil bounds] is all zeros
+    movi v3.2d, #0
     ret
 .size objc_msgSend_guest, .-objc_msgSend_guest
 

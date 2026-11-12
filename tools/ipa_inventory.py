@@ -150,7 +150,7 @@ def main():
                                 if not block: break
                                 dst.write(block)
                         candidates.append((info.filename, target, sha256_file(target)))
-                app_infos = [i for i in archive.infolist() if i.filename.endswith(".app/Info.plist") and "/Payload/" in i.filename]
+                app_infos = [i for i in archive.infolist() if i.filename.endswith(".app/Info.plist") and i.filename.startswith("Payload/") and i.filename.count("/") == 2]
                 if app_infos:
                     with archive.open(app_infos[0]) as stream:
                         plist_data = plistlib.loads(stream.read())

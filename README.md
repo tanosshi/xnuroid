@@ -92,7 +92,7 @@ variables instead. `run_phases.ps1` accepts the same folder through `-GameDir`.
 `xnuroid-helper.exe` (attached to each tagged release) or `python gui/xnuroid_gui.py` does the whole Android app flow
 without a terminal. Put the exe in the repository folder and open it, or drop an `.ipa` onto it.
 
-- Checks Git Bash, Python, the Android SDK parts, and the debug signing key, and fixes what it can (SDK packages
+- Checks Git Bash, Python, the Android SDK parts, a JDK, and the debug signing key, and fixes what it can (SDK packages
   through `sdkmanager`, the debug keystore through `keytool`).
 - Watches for a USB-debugging phone and reports unauthorized, non-arm64, or pre-Android 12 devices.
 - Takes an `.ipa`, an unpacked folder, a `Payload` folder, or a `.app`. IPAs are unpacked into `games/`. It reads the
@@ -115,8 +115,6 @@ For the Android app host (build and run), see the [Android app host](docs/androi
 
 > **Note:** `CMakeLists.txt` is stale. It builds only the host-side `macho-inspect` tool from
 > `src/host/main.cpp` and `src/host/chained_fixups.cpp`; it does not build either loader. Use the shell scripts.
-
-## Running
 
 ## Running
 

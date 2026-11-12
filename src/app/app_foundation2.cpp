@@ -43,6 +43,7 @@ std::deque<std::function<void()>> g_queue;
 std::map<uint64_t, TimerRec> g_timers;
 std::multimap<double, uint64_t> g_schedule;
 uint64_t g_next_timer = 1;
+uint64_t g_loop_wake = 0;   // bumped by whatever must cut the loop's sleep short: a new or moved timer, a touch
 pthread_t g_main_thread;
 bool g_main_set = false;
 void (*g_frame_hook)() = nullptr;
@@ -56,6 +57,10 @@ double now_s() {
 void mark_main_thread() { g_main_thread = pthread_self(); g_main_set = true; }
 bool on_main_thread() { return !g_main_set || pthread_equal(g_main_thread, pthread_self()); }
 void set_frame_hook(void (*hook)()) { g_frame_hook = hook; }
+void run_loop_wake() {
+    { std::lock_guard<std::mutex> l(g_loop_mu); ++g_loop_wake; }
+    g_loop_cv.notify_one();
+}
 
 void post_main(std::function<void()> fn, double delay) {
     if (delay > 0) { timer_add(delay, 0, std::move(fn)); return; }
@@ -74,6 +79,7 @@ uint64_t timer_add(double delay, double interval, std::function<void()> fn) {
         double fire = now_s() + std::max(0.0, delay);
         g_timers[tid] = TimerRec{fire, interval, std::move(fn)};
         g_schedule.emplace(fire, tid);
+        ++g_loop_wake;
     }
     g_loop_cv.notify_one();
     return tid;
@@ -91,6 +97,7 @@ void timer_set_next(uint64_t tid, double delay) {
         if (it == g_timers.end()) return;
         it->second.fire = now_s() + std::max(0.0, delay);
         g_schedule.emplace(it->second.fire, tid);
+        ++g_loop_wake;
     }
     g_loop_cv.notify_one();
 }
@@ -103,8 +110,10 @@ void run_loop_once(double max_wait) {
         while (!g_schedule.empty() && !g_timers.count(g_schedule.begin()->second)) g_schedule.erase(g_schedule.begin());
         if (!g_schedule.empty()) deadline = std::min(deadline, g_schedule.begin()->first);
         double wait = deadline - now_s();
+        // also ended by a timer another thread added (its fire time may be before this deadline) and by a touch
+        const uint64_t seen = g_loop_wake;
         if (g_queue.empty() && wait > 0)
-            g_loop_cv.wait_for(l, std::chrono::microseconds(static_cast<int64_t>(wait * 1e6)), [] { return !g_queue.empty(); });
+            g_loop_cv.wait_for(l, std::chrono::microseconds(static_cast<int64_t>(wait * 1e6)), [seen] { return !g_queue.empty() || g_loop_wake != seen; });
         work.swap(g_queue);
     }
     for (auto& fn : work) {
@@ -192,9 +201,15 @@ std::string bundle_dir() {
     }
     return g_bundle_dir;
 }
+static std::string g_documents_dir;   // Documents moved elsewhere (shared storage); empty = inside the sandbox
+void set_documents_dir(const std::string& dir) { g_documents_dir = dir; }
 std::string sandbox_dir(const char* sub) {
     static const std::string root = getenv("LOADER_SANDBOX_DIR") ? getenv("LOADER_SANDBOX_DIR") : "/data/local/tmp/sandbox";
     std::string p = root;
+    if (!g_documents_dir.empty() && sub && std::strncmp(sub, "Documents", 9) == 0 && (sub[9] == 0 || sub[9] == '/')) {
+        p = g_documents_dir;
+        sub = sub[9] ? sub + 10 : nullptr;
+    }
     mkdir(p.c_str(), 0755);
     for (const char* s = sub; s && *s;) {
         const char* slash = strchr(s, '/');
@@ -522,16 +537,53 @@ static id box_scalar(const void* p, char t) {
         default: return nullptr;
     }
 }
-static const char* method_return_type(id o, SEL s) {
-    (void)o; (void)s;
-    return nullptr;
+// The type character of a method's return value (arg < 0) or of its explicit argument `arg`, from its type encoding
+// ("d16@0:8", "v24@0:8d16"); '@' when unknown. Accessors of scalar properties take and return their value in the
+// registers of its type, so KVC has to box and unbox by it, as Foundation does.
+extern "C" const char* app_method_types(Class c, SEL s);   // app_runtime.cpp
+static const char* enc_skip(const char* p) {   // past one type and its frame offset
+    while (*p && strchr("rnNoORV", *p)) ++p;
+    if (*p == '^') return enc_skip(p + 1);
+    if (*p == '@' && p[1] == '?') p += 2;
+    else if (*p == '{' || *p == '(' || *p == '[') {
+        int depth = 0;
+        do {
+            if (*p == '{' || *p == '(' || *p == '[') ++depth;
+            else if (*p == '}' || *p == ')' || *p == ']') --depth;
+            ++p;
+        } while (*p && depth > 0);
+    } else if (*p) {
+        ++p;
+    }
+    while (*p >= '0' && *p <= '9') ++p;
+    return p;
+}
+static char method_type(id o, SEL s, int arg) {
+    const char* p = app_method_types(class_of(o), s);
+    if (!p) return '@';
+    if (arg >= 0)
+        for (int i = 0; i < arg + 3 && *p; ++i) p = enc_skip(p);   // return value, self, _cmd, earlier arguments
+    while (*p && strchr("rnNoORV", *p)) ++p;
+    return *p ? *p : '@';
 }
 static id kvc_get(id self, const std::string& key) {
     if (key.empty()) return nullptr;
     SEL g = sel(key.c_str());
     if (responds(self, g)) {
-        // without type information assume an object getter
-        return send(self, g);
+        switch (method_type(self, g, -1)) {
+            case 'c': return num_i(send<signed char>(self, g));
+            case 'B': return num_b(send<bool>(self, g));
+            case 'C': return num_i(send<unsigned char>(self, g));
+            case 's': return num_i(send<short>(self, g));
+            case 'S': return num_i(send<unsigned short>(self, g));
+            case 'i': return num_i(send<int>(self, g));
+            case 'I': return num_i(send<unsigned>(self, g));
+            case 'l': case 'q': return num_i(send<long long>(self, g));
+            case 'L': case 'Q': return num_u(send<unsigned long long>(self, g));
+            case 'f': return num_f(send<float>(self, g));
+            case 'd': return num_d(send<double>(self, g));
+            default: return send(self, g);
+        }
     }
     SEL is = sel(("is" + cap_first(key)).c_str());
     if (responds(self, is)) return num_b(send<bool>(self, is));
@@ -545,12 +597,23 @@ static id kvc_get(id self, const std::string& key) {
         if (type && type[0] == '@') return *static_cast<id const*>(p);
         return type ? box_scalar(p, type[0]) : nullptr;
     }
-    (void)method_return_type;
     return send(self, "valueForUndefinedKey:", str(key));
 }
 static void kvc_set(id self, const std::string& key, id v) {
     SEL s = sel(("set" + cap_first(key) + ":").c_str());
-    if (responds(self, s)) { send<void>(self, s, v); return; }
+    if (responds(self, s)) {
+        switch (method_type(self, s, 0)) {
+            case 'c': case 'C': send<void>(self, s, static_cast<signed char>(num_ival(v))); break;
+            case 'B': send<void>(self, s, num_ival(v) != 0); break;
+            case 's': case 'S': send<void>(self, s, static_cast<short>(num_ival(v))); break;
+            case 'i': case 'I': send<void>(self, s, static_cast<int>(num_ival(v))); break;
+            case 'l': case 'q': case 'L': case 'Q': send<void>(self, s, static_cast<long long>(num_ival(v))); break;
+            case 'f': send<void>(self, s, static_cast<float>(num_dval(v))); break;
+            case 'd': send<void>(self, s, num_dval(v)); break;
+            default: send<void>(self, s, v); break;
+        }
+        return;
+    }
     for (std::string n : {"_" + key, key}) {
         void* iv = app_class_get_instance_variable(class_of(self), n.c_str());
         if (!iv) continue;
@@ -627,14 +690,15 @@ static id note_new(id name, id object, id info) {
     return autorelease(n);
 }
 static void nc_remove(id observer, id name, id object, bool all) {
-    std::vector<id> blocks;
+    // released after unlocking: a release can deallocate, and every dealloc runs nc_dealloc_hook, which locks g_nc_mu
+    std::vector<id> blocks, names;
     {
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observers) return;
         auto& v = *g_observers;
         for (auto it = v.begin(); it != v.end();) {
             if (it->observer == observer && (all || ((!name || obj_equal(it->name, name)) && (!object || it->object == object)))) {
-                release(it->name);
+                names.push_back(it->name);
                 if (it->block) blocks.push_back(it->block);
                 it = v.erase(it);
             } else {
@@ -645,6 +709,7 @@ static void nc_remove(id observer, id name, id object, bool all) {
         for (auto& o : v) if (o.observer == observer) { still = true; break; }
         if (!still && g_observer_set) g_observer_set->erase(observer);
     }
+    for (id n : names) release(n);
     for (id b : blocks) block_release(b);
 }
 static void nc_dealloc_hook(id o) {
@@ -1256,6 +1321,21 @@ static std::vector<std::string> list_dir(const std::string& p) {
     std::sort(out.begin(), out.end());
     return out;
 }
+// a file, or a folder with everything in it
+static bool copy_item(const std::string& a, const std::string& b) {
+    struct stat st;
+    if (stat(a.c_str(), &st) != 0) return false;
+    if (!S_ISDIR(st.st_mode)) return copy_file(a, b);
+    if (mkdir(b.c_str(), 0775) != 0 && errno != EEXIST) return false;
+    bool ok = true;
+    for (auto& n : list_dir(a)) ok = copy_item(a + "/" + n, b + "/" + n) && ok;
+    return ok;
+}
+static bool move_item(const std::string& a, const std::string& b) {
+    if (rename(a.c_str(), b.c_str()) == 0) return true;
+    if (errno != EXDEV) return false;
+    return copy_item(a, b) && rm_rf(a);   // across filesystems (tmp to a Documents folder on shared storage)
+}
 static void list_recursive(const std::string& base, const std::string& rel, std::vector<id>& out) {
     for (auto& n : list_dir(base + (rel.empty() ? "" : "/" + rel))) {
         std::string r = rel.empty() ? n : rel + "/" + n;
@@ -1284,6 +1364,9 @@ static void init_files() {
     declare_protocol(U, "NSCopying");
     defc(U, "fileURLWithPath:", +[](id, SEL, id p) -> id { return p ? url_make(utf8(p), true) : nullptr; });
     defc(U, "fileURLWithPath:isDirectory:", +[](id, SEL, id p, bool) -> id { return p ? url_make(utf8(p), true) : nullptr; });
+    // picked documents are plain paths here: there is no security scope to enter or leave
+    def(U, "startAccessingSecurityScopedResource", +[](id, SEL) -> bool { return true; });
+    def(U, "stopAccessingSecurityScopedResource", +[](id, SEL) {});
     defc(U, "URLWithString:", +[](id, SEL, id s) -> id {
         if (!s) return nullptr;
         std::string v = utf8(s);
@@ -1416,10 +1499,10 @@ static void init_files() {
     });
     def(F, "removeItemAtPath:error:", +[](id, SEL, id p, id* err) -> bool { if (err) *err = nullptr; return rm_rf(remap_path(utf8(p))); });
     def(F, "removeItemAtURL:error:", +[](id, SEL, id u, id* err) -> bool { if (err) *err = nullptr; return rm_rf(url_path(ux(u))); });
-    def(F, "copyItemAtPath:toPath:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return copy_file(remap_path(utf8(a)), remap_path(utf8(b))); });
-    def(F, "copyItemAtURL:toURL:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return copy_file(url_path(ux(a)), url_path(ux(b))); });
-    def(F, "moveItemAtPath:toPath:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return rename(remap_path(utf8(a)).c_str(), remap_path(utf8(b)).c_str()) == 0; });
-    def(F, "moveItemAtURL:toURL:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return rename(url_path(ux(a)).c_str(), url_path(ux(b)).c_str()) == 0; });
+    def(F, "copyItemAtPath:toPath:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return copy_item(remap_path(utf8(a)), remap_path(utf8(b))); });
+    def(F, "copyItemAtURL:toURL:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return copy_item(url_path(ux(a)), url_path(ux(b))); });
+    def(F, "moveItemAtPath:toPath:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return move_item(remap_path(utf8(a)), remap_path(utf8(b))); });
+    def(F, "moveItemAtURL:toURL:error:", +[](id, SEL, id a, id b, id* err) -> bool { if (err) *err = nullptr; return move_item(url_path(ux(a)), url_path(ux(b))); });
     def(F, "contentsOfDirectoryAtPath:error:", +[](id, SEL, id p, id* err) -> id {
         if (err) *err = nullptr;
         std::vector<id> v; for (auto& n : list_dir(remap_path(utf8(p)))) v.push_back(str(n)); return arr(v);
@@ -1626,9 +1709,14 @@ static void init_locale() {
         return str(b);
     });
     def(P, "operatingSystemVersionString", +[](id, SEL) -> id { return str("Version 8.4 (Build 12H143)"); });
-    def(P, "operatingSystemVersion", +[](id, SEL) -> OSVersion { return {8, 4, 0}; });
+    // the same version UIDevice.systemVersion reports (ios_version)
+    def(P, "operatingSystemVersion", +[](id, SEL) -> OSVersion {
+        const uint32_t v = ios_version_packed();
+        return {static_cast<long>(v >> 16), static_cast<long>(v >> 8 & 0xff), static_cast<long>(v & 0xff)};
+    });
     def(P, "isOperatingSystemAtLeastVersion:", +[](id, SEL, OSVersion v) -> bool {
-        OSVersion me{8, 4, 0};
+        const uint32_t packed = ios_version_packed();
+        OSVersion me{static_cast<long>(packed >> 16), static_cast<long>(packed >> 8 & 0xff), static_cast<long>(packed & 0xff)};
         if (me.major != v.major) return me.major > v.major;
         if (me.minor != v.minor) return me.minor > v.minor;
         return me.patch >= v.patch;
@@ -2661,6 +2749,11 @@ static void init_values() {
     def(IP, "length", +[](id self, SEL) -> NSUInteger { return ext_get<IndexPathExt>(self)->v.size(); });
     def(IP, "indexAtPosition:", +[](id self, SEL, NSUInteger p) -> NSUInteger { auto& v = ext_get<IndexPathExt>(self)->v; return p < v.size() ? v[p] : NSNotFound; });
     def(IP, "isEqual:", +[](id self, SEL, id o) -> bool { return o && is_kind(o, "NSIndexPath") && ext_get<IndexPathExt>(self)->v == ext_get<IndexPathExt>(o)->v; });
+    def(IP, "hash", +[](id self, SEL) -> NSUInteger {   // equal paths hash alike (row-height caches keyed by index path)
+        NSUInteger h = 1469598103934665603ull;
+        for (NSUInteger i : ext_get<IndexPathExt>(self)->v) h = (h ^ i) * 1099511628211ull;
+        return h;
+    });
     def(IP, "copyWithZone:", +[](id self, SEL, void*) -> id { return retain(self); });
 
     Class SD = def_class("NSSortDescriptor", "NSObject");
@@ -2950,10 +3043,13 @@ struct Queue {
     std::mutex mu;                       // serial queues run one block at a time
     std::deque<std::function<void()>> pending;
     bool worker = false;
+    bool reentrant = false;              // created DISPATCH_QUEUE_CONCURRENT: a block on it may dispatch_sync to it
     std::string label;
 };
 Queue g_main_q_obj{true, false};
 Queue g_global_q_obj{false, true};
+uint64_t g_concurrent_attr = 2;          // &_dispatch_queue_attr_concurrent, what DISPATCH_QUEUE_CONCURRENT passes
+thread_local Queue* t_running_queue = nullptr;   // the created queue whose worker this thread is
 struct DispatchGroup { std::atomic<long> count{0}; std::mutex mu; std::condition_variable cv; };
 constexpr uint64_t kDispatchTimeNow = 0, kDispatchTimeForever = ~0ull;
 
@@ -2967,7 +3063,9 @@ void queue_run_serial(Queue* q) {
             q->pending.pop_front();
         }
         void* p = pool_push();
+        t_running_queue = q;
         fn();
+        t_running_queue = nullptr;
         pool_pop(p);
     }
 }
@@ -2985,7 +3083,14 @@ static void* gcd_main_queue() { return &g_main_q_obj; }
 static void* gcd_get_global_queue(long, unsigned long) { return &g_global_q_obj; }
 static void* gcd_get_current_queue() { return on_main_thread() ? static_cast<void*>(&g_main_q_obj) : static_cast<void*>(&g_global_q_obj); }
 static const char* gcd_queue_get_label(void* q) { Queue* qq = static_cast<Queue*>(q); return qq && !qq->label.empty() ? qq->label.c_str() : ""; }
-static void* gcd_queue_create(const char* label, void*) { Queue* q = new Queue(); q->label = label ? label : ""; return q; }
+static void* gcd_queue_create(const char* label, void* attr) {
+    // Blocks of a concurrent queue still run one at a time here (there are no barriers to keep writers apart), but
+    // the one thing that needs concurrency, a dispatch_sync to the queue from one of its own blocks, runs inline.
+    Queue* q = new Queue();
+    q->label = label ? label : "";
+    q->reentrant = attr == &g_concurrent_attr;
+    return q;
+}
 static uint64_t gcd_time(uint64_t base, int64_t delta) { return (base == kDispatchTimeForever ? kDispatchTimeForever : (base ? base : static_cast<uint64_t>(now_s() * 1e9)) + delta); }
 static uint64_t gcd_walltime(const void*, int64_t delta) { return static_cast<uint64_t>(now_s() * 1e9) + delta; }
 static void gcd_async(void* q, id block) {
@@ -2995,7 +3100,7 @@ static void gcd_async(void* q, id block) {
 static void gcd_async_f(void* q, void* ctx, void (*fn)(void*)) { queue_async(static_cast<Queue*>(q), [ctx, fn] { fn(ctx); }); }
 static void gcd_sync(void* q, id block) {
     Queue* qq = static_cast<Queue*>(q);
-    if (!qq || (qq->main && on_main_thread()) || qq->concurrent) { call_block0(block); return; }
+    if (!qq || (qq->main && on_main_thread()) || qq->concurrent || (qq->reentrant && t_running_queue == qq)) { call_block0(block); return; }
     if (qq->main) { run_on_main_sync([block] { call_block0(block); }); return; }
     std::mutex m; std::condition_variable cv; bool done = false;
     queue_async(qq, [&] { call_block0(block); std::lock_guard<std::mutex> l(m); done = true; cv.notify_one(); });
@@ -3004,7 +3109,8 @@ static void gcd_sync(void* q, id block) {
 }
 static void gcd_sync_f(void* q, void* ctx, void (*fn)(void*)) {
     Queue* qq = static_cast<Queue*>(q);
-    if (!qq || (qq->main && on_main_thread()) || qq->concurrent) { fn(ctx); return; }
+    if (!qq || (qq->main && on_main_thread()) || qq->concurrent || (qq->reentrant && t_running_queue == qq)) { fn(ctx); return; }
+    if (qq->main) { run_on_main_sync([ctx, fn] { fn(ctx); }); return; }
     std::mutex m; std::condition_variable cv; bool done = false;
     queue_async(qq, [&] { fn(ctx); std::lock_guard<std::mutex> l(m); done = true; cv.notify_one(); });
     std::unique_lock<std::mutex> l(m);
@@ -3048,8 +3154,36 @@ static void gcd_group_notify(void* g, void* q, id block) {
         queue_async(qq, [b] { call_block0(b); block_release(b); });
     }, "dispatch-notify");
 }
-static void gcd_once(long* pred, id block) { if (__sync_bool_compare_and_swap(pred, 0, 1)) call_block0(block); }
-static void gcd_once_f(long* pred, void* ctx, void (*fn)(void*)) { if (__sync_bool_compare_and_swap(pred, 0, 1)) fn(ctx); }
+// The predicate turns ~0 (the value the guest's inlined fast path tests for) only when the initializer has returned.
+// A second thread arriving meanwhile waits for that, instead of going on with a singleton that is still nil; the
+// running thread itself may come back in (it returns at once, so a recursive request does not deadlock).
+static std::mutex g_once_mu;
+static std::condition_variable g_once_cv;
+static std::unordered_map<long*, pthread_t> g_once_running;
+extern "C++" {
+template <class Fn>
+static void once_run(long* pred, Fn&& fn) {
+    if (__atomic_load_n(pred, __ATOMIC_ACQUIRE) == -1) return;
+    {
+        std::unique_lock<std::mutex> l(g_once_mu);
+        for (;;) {
+            if (*pred == -1) return;
+            auto it = g_once_running.find(pred);
+            if (it == g_once_running.end()) break;
+            if (pthread_equal(it->second, pthread_self())) return;
+            g_once_cv.wait(l);
+        }
+        g_once_running[pred] = pthread_self();
+    }
+    fn();
+    std::lock_guard<std::mutex> l(g_once_mu);
+    __atomic_store_n(pred, -1L, __ATOMIC_RELEASE);
+    g_once_running.erase(pred);
+    g_once_cv.notify_all();
+}
+}  // extern "C++"
+static void gcd_once(long* pred, id block) { once_run(pred, [&] { call_block0(block); }); }
+static void gcd_once_f(long* pred, void* ctx, void (*fn)(void*)) { once_run(pred, [&] { fn(ctx); }); }
 static void gcd_retain(void*) {}
 static void gcd_release(void*) {}
 static void gcd_resume(void*) {}
@@ -3091,10 +3225,9 @@ void register_gcd_symbols(std::unordered_map<std::string, void*>& m) {
     r("_dispatch_resume", &gcd_resume);
     r("_dispatch_suspend", &gcd_suspend);
     r("_dispatch_set_target_queue", &gcd_set_target);
-    static void* main_q = &g_main_q_obj;
-    m["__dispatch_main_q"] = &main_q;   // dispatch_get_main_queue() reads &_dispatch_main_q
-    static uint64_t concurrent_attr = 2;
-    m["__dispatch_queue_attr_concurrent"] = &concurrent_attr;
+    // dispatch_get_main_queue() is &_dispatch_main_q: the symbol's address is the queue itself
+    m["__dispatch_main_q"] = &g_main_q_obj;
+    m["__dispatch_queue_attr_concurrent"] = &g_concurrent_attr;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

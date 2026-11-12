@@ -155,8 +155,18 @@ def android_string(text: str) -> str:
 
 
 def package_id(info: dict) -> str:
-    source = info.get("CFBundleName") or info.get("CFBundleExecutable") or info.get("CFBundleDisplayName") or ""
-    name = re.sub(r"[^a-z0-9_]", "", source.lower())
+    # The first name that leaves any ASCII behind wins; a title in another script falls through to the next one
+    # and finally to the bundle identifier, so two such games do not both become com.xnuroid.loader.
+    name = ""
+    for key in ("CFBundleName", "CFBundleExecutable", "CFBundleDisplayName", "CFBundleIdentifier"):
+        source = info.get(key)
+        if not isinstance(source, str):
+            continue
+        if key == "CFBundleIdentifier":
+            source = source.replace(".", "_")
+        name = re.sub(r"[^a-z0-9_]", "", source.lower())
+        if name:
+            break
     if name and not name[0].isalpha():
         name = "app" + name
     return PACKAGE_PREFIX + (name or FALLBACK_PACKAGE_NAME)
@@ -196,7 +206,7 @@ def main() -> int:
     if icon:
         try:
             art = normalize_png(icon.read_bytes())
-        except (OSError, ValueError, zlib.error, StopIteration) as e:
+        except (OSError, ValueError, zlib.error, StopIteration, IndexError, struct.error) as e:
             log(f"skipping icon {icon.name}: {e}")
             icon = None
     if icon:

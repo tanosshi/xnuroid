@@ -1,6 +1,7 @@
 """Turns whatever the user picked (.ipa, unpacked folder, Payload folder or .app) into a configured game."""
 from __future__ import annotations
 
+import ast
 import importlib
 import plistlib
 import re
@@ -14,7 +15,12 @@ from typing import Callable
 import macho_check
 
 Progress = Callable[[float, str], None]
-CONFIG_LINE = re.compile(r'^(GAME_ROOT|APP_NAME|APP_EXECUTABLE)\s*=\s*r?["\'](.*)["\']\s*$', re.M)
+CONFIG_KEYS = ("GAME_ROOT", "APP_NAME", "APP_EXECUTABLE")
+IPA_STAMP = ".ipa_stamp"
+
+
+class Cancelled(Exception):
+    """The user pressed Cancel while a long copy was running."""
 
 
 @dataclass
@@ -87,9 +93,33 @@ def bundle_candidates(choice: Path) -> list[Path]:
     return apps_in(choice / "Payload")
 
 
-def extract_ipa(ipa: Path, games_dir: Path, progress: Progress) -> Path:
+def _ipa_stamp(ipa: Path) -> str:
+    stat = ipa.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _same_ipa(ipa: Path, dest: Path) -> bool:
+    """Whether dest was unpacked from this very file; a different .ipa with the same name is unpacked again."""
+    try:
+        return (dest / IPA_STAMP).read_text(encoding="utf-8").strip() == _ipa_stamp(ipa)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    # Unpacked before stamps existed: trust it unless the .ipa is newer, and remember it from now on.
+    try:
+        if ipa.stat().st_mtime > (dest / "Payload").stat().st_mtime:
+            return False
+        (dest / IPA_STAMP).write_text(_ipa_stamp(ipa), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def extract_ipa(ipa: Path, games_dir: Path, progress: Progress,
+                cancelled: Callable[[], bool] = lambda: False) -> Path:
     dest = games_dir / re.sub(r"[^\w.-]+", "_", ipa.stem)
-    if apps_in(dest / "Payload"):
+    if apps_in(dest / "Payload") and _same_ipa(ipa, dest):
         progress(1.0, "Already unpacked")
         return dest
     partial = dest.with_name(dest.name + ".unpacking")
@@ -100,9 +130,15 @@ def extract_ipa(ipa: Path, games_dir: Path, progress: Progress) -> Path:
             total = sum(m.file_size for m in members) or 1
             done = 0
             for member in members:
+                if cancelled():
+                    raise Cancelled()
                 archive.extract(member, partial)
                 done += member.file_size
                 progress(done / total, f"Unpacking {done >> 20} of {total >> 20} MB")
+        (partial / IPA_STAMP).write_text(_ipa_stamp(ipa), encoding="utf-8")
+    except Cancelled:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
     except (OSError, zipfile.BadZipFile) as error:
         shutil.rmtree(partial, ignore_errors=True)
         raise ValueError(f"I could not unpack {ipa.name}: {error}\n\n"
@@ -117,20 +153,34 @@ def adopt_loose_app(app: Path, games_dir: Path, progress: Progress) -> Path:
     if app.parent.name == "Payload":
         return app.parent.parent
     dest = games_dir / app.stem
-    target = dest / "Payload" / app.name
+    # Copied beside dest first and swapped in afterwards: the picked .app may itself live inside dest.
+    partial = dest.with_name(dest.name + ".copying")
     progress(0.0, "Copying the app into the project")
+    shutil.rmtree(partial, ignore_errors=True)
+    try:
+        shutil.copytree(app, partial / "Payload" / app.name)
+    except OSError as error:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise ValueError(f"I could not copy {app.name}: {error}") from None
     shutil.rmtree(dest, ignore_errors=True)
-    shutil.copytree(app, target)
+    partial.rename(dest)
     progress(1.0, "Copied")
     return dest
 
 
 def read_config(project: Path) -> Game | None:
     config = project / "tools" / "game_config_local.py"
+    # Parsed, never imported: the values are plain string literals.
+    values = {}
     try:
-        values = dict(CONFIG_LINE.findall(config.read_text(encoding="utf-8")))
-    except OSError:
+        tree = ast.parse(config.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
         return None
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in CONFIG_KEYS and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            values[node.targets[0].id] = node.value.value
     if not values.get("GAME_ROOT") or not values.get("APP_NAME"):
         return None
     root = Path(values["GAME_ROOT"])
@@ -144,11 +194,13 @@ def read_config(project: Path) -> Game | None:
 
 
 def write_config(project: Path, game: Game) -> None:
+    # tools/game_config.py imports this file, and the names come from the game's Info.plist: repr() keeps a quote
+    # or backslash in them from ending the string literal.
     (project / "tools" / "game_config_local.py").write_text(
         '"""Written by the xnuroid helper. Git-ignored, so your paths stay local."""\n'
-        f'GAME_ROOT = r"{game.root.resolve().as_posix()}"\n'
-        f'APP_NAME = "{game.app.stem}"\n'
-        f'APP_EXECUTABLE = "{game.executable}"\n',
+        f'GAME_ROOT = {game.root.resolve().as_posix()!r}\n'
+        f'APP_NAME = {game.app.stem!r}\n'
+        f'APP_EXECUTABLE = {str(game.executable)!r}\n',
         encoding="utf-8")
 
 

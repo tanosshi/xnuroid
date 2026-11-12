@@ -38,7 +38,71 @@ static id cf_autorelease(id o) { return autorelease(o); }
 static unsigned long cf_hash(id o) { return obj_hash(o); }
 static bool cf_equal(id a, id b) { return a == b || obj_equal(a, b); }
 static id cf_copy_description(id o) { return o ? retain(send(o, "description")) : str_new("(null)"); }
-static long cf_get_type_id(id) { return 1; }
+// CFTypeIDs: arbitrary but distinct per toll-free bridged kind, so CFGetTypeID(x) == CFStringGetTypeID() style checks work
+enum : long { kTidOther = 1, kTidNull = 16, kTidSet = 17, kTidDict = 18, kTidArray = 19, kTidData = 20, kTidBool = 21, kTidNumber = 22,
+              kTidString = 7, kTidURL = 29, kTidUUID = 38, kTidDate = 42 };
+static long cf_get_type_id(id o) {
+    if (!o) return 0;
+    static const std::pair<const char*, long> kinds[] = {{"NSString", kTidString}, {"NSDictionary", kTidDict}, {"NSArray", kTidArray},
+                                                         {"NSData", kTidData}, {"NSNumber", kTidNumber}, {"NSDate", kTidDate}, {"NSURL", kTidURL},
+                                                         {"NSSet", kTidSet}, {"NSNull", kTidNull}, {"NSUUID", kTidUUID}};
+    for (const auto& k : kinds)
+        if (is_kind(o, k.first)) {
+            if (k.second == kTidNumber && (o == num_b(true) || o == num_b(false))) return kTidBool;
+            return k.second;
+        }
+    return kTidOther;
+}
+
+// CFPropertyListCreateDeepCopy: containers rebuilt with copied contents (mutable, a superset of every option)
+static id deep_copy(id o, long options) {
+    if (is_kind(o, "NSDictionary")) {
+        id d = send_cls(class_named("NSMutableDictionary"), "new");
+        id keys = send(o, "allKeys");
+        for (unsigned long i = 0, n = send<unsigned long>(keys, "count"); i < n; ++i) {
+            id k = send(keys, "objectAtIndex:", i);
+            id v = deep_copy(send(o, "objectForKey:", k), options);
+            send<void>(d, "setObject:forKey:", v, k);
+            release(v);
+        }
+        return d;
+    }
+    if (is_kind(o, "NSArray")) {
+        id a = send_cls(class_named("NSMutableArray"), "new");
+        for (unsigned long i = 0, n = send<unsigned long>(o, "count"); i < n; ++i) {
+            id v = deep_copy(send(o, "objectAtIndex:", i), options);
+            send<void>(a, "addObject:", v);
+            release(v);
+        }
+        return a;
+    }
+    return send(o, options == 2 && (is_kind(o, "NSString") || is_kind(o, "NSData")) ? "mutableCopy" : "copy");
+}
+static id cf_property_list_deep_copy(void*, id plist, long options) { return plist ? deep_copy(plist, options) : nullptr; }
+
+// %XX decoding; escapes of characters in `keep` stay as they are. A NULL `keep` means nothing is decoded.
+static id cf_url_unescape(void*, id str, id keep, uint32_t) {
+    if (!str) return nullptr;
+    if (!keep) return retain(send(str, "copy"));
+    std::string in = utf8(str), kept = utf8(keep), out;
+    auto hexv = [](char c) { return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1; };
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size() && hexv(in[i + 1]) >= 0 && hexv(in[i + 2]) >= 0) {
+            char c = static_cast<char>(hexv(in[i + 1]) * 16 + hexv(in[i + 2]));
+            if (kept.find(c) == std::string::npos) { out += c; i += 2; continue; }
+        }
+        out += in[i];
+    }
+    return str_new(out);
+}
+
+// CFUUIDBytes is 16 bytes returned in x0/x1
+struct UuidBytes { uint8_t b[16]; };
+static UuidBytes cf_uuid_get_bytes(id u) {
+    UuidBytes r{};
+    if (u) send<void>(u, "getUUIDBytes:", r.b);
+    return r;
+}
 
 // CFString
 static long cf_string_get_length(id s) { return static_cast<long>(u16(s).size()); }
@@ -51,17 +115,45 @@ static bool cf_string_get_cstr(id s, char* buf, long size, uint32_t) {
     std::memcpy(buf, u.c_str(), u.size() + 1);
     return true;
 }
-static long cf_string_get_bytes(id s, NSRange r, uint32_t, uint8_t, bool, uint8_t* buf, long max, long* used) {
-    std::string u = utf8(s);
-    long n = std::min<long>(max, static_cast<long>(u.size()));
-    if (buf) std::memcpy(buf, u.data(), n);
-    if (used) *used = n;
-    return n;
+// CFStringEncoding -> NSStringEncoding. external: with a byte order mark, as CFString writes the plain UTF-16 and
+// UTF-32 encodings only when asked for the external representation.
+static NSUInteger cf_to_ns_encoding(uint32_t cf, bool external = true) {
+    switch (cf) {
+        case 0x08000100: return 4;                            // UTF-8
+        case 0x0600: return 1;                                // ASCII
+        case 0x0201: return 5;                                // ISO Latin 1
+        case 0x0500: return 12;                               // Windows Latin 1
+        case 0: return 30;                                    // MacRoman
+        case 0x0100: return external ? 10 : 0x94000100;       // UTF-16
+        case 0x0c000100: return external ? 0x8c000100 : 0x9c000100;   // UTF-32
+        default: return cf | 0x80000000u;                     // UTF-16/32 with a fixed byte order: the same number, top bit set
+    }
+}
+// Converts as many characters of the range as fit in the buffer (all of them without one); returns that count and
+// stores the bytes they take. Engines read strings out this way into their own UTF-32 or UTF-16 arrays.
+static long cf_string_get_bytes(id s, NSRange r, uint32_t enc, uint8_t, bool external, uint8_t* buf, long max, long* used) {
+    if (used) *used = 0;
+    if (!is_string(s)) return 0;
+    const NSUInteger len = send<NSUInteger>(s, "length"), ns_enc = cf_to_ns_encoding(enc, external);
+    if (r.location > len) return 0;
+    NSUInteger count = std::min(r.length, len - r.location);
+    for (;;) {
+        id d = send(send(s, "substringWithRange:", NSRange{r.location, count}), "dataUsingEncoding:", ns_enc);
+        const long bytes = static_cast<long>(data_len(d));
+        if (!buf || bytes <= max || !count) {
+            if (buf && bytes <= max) std::memcpy(buf, data_bytes(d), static_cast<size_t>(bytes));
+            if (used) *used = !buf || bytes <= max ? bytes : 0;
+            return static_cast<long>(!buf || bytes <= max ? count : 0);
+        }
+        count = std::min<NSUInteger>(count - 1, count * static_cast<NSUInteger>(std::max<long>(max, 0)) / static_cast<NSUInteger>(bytes));
+    }
 }
 static id cf_string_create_with_cstr(void*, const char* c, uint32_t) { return c ? str_new(c) : nullptr; }
 static id cf_string_create_with_bytes(void*, const uint8_t* b, long n, uint32_t enc, bool) {
+    if (!b || n < 0) return nullptr;
     if (enc == 0x08000100 || enc == 0x0600) return str_new(std::string(reinterpret_cast<const char*>(b), n));
-    return str_new(std::string(reinterpret_cast<const char*>(b), n));
+    return send(send_cls(class_named("NSString"), "alloc"), "initWithBytes:length:encoding:", static_cast<const void*>(b), static_cast<NSUInteger>(n),
+                cf_to_ns_encoding(enc));   // +1 (create rule)
 }
 static id cf_string_create_copy(void*, id s) { return s ? str16_new(u16(s)) : nullptr; }
 static id cf_string_create_mutable(void*, long) { return str16_new(u"", true); }
@@ -100,21 +192,25 @@ static id cf_data_create(void*, const uint8_t* b, long n) { return data_new(b, n
 
 // CFNumber
 static id cf_number_create(void*, int type, const void* v) {
+    // CFNumberType: 1 SInt8, 2 SInt16, 3 SInt32, 4 SInt64, 5 Float32, 6 Float64, 7 char, 8 short, 9 int, 10 long,
+    // 11 long long, 12 float, 13 double, 14 CFIndex, 15 NSInteger, 16 CGFloat
     switch (type) {
-        case 1: case 2: case 3: case 9: return retain(num_i(*static_cast<const int*>(v)));
-        case 4: case 10: return retain(num_i(*static_cast<const long long*>(v)));
+        case 1: case 7: return retain(num_i(*static_cast<const int8_t*>(v)));
+        case 2: case 8: return retain(num_i(*static_cast<const int16_t*>(v)));
+        case 3: case 9: return retain(num_i(*static_cast<const int32_t*>(v)));
         case 5: case 12: return retain(num_f(*static_cast<const float*>(v)));
-        case 6: case 13: return retain(num_d(*static_cast<const double*>(v)));
-        default: return retain(num_i(*static_cast<const long*>(v)));
+        case 6: case 13: case 16: return retain(num_d(*static_cast<const double*>(v)));
+        default: return retain(num_i(*static_cast<const long long*>(v)));
     }
 }
 static bool cf_number_get_value(id n, int type, void* out) {
-    switch (type) {
-        case 1: case 2: case 3: case 9: *static_cast<int*>(out) = static_cast<int>(num_ival(n)); break;
-        case 4: case 10: *static_cast<long long*>(out) = num_ival(n); break;
+    switch (type) {   // exactly as wide as the caller's variable
+        case 1: case 7: *static_cast<int8_t*>(out) = static_cast<int8_t>(num_ival(n)); break;
+        case 2: case 8: *static_cast<int16_t*>(out) = static_cast<int16_t>(num_ival(n)); break;
+        case 3: case 9: *static_cast<int32_t*>(out) = static_cast<int32_t>(num_ival(n)); break;
         case 5: case 12: *static_cast<float*>(out) = static_cast<float>(num_dval(n)); break;
-        case 6: case 13: *static_cast<double*>(out) = num_dval(n); break;
-        default: *static_cast<long*>(out) = static_cast<long>(num_ival(n)); break;
+        case 6: case 13: case 16: *static_cast<double*>(out) = num_dval(n); break;
+        default: *static_cast<long long*>(out) = num_ival(n); break;
     }
     return true;
 }
@@ -723,11 +819,28 @@ void register_misc_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CFEqual", &cf_equal);
     r("_CFCopyDescription", &cf_copy_description);
     r("_CFGetTypeID", &cf_get_type_id);
+    r("_CFStringGetTypeID", +[]() -> long { return kTidString; });
+    r("_CFDictionaryGetTypeID", +[]() -> long { return kTidDict; });
+    r("_CFArrayGetTypeID", +[]() -> long { return kTidArray; });
+    r("_CFDataGetTypeID", +[]() -> long { return kTidData; });
+    r("_CFNumberGetTypeID", +[]() -> long { return kTidNumber; });
+    r("_CFBooleanGetTypeID", +[]() -> long { return kTidBool; });
+    r("_CFDateGetTypeID", +[]() -> long { return kTidDate; });
+    r("_CFURLGetTypeID", +[]() -> long { return kTidURL; });
+    r("_CFSetGetTypeID", +[]() -> long { return kTidSet; });
+    r("_CFNullGetTypeID", +[]() -> long { return kTidNull; });
+    r("_CFUUIDGetTypeID", +[]() -> long { return kTidUUID; });
+    r("_CFMakeCollectable", +[](id o) -> id { return o; });
+    r("_CFPropertyListCreateDeepCopy", &cf_property_list_deep_copy);
+    r("_CFURLCreateStringByReplacingPercentEscapes", &cf_url_unescape);
+    r("_CFURLCreateStringByReplacingPercentEscapesUsingEncoding", &cf_url_unescape);
+    r("_CFUUIDGetUUIDBytes", &cf_uuid_get_bytes);
     r("_CFStringGetLength", &cf_string_get_length);
     r("_CFStringGetCharacterAtIndex", &cf_string_get_char);
     r("_CFStringGetCStringPtr", &cf_string_get_cstr_ptr);
     r("_CFStringGetCString", &cf_string_get_cstr);
     r("_CFStringGetBytes", &cf_string_get_bytes);
+    r("_CFStringConvertEncodingToNSStringEncoding", +[](uint32_t cf) -> NSUInteger { return cf_to_ns_encoding(cf); });
     r("_CFStringCreateWithCString", &cf_string_create_with_cstr);
     r("_CFStringCreateWithBytes", &cf_string_create_with_bytes);
     r("_CFStringCreateCopy", &cf_string_create_copy);

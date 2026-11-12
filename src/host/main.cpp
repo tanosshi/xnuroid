@@ -335,7 +335,7 @@ bool parse_fixup_inventory(const std::vector<uint8_t>& b, Inventory& r, std::str
                                       : static_cast<uint16_t>((raw >> (fmt == 13 ? 52 : 51)) & 0x7ff);
           ++fs.words; if (is_bind) ++fs.binds; else ++fs.rebases;
           if (is_bind) {
-            const uint32_t ordinal = static_cast<uint32_t>(raw & (fmt == 12 ? 0xffffffULL : 0xffffULL));
+            const uint32_t ordinal = static_cast<uint32_t>(raw & (fmt64 || fmt == 12 ? 0xffffffULL : 0xffffULL));
             if (ordinal >= import_count) { ++fs.invalid; chain_valid = false; break; }
           }
           if (next == 0) { ++fs.terminated; done = true; break; }

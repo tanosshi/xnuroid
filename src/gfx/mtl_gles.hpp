@@ -341,17 +341,23 @@ struct Ring {
     GLuint buf = 0;
     GLenum target = 0;
     size_t size = 0, head = 0;
+    // Two stores take turns. A full one hands over to the other, so the ranges already pushed for the draw being
+    // assembled stay intact; orphaning the store in place would drop them. buf is the store of the last push.
+    GLuint stores[2] = {0, 0};
+    size_t caps[2] = {0, 0};
+    int cur = 0;
     size_t push(const void* data, size_t len, size_t align) {
-        if (!buf) {
-            glGenBuffers(1, &buf);
-            glBindBuffer(target, buf);
-            glBufferData(target, static_cast<GLsizeiptr>(size), nullptr, GL_STREAM_DRAW);
-        }
-        glBindBuffer(target, buf);
         head = (head + align - 1) / align * align;
-        if (head + len > size) {
-            glBufferData(target, static_cast<GLsizeiptr>(size), nullptr, GL_STREAM_DRAW);   // orphan
+        if (!buf || head + len > caps[cur]) {
+            if (buf) cur ^= 1;
+            if (!stores[cur]) glGenBuffers(1, &stores[cur]);
+            buf = stores[cur];
+            caps[cur] = std::max(size, len);   // a single push larger than the ring gets a store of its own size
+            glBindBuffer(target, buf);
+            glBufferData(target, static_cast<GLsizeiptr>(caps[cur]), nullptr, GL_STREAM_DRAW);   // orphan
             head = 0;
+        } else {
+            glBindBuffer(target, buf);
         }
         size_t at = head;
         if (len) glBufferSubData(target, static_cast<GLintptr>(at), static_cast<GLsizeiptr>(len), data);
@@ -426,6 +432,9 @@ inline Tex* texture(FakeObjcObj* o) {
     t->h = static_cast<int>(std::max<uint64_t>(1, prop(o, "height", 1)));
     t->d = static_cast<int>(std::max<uint64_t>(1, prop(o, "depth", 1)));
     t->levels = static_cast<int>(std::max<uint64_t>(1, prop(o, "mipmapLevelCount", 1)));
+    int full_chain = 1;   // glTexStorage rejects more levels than the size has
+    for (int m = std::max(std::max(t->w, t->h), prop(o, "textureType", 2) == 7 ? t->d : 1); m > 1; m >>= 1) ++full_chain;
+    t->levels = std::min(t->levels, full_chain);
     t->layers = static_cast<int>(std::max<uint64_t>(1, prop(o, "arrayLength", 1)));
     t->samples = static_cast<int>(std::max<uint64_t>(1, prop(o, "sampleCount", 1)));
     t->target = target_of(prop(o, "textureType", 2), t->samples);
@@ -580,14 +589,15 @@ inline void attach(GLenum fb_target, GLenum point, Tex* t, int level, int slice)
 }
 
 // Reads level 0 of t as RGBA8 rows top to bottom (Metal row order).
-inline bool read_rgba(Tex* t, std::vector<uint8_t>& out) {
+inline bool read_rgba(Tex* t, std::vector<uint8_t>& out, int level = 0) {
     ThreadGL& g = tgl();
-    if (!g.init || !t || t->f.compressed || t->f.depth) return false;
+    if (!g.init || !t || t->f.compressed || t->f.depth || level < 0 || level >= t->levels) return false;
+    const int w = std::max(1, t->w >> level), h = std::max(1, t->h >> level);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g.read_fbo);
-    attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, t, 0, 0);
-    out.resize(static_cast<size_t>(t->w) * t->h * 4);
+    attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, t, level, 0);
+    out.resize(static_cast<size_t>(w) * h * 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, t->w, t->h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     return glGetError() == GL_NO_ERROR;
 }
@@ -1156,7 +1166,7 @@ inline void bind_vertices(Encoder* e, ThreadGL& g, uint64_t max_vertex, uint64_t
     Pipeline* p = e->pipe;
     glBindVertexArray(g.vao);
     uint32_t want = 0;
-    std::map<uint64_t, size_t> uploaded;   // buffer index -> ring offset
+    std::map<uint64_t, std::pair<GLuint, size_t>> uploaded;   // buffer index -> ring store and offset
     for (const Attr& a : p->attrs) {
         VFmt vf;
         if (!vertex_format(a.format, vf) || a.buffer >= 32) continue;
@@ -1178,10 +1188,11 @@ inline void bind_vertices(Encoder* e, ThreadGL& g, uint64_t max_vertex, uint64_t
                             static_cast<unsigned long long>(a.buffer), static_cast<unsigned long long>(need), n);
             }
             if (tex_profiling() && e->vbuf[a.buffer].bytes.empty()) tex_profile_read(src, n, p->prog, 'v');
-            uploaded[a.buffer] = g.vb.push(src, n, 16);
+            const size_t at = g.vb.push(src, n, 16);
+            uploaded[a.buffer] = {g.vb.buf, at};
         }
-        glBindBuffer(GL_ARRAY_BUFFER, g.vb.buf);
-        const void* ptr = reinterpret_cast<const void*>(uploaded[a.buffer] + a.offset);
+        glBindBuffer(GL_ARRAY_BUFFER, uploaded[a.buffer].first);
+        const void* ptr = reinterpret_cast<const void*>(uploaded[a.buffer].second + a.offset);
         GLsizei stride = static_cast<GLsizei>(l.step == 0 ? 0 : l.stride);
         if (vf.integer) glVertexAttribIPointer(static_cast<GLuint>(a.loc), vf.comps, vf.type, stride, ptr);
         else glVertexAttribPointer(static_cast<GLuint>(a.loc), vf.comps, vf.type, vf.norm ? GL_TRUE : GL_FALSE, stride, ptr);
@@ -1628,8 +1639,15 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
             ps->props["#gl"] = reinterpret_cast<uint64_t>(make_pipeline(fake_lookup(frame.x[2])));
             ps->gltype = kGlPipeline;
         }
-        if (sel == "newRenderPipelineStateWithDescriptor:completionHandler:") { run_block(frame.x[3], h); frame.ret_x0 = 0; return true; }
         size_t colons = colon_count(sel);
+        if (sel.size() > 18 && sel.compare(sel.size() - 18, 18, "completionHandler:") == 0) {
+            // ...:completionHandler: ^(state, error) / ...:options:completionHandler: ^(state, reflection, error)
+            const uint64_t block = frame.x[1 + colons];
+            if (void* inv = block ? *reinterpret_cast<void**>(block + 16) : nullptr)
+                reinterpret_cast<void (*)(uint64_t, uint64_t, uint64_t, uint64_t)>(inv)(block, h, 0, 0);
+            frame.ret_x0 = 0;
+            return true;
+        }
         if (colons >= 2) {   // ...:error: / ...:options:reflection:error: : clear the NSError out-parameter
             uint64_t err = frame.x[1 + colons];
             if (err) *reinterpret_cast<uint64_t*>(err) = 0;
@@ -1680,12 +1698,16 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         std::vector<uint8_t> px;
         const uint64_t* r = reinterpret_cast<const uint64_t*>(frame.x[4]);
         uint8_t* dst = reinterpret_cast<uint8_t*>(frame.x[2]);
-        if (t && r && dst && read_rgba(t, px)) {
-            for (uint64_t y = 0; y < r[4] && r[1] + y < static_cast<uint64_t>(t->h); ++y)
-                for (uint64_t x = 0; x < r[3] && r[0] + x < static_cast<uint64_t>(t->w); ++x) {
-                    const uint8_t* s = &px[((r[1] + y) * t->w + r[0] + x) * 4];
-                    uint8_t* d = dst + y * frame.x[3] + x * 4;
-                    if (t->f.bgra) { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3]; } else std::memcpy(d, s, 4);
+        const int level = static_cast<int>(frame.x[5]);
+        // 8-bit formats only: the guest's rows hold bytes-per-pixel of the texture's own format, not always 4
+        const size_t bpp = t && t->f.type == GL_UNSIGNED_BYTE && !t->f.integer ? static_cast<size_t>(t->f.bytes) : 0;
+        if (t && r && dst && (bpp == 1 || bpp == 2 || bpp == 4) && read_rgba(t, px, level)) {
+            const uint64_t lw = static_cast<uint64_t>(std::max(1, t->w >> level)), lh = static_cast<uint64_t>(std::max(1, t->h >> level));
+            for (uint64_t y = 0; y < r[4] && r[1] + y < lh; ++y)
+                for (uint64_t x = 0; x < r[3] && r[0] + x < lw; ++x) {
+                    const uint8_t* s = &px[((r[1] + y) * lw + r[0] + x) * 4];
+                    uint8_t* d = dst + y * frame.x[3] + x * bpp;
+                    if (t->f.bgra) { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3]; } else std::memcpy(d, s, bpp);
                 }
         }
         return true;

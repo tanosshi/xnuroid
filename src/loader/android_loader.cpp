@@ -453,13 +453,15 @@ extern "C" void native_memset_pattern16(void* b, const void* pattern16, size_t l
 }
 
 // Apple Darwin TSD / pthread_key emulation
-static int g_next_apple_key = 1;
+static std::atomic<int> g_next_apple_key{1};
 
 // Darwin's pthread_key_t is a 64-bit unsigned long; bionic's is a 32-bit int. The guest's key variable is 8 bytes, so
 // write all of it (a 4-byte store leaves garbage in the upper half and key*8 becomes a wild TSD index).
 extern "C" int native_pthread_key_create(uint64_t* key, void (*destructor)(void*)) {
     if (!key) return EINVAL;
-    *key = static_cast<uint64_t>(g_next_apple_key++);
+    const int k = g_next_apple_key.fetch_add(1);   // two threads creating keys at once must not get the same slot
+    if (k >= 512) return EAGAIN;                     // g_apple_tsd is full: say so, rather than hand out a key that stores nothing
+    *key = static_cast<uint64_t>(k);
     return 0;
 }
 
@@ -647,8 +649,8 @@ struct MachThread {
     pid_t tid = 0;
     pthread_t pt{};
     sem_t resume;
-    volatile int suspended = 0;
-    int suspend_count = 0;
+    std::atomic<int> suspended{0};       // parked in the handler; the saved registers below are current
+    std::atomic<int> suspend_count{0};   // changed under g_mt_mu, read by the handler
     uint64_t regs[31] = {};
     uint64_t sp = 0, pc = 0;
     uint32_t cpsr = 0;
@@ -667,9 +669,17 @@ static void mach_suspend_handler(int, siginfo_t*, void* ctx) {
     me->sp = uc->uc_mcontext.sp;
     me->pc = uc->uc_mcontext.pc;
     me->cpsr = static_cast<uint32_t>(uc->uc_mcontext.pstate);
-    me->suspended = 1;
-    while (sem_wait(&me->resume) != 0 && errno == EINTR) {}
-    me->suspended = 0;
+    const int saved_errno = errno;
+    // Parked for as long as a suspend is outstanding; the semaphore only wakes the loop up. A suspend that arrives
+    // while this thread is on its way out either sees suspended == 0 and waits for the next signal, or is seen
+    // here by the second look at suspend_count and keeps the thread parked with the registers it already saved.
+    for (;;) {
+        me->suspended = 1;
+        if (me->suspend_count > 0) { sem_wait(&me->resume); continue; }
+        me->suspended = 0;
+        if (me->suspend_count <= 0) break;
+    }
+    errno = saved_errno;
 }
 static MachThread* mach_register_current() {
     if (t_mach_self) return t_mach_self;
@@ -740,8 +750,15 @@ int native_thread_suspend(uint32_t port) {
     if (!signal_it) return 0;
     syscall(SYS_tgkill, getpid(), m->tid, mach_suspend_signal());
     for (int i = 0; i < 40000 && !m->suspended; ++i) usleep(50);   // up to 2 s
-    if (!m->suspended) fprintf(stderr, "[MACH] thread_suspend(port=%u): thread did not acknowledge the suspend signal within 2 s\n", port);
-    return m->suspended ? 0 : 5;
+    if (m->suspended) return 0;
+    fprintf(stderr, "[MACH] thread_suspend(port=%u): thread did not acknowledge the suspend signal within 2 s\n", port);
+    {
+        // given up: a later suspend signals again, and a late delivery of this one does not park the thread
+        std::lock_guard<std::mutex> l(g_mt_mu);
+        if (m->suspend_count > 0) --m->suspend_count;
+    }
+    sem_post(&m->resume);   // in case it parked this very moment
+    return 5;
 }
 int native_thread_resume(uint32_t port) {
     MachThread* m = mach_find(port);
@@ -798,8 +815,10 @@ extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* 
 // Guest dlopen/dlsym: Apple frameworks resolve to a fake handle; MTLCreateSystemDefaultDevice returns a fake device.
 static char g_fake_framework_handle[16];
 extern "C" void* native_mtl_create_system_default_device();
+static void* guest_dlsym_lookup(const char* name);   // after resolve_symbol
 extern "C" void* native_guest_dlopen(const char* path, int flags) {
-    if (path && (std::strstr(path, "/System/Library/") || std::strstr(path, ".framework"))) {
+    if (path && (std::strstr(path, "/System/Library/") || std::strstr(path, ".framework") || std::strncmp(path, "/usr/lib/", 9) == 0 ||
+                 (!std::strchr(path, '/') && std::strstr(path, ".dylib")))) {
         fprintf(stderr, "[DLOPEN] fake framework handle for %s\n", path);
         return g_fake_framework_handle;
     }
@@ -810,7 +829,7 @@ extern "C" void* native_guest_dlsym(void* handle, const char* name) {
         fprintf(stderr, "[DLSYM] fake framework: %s\n", name ? name : "(null)");
         if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
             return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
-        return nullptr;
+        return name ? guest_dlsym_lookup(name) : nullptr;
     }
     if (name && std::strcmp(name, "MTLCreateSystemDefaultDevice") == 0)
         return reinterpret_cast<void*>(&native_mtl_create_system_default_device);
@@ -818,6 +837,8 @@ extern "C" void* native_guest_dlsym(void* handle, const char* name) {
     intptr_t h = reinterpret_cast<intptr_t>(handle);
     if (h == -2 || h == -3 || h == -5) handle = RTLD_DEFAULT;
     else if (h == -1) handle = RTLD_NEXT;
+    if (handle == RTLD_DEFAULT && name)   // the process-wide namespace includes what the loader provides
+        if (void* p = guest_dlsym_lookup(name)) return p;
     return dlsym(handle, name);
 }
 
@@ -867,22 +888,38 @@ extern "C" uint64_t native_clock_gettime_nsec_np(int darwin_clock) {
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 // dispatch_once: predicate is a Darwin intptr; 0 = not run, ~0 = done. A Block's invoke pointer sits at +16.
+// The predicate only becomes ~0 once the initializer has returned: callers inline the `*pred == ~0` test, so an
+// early mark would hand other threads a half-built singleton. They wait instead; the running thread itself may
+// re-enter (it returns at once, so a recursive request does not deadlock).
 static pthread_mutex_t g_once_mutex = PTHREAD_MUTEX_INITIALIZER;
-extern "C" void native_dispatch_once_f(intptr_t* pred, void* ctx, void (*fn)(void*)) {
+static pthread_cond_t g_once_cond = PTHREAD_COND_INITIALIZER;
+static std::unordered_map<intptr_t*, pid_t> g_once_running;
+template <class Fn>
+static void dispatch_once_run(intptr_t* pred, Fn&& fn) {
     if (__atomic_load_n(pred, __ATOMIC_ACQUIRE) == -1) return;
+    const pid_t me = gettid();
     pthread_mutex_lock(&g_once_mutex);
-    bool run = (*pred != -1);
-    if (run) *pred = -1;  // mark first so recursive requests on this thread do not deadlock/loop
+    for (;;) {
+        if (*pred == -1) { pthread_mutex_unlock(&g_once_mutex); return; }
+        auto it = g_once_running.find(pred);
+        if (it == g_once_running.end()) break;
+        if (it->second == me) { pthread_mutex_unlock(&g_once_mutex); return; }
+        pthread_cond_wait(&g_once_cond, &g_once_mutex);
+    }
+    g_once_running[pred] = me;
     pthread_mutex_unlock(&g_once_mutex);
-    if (run) fn(ctx);
+    fn();
+    pthread_mutex_lock(&g_once_mutex);
+    __atomic_store_n(pred, static_cast<intptr_t>(-1), __ATOMIC_RELEASE);
+    g_once_running.erase(pred);
+    pthread_cond_broadcast(&g_once_cond);
+    pthread_mutex_unlock(&g_once_mutex);
+}
+extern "C" void native_dispatch_once_f(intptr_t* pred, void* ctx, void (*fn)(void*)) {
+    dispatch_once_run(pred, [&] { fn(ctx); });
 }
 extern "C" void native_dispatch_once(intptr_t* pred, void* block) {
-    if (__atomic_load_n(pred, __ATOMIC_ACQUIRE) == -1) return;
-    pthread_mutex_lock(&g_once_mutex);
-    bool run = (*pred != -1);
-    if (run) *pred = -1;
-    pthread_mutex_unlock(&g_once_mutex);
-    if (run) reinterpret_cast<void (*)(void*)>(*reinterpret_cast<void**>(static_cast<char*>(block) + 16))(block);
+    dispatch_once_run(pred, [&] { reinterpret_cast<void (*)(void*)>(*reinterpret_cast<void**>(static_cast<char*>(block) + 16))(block); });
 }
 extern "C" void native_assert_rtn(const char* func, const char* file, int line, const char* expr) {
     fprintf(stderr, "[ASSERT] %s:%d: %s: Assertion `%s' failed.\n", file ? file : "?", line, func ? func : "?", expr ? expr : "?");
@@ -1103,6 +1140,30 @@ extern "C" int native_mach_port_deallocate(uint32_t task, uint32_t name) { retur
 extern "C" int native_mach_port_insert_right(uint32_t task, uint32_t name, uint32_t poly, uint32_t polyPoly) { return 0; }
 extern "C" int native_mach_port_mod_refs(uint32_t task, uint32_t name, int right, int delta) { return 0; }
 
+// sysconf: Darwin numbers its _SC_* names differently (_SC_PAGESIZE is 29 there, 39 in bionic); a guest asking
+// for the page size would otherwise get an unrelated limit. Unknown names fail as an unsupported option would.
+extern "C" long native_sysconf_darwin(int name) {
+    switch (name) {
+        case 1: return sysconf(_SC_ARG_MAX);
+        case 2: return sysconf(_SC_CHILD_MAX);
+        case 3: return sysconf(_SC_CLK_TCK);
+        case 4: return sysconf(_SC_NGROUPS_MAX);
+        case 5: return sysconf(_SC_OPEN_MAX);
+        case 15: return sysconf(_SC_LINE_MAX);
+        case 29: return sysconf(_SC_PAGESIZE);
+        case 56: return sysconf(_SC_IOV_MAX);
+        case 57: return sysconf(_SC_NPROCESSORS_CONF);
+        case 58: return sysconf(_SC_NPROCESSORS_ONLN);
+        case 70: return sysconf(_SC_GETGR_R_SIZE_MAX);
+        case 71: return sysconf(_SC_GETPW_R_SIZE_MAX);
+        case 72: return sysconf(_SC_HOST_NAME_MAX);
+        case 73: return sysconf(_SC_LOGIN_NAME_MAX);
+        case 93: return sysconf(_SC_THREAD_STACK_MIN);
+        case 200: return sysconf(_SC_PHYS_PAGES);
+        default: errno = EINVAL; return -1;
+    }
+}
+
 extern "C" int native_vm_allocate(uint32_t task, uintptr_t* address, size_t size, int flags) {
     void* p = mmap(reinterpret_cast<void*>(*address), size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (p == MAP_FAILED) return 1;
@@ -1173,6 +1234,32 @@ static inline va_list darwin_va(void* darwin_ap) {
     return make_va_list(darwin_ap);
 }
 
+// ---- SQLite: iOS ships libsqlite3, and an Android app cannot load the platform copy, so the amalgamation is built
+// in (src/third_party/sqlite) and exported. Plain API functions bind by name (sqlite_symbol); the variadic ones read
+// Darwin's stack-passed arguments.
+#include "../third_party/sqlite/sqlite3.h"
+static void* sqlite_symbol(const char* name) {
+    static void* self = [] {
+        Dl_info info{};
+        void* h = dladdr(reinterpret_cast<void*>(&sqlite3_libversion), &info) && info.dli_fname ? dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD) : nullptr;
+        return h ? h : dlopen(nullptr, RTLD_NOW);
+    }();
+    return self ? dlsym(self, name) : nullptr;
+}
+extern "C" char* native_sqlite3_mprintf(const char* fmt, const void* va) { va_list ap = make_va_list(va); return sqlite3_vmprintf(fmt, ap); }
+extern "C" char* native_sqlite3_snprintf(int n, char* buf, const char* fmt, const void* va) { va_list ap = make_va_list(va); return sqlite3_vsnprintf(n, buf, fmt, ap); }
+extern "C" char* native_sqlite3_vmprintf(const char* fmt, void* dap) { va_list ap = darwin_va(dap); return sqlite3_vmprintf(fmt, ap); }
+extern "C" char* native_sqlite3_vsnprintf(int n, char* buf, const char* fmt, void* dap) { va_list ap = darwin_va(dap); return sqlite3_vsnprintf(n, buf, fmt, ap); }
+extern "C" void native_sqlite3_log(int err, const char* fmt, const void* va) { char* m = native_sqlite3_mprintf(fmt, va); sqlite3_log(err, "%s", m ? m : ""); sqlite3_free(m); }
+// config / db_config take a few pointer-or-int arguments after the opcode
+extern "C" int native_sqlite3_config(int op, const uint64_t* a) { return sqlite3_config(op, a[0], a[1], a[2], a[3]); }
+extern "C" int native_sqlite3_db_config(sqlite3* db, int op, const uint64_t* a) { return sqlite3_db_config(db, op, a[0], a[1], a[2], a[3]); }
+APP_VARIADIC(th_sqlite3_mprintf, native_sqlite3_mprintf, 1)
+APP_VARIADIC(th_sqlite3_snprintf, native_sqlite3_snprintf, 3)
+APP_VARIADIC(th_sqlite3_log, native_sqlite3_log, 2)
+APP_VARIADIC(th_sqlite3_config, native_sqlite3_config, 1)
+APP_VARIADIC(th_sqlite3_db_config, native_sqlite3_db_config, 2)
+
 static inline void set_ret_int(CallFrame& f, int v) {
     f.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(v));
 }
@@ -1231,6 +1318,31 @@ static void shim_scanf(CallFrame& f, void*) {
     va_list ap = guest_va<1>(f);
     set_ret_int(f, vscanf(reinterpret_cast<const char*>(f.x[0]), ap));
 }
+// wide-character variants (wchar_t is 32-bit on both sides)
+static void shim_wprintf(CallFrame& f, void*) {
+    va_list ap = guest_va<1>(f);
+    set_ret_int(f, vwprintf(reinterpret_cast<const wchar_t*>(f.x[0]), ap));
+}
+static void shim_fwprintf(CallFrame& f, void*) {
+    va_list ap = guest_va<2>(f);
+    set_ret_int(f, vfwprintf(reinterpret_cast<FILE*>(f.x[0]), reinterpret_cast<const wchar_t*>(f.x[1]), ap));
+}
+static void shim_swprintf(CallFrame& f, void*) {
+    va_list ap = guest_va<3>(f);
+    set_ret_int(f, vswprintf(reinterpret_cast<wchar_t*>(f.x[0]), f.x[1], reinterpret_cast<const wchar_t*>(f.x[2]), ap));
+}
+static void shim_swscanf(CallFrame& f, void*) {
+    va_list ap = guest_va<2>(f);
+    set_ret_int(f, vswscanf(reinterpret_cast<const wchar_t*>(f.x[0]), reinterpret_cast<const wchar_t*>(f.x[1]), ap));
+}
+static void shim_fwscanf(CallFrame& f, void*) {
+    va_list ap = guest_va<2>(f);
+    set_ret_int(f, vfwscanf(reinterpret_cast<FILE*>(f.x[0]), reinterpret_cast<const wchar_t*>(f.x[1]), ap));
+}
+static void shim_wscanf(CallFrame& f, void*) {
+    va_list ap = guest_va<1>(f);
+    set_ret_int(f, vwscanf(reinterpret_cast<const wchar_t*>(f.x[0]), ap));
+}
 static void shim_syslog(CallFrame& f, void*) {
     va_list ap = guest_va<2>(f);
     char buf[1024];
@@ -1261,6 +1373,12 @@ extern "C" int native_vdprintf(int fd, const char* fmt, void* dap) { va_list ap 
 extern "C" int native_vsscanf(const char* s, const char* fmt, void* dap) { va_list ap = darwin_va(dap); return vsscanf(s, fmt, ap); }
 extern "C" int native_vfscanf(FILE* fp, const char* fmt, void* dap) { va_list ap = darwin_va(dap); return vfscanf(fp, fmt, ap); }
 extern "C" int native_vscanf(const char* fmt, void* dap) { va_list ap = darwin_va(dap); return vscanf(fmt, ap); }
+extern "C" int native_vwprintf(const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vwprintf(fmt, ap); }
+extern "C" int native_vfwprintf(FILE* fp, const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vfwprintf(fp, fmt, ap); }
+extern "C" int native_vswprintf(wchar_t* s, size_t n, const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vswprintf(s, n, fmt, ap); }
+extern "C" int native_vswscanf(const wchar_t* s, const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vswscanf(s, fmt, ap); }
+extern "C" int native_vfwscanf(FILE* fp, const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vfwscanf(fp, fmt, ap); }
+extern "C" int native_vwscanf(const wchar_t* fmt, void* dap) { va_list ap = darwin_va(dap); return vwscanf(fmt, ap); }
 extern "C" int native___vsnprintf_chk(char* s, size_t maxlen, int, size_t, const char* fmt, void* dap) {
     va_list ap = darwin_va(dap);
     return vsnprintf(s, maxlen, fmt, ap);
@@ -1367,14 +1485,29 @@ static bool selftest_setjmp() {
 // ---------------------------------------------------------------------------
 static std::string remap_game_path(const char* path) {
     std::string p = path ? path : "";
-    if (p.find("Data/") != std::string::npos || p.find("Managed/") != std::string::npos) {
-        size_t idx = p.find("Data/");
-        if (idx != std::string::npos) {
-            p = std::string(game_dir()) + "/" + p.substr(idx);
-        } else {
-            p = std::string(game_dir()) + "/Data/" + p;
+    const std::string game = game_dir();
+    // the guest's writable container, and its Documents folder when that lives on shared storage (app_main.cpp)
+    static const std::string box = getenv("LOADER_SANDBOX_DIR") ? getenv("LOADER_SANDBOX_DIR") : "/data/local/tmp/sandbox";
+    static const std::string shared = getenv("LOADER_SHARED_STORAGE") ? std::string(getenv("LOADER_SHARED_STORAGE")) + "/xnuroid" : "";
+    auto under = [&](const std::string& root) {
+        return !root.empty() && p.compare(0, root.size(), root) == 0 && (p.size() == root.size() || p[root.size()] == '/');
+    };
+    if (under(game)) return p;   // already the bundle copy
+    // "Data/" as a whole path component: SaveData/ or GameData/ are the guest's own folders
+    size_t idx = p.find("Data/");
+    while (idx != std::string::npos && idx > 0 && p[idx - 1] != '/') idx = p.find("Data/", idx + 1);
+    if (under(box) || under(shared)) {
+        // These are real locations too, and a save folder in them may be called Data. A file that earlier builds
+        // redirected into the bundle copy is still found there.
+        const size_t any = p.find("Data/");
+        if (any != std::string::npos && access(p.c_str(), F_OK) != 0) {
+            const std::string legacy = game + "/" + p.substr(any);
+            if (access(legacy.c_str(), F_OK) == 0) return legacy;
         }
+        return p;
     }
+    if (idx != std::string::npos) p = game + "/" + p.substr(idx);
+    else if (p.find("Managed/") != std::string::npos) p = game + "/Data/" + p;
     return p;
 }
 
@@ -1410,11 +1543,9 @@ static int linux_to_darwin_open_flags(int l) {
     return f;
 }
 
-static std::unordered_map<int, std::string> g_fd_paths;
-
+// Asked from the kernel each time: a table filled by open() would be shared between guest threads and would keep
+// the old path after the descriptor number is closed and reused.
 static std::string fd_path(int fd) {
-    auto it = g_fd_paths.find(fd);
-    if (it != g_fd_paths.end()) return it->second;
     char link[64];
     char out[512];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
@@ -1433,7 +1564,6 @@ static void shim_open(CallFrame& frame, void*) {
     int linux_flags = darwin_to_linux_open_flags(flags);
     int fd = open(p.c_str(), linux_flags, mode);
     int saved_errno = errno;
-    if (fd >= 0) g_fd_paths[fd] = p;
     fprintf(stderr, "[SHIM] open(\"%s\") -> \"%s\" darwin_flags=0x%x linux_flags=0x%x mode=0%o -> fd=%d\n",
             path ? path : "(null)", p.c_str(), flags, linux_flags, static_cast<unsigned>(mode), fd);
     errno = saved_errno;
@@ -1448,7 +1578,6 @@ static void shim_openat(CallFrame& frame, void*) {
     mode_t mode = (flags & 0x200) ? static_cast<mode_t>(frame.read_stack<int>(0)) : 0;
     std::string p = remap_game_path(path);
     int fd = openat(dirfd, p.c_str(), darwin_to_linux_open_flags(flags), mode);
-    if (fd >= 0) g_fd_paths[fd] = p;
     frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(fd));
 }
 
@@ -1474,8 +1603,28 @@ static void shim_fcntl(CallFrame& frame, void*) {
             rc = fcntl(fd, F_SETFL, l);
             break;
         }
-        case 45: case 48: case 41: rc = 0; break;  // F_RDAHEAD, F_NOCACHE, F_PREALLOCATE: no-ops
-        case 51: rc = fsync(fd); break;            // F_FULLFSYNC
+        case 7: case 8: case 9: {                  // F_GETLK, F_SETLK, F_SETLKW (a guest's own SQLite locks this way)
+            struct DarwinFlock { int64_t start, len; int32_t pid; int16_t type, whence; };   // l_type: 1 read, 2 unlock, 3 write
+            auto* d = reinterpret_cast<DarwinFlock*>(arg);
+            if (!d) { errno = EFAULT; break; }
+            struct flock l{};
+            l.l_type = d->type == 1 ? F_RDLCK : d->type == 3 ? F_WRLCK : F_UNLCK;
+            l.l_whence = d->whence;
+            l.l_start = d->start;
+            l.l_len = d->len;
+            l.l_pid = d->pid;
+            rc = fcntl(fd, cmd == 7 ? F_GETLK : cmd == 8 ? F_SETLK : F_SETLKW, &l);
+            if (rc == 0 && cmd == 7) {
+                d->start = l.l_start;
+                d->len = l.l_len;
+                d->pid = l.l_pid;
+                d->type = l.l_type == F_RDLCK ? 1 : l.l_type == F_WRLCK ? 3 : 2;
+                d->whence = l.l_whence;
+            }
+            break;
+        }
+        case 45: case 48: case 42: case 41: case 73: rc = 0; break;  // F_RDAHEAD, F_NOCACHE, F_PREALLOCATE, F_CHKCLEAN, F_SETNOSIGPIPE: no-ops
+        case 51: case 85: rc = fsync(fd); break;   // F_FULLFSYNC, F_BARRIERFSYNC
         case 50: {                                  // F_GETPATH
             std::string p = fd_path(fd);
             if (p.empty() || !arg) { errno = EBADF; rc = -1; }
@@ -2317,6 +2466,24 @@ int32_t native_au_get_property(void* u, uint32_t prop, uint32_t, uint32_t, void*
 int32_t native_au_zero(void*);
 int32_t native_au_start(void* u);
 int32_t native_au_stop(void* u);
+int32_t native_au_set_parameter(void*, uint32_t, uint32_t, uint32_t, float, uint32_t);
+int32_t native_au_get_parameter(void*, uint32_t, uint32_t, uint32_t, float*);
+int32_t native_au_render(void*, uint32_t*, const void*, uint32_t, uint32_t, void*);
+int32_t native_augraph_new(void**);
+int32_t native_augraph_add_node(void*, const uint32_t*, int32_t*);
+int32_t native_augraph_open(void*);
+int32_t native_augraph_node_info(void*, int32_t, uint32_t*, void**);
+int32_t native_augraph_set_node_input_callback(void*, int32_t, uint32_t, const void*);
+int32_t native_augraph_connect(void*, int32_t, uint32_t, int32_t, uint32_t);
+int32_t native_augraph_disconnect(void*, int32_t, uint32_t);
+int32_t native_augraph_start(void*);
+int32_t native_augraph_stop(void*);
+int32_t native_augraph_is_running(void*, uint8_t*);
+int32_t native_augraph_node_count(void*, uint32_t*);
+int32_t native_augraph_ind_node(void*, uint32_t, int32_t*);
+int32_t native_augraph_dispose(void*);
+int32_t native_augraph_zero(void*);
+int32_t native_augraph_cpu_load(void*, float*);
 } // extern "C"
 
 
@@ -2525,11 +2692,33 @@ static void register_darwin_framework_stubs() {
     reg("_AudioUnitUninitialize", reinterpret_cast<void*>(&native_au_zero));
     reg("_AudioOutputUnitStart", reinterpret_cast<void*>(&native_au_start));
     reg("_AudioOutputUnitStop", reinterpret_cast<void*>(&native_au_stop));
+    reg("_AudioUnitSetParameter", reinterpret_cast<void*>(&native_au_set_parameter));
+    reg("_AudioUnitGetParameter", reinterpret_cast<void*>(&native_au_get_parameter));
+    reg("_AudioUnitRender", reinterpret_cast<void*>(&native_au_render));
+    reg("_NewAUGraph", reinterpret_cast<void*>(&native_augraph_new));
+    reg("_AUGraphAddNode", reinterpret_cast<void*>(&native_augraph_add_node));
+    reg("_AUGraphOpen", reinterpret_cast<void*>(&native_augraph_open));
+    reg("_AUGraphNodeInfo", reinterpret_cast<void*>(&native_augraph_node_info));
+    reg("_AUGraphSetNodeInputCallback", reinterpret_cast<void*>(&native_augraph_set_node_input_callback));
+    reg("_AUGraphConnectNodeInput", reinterpret_cast<void*>(&native_augraph_connect));
+    reg("_AUGraphDisconnectNodeInput", reinterpret_cast<void*>(&native_augraph_disconnect));
+    reg("_AUGraphStart", reinterpret_cast<void*>(&native_augraph_start));
+    reg("_AUGraphStop", reinterpret_cast<void*>(&native_augraph_stop));
+    reg("_AUGraphIsRunning", reinterpret_cast<void*>(&native_augraph_is_running));
+    reg("_AUGraphGetNodeCount", reinterpret_cast<void*>(&native_augraph_node_count));
+    reg("_AUGraphGetIndNode", reinterpret_cast<void*>(&native_augraph_ind_node));
+    reg("_DisposeAUGraph", reinterpret_cast<void*>(&native_augraph_dispose));
+    reg("_AUGraphInitialize", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphUninitialize", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphClose", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphUpdate", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_CAShow", reinterpret_cast<void*>(&native_augraph_zero));
+    reg("_AUGraphGetCPULoad", reinterpret_cast<void*>(&native_augraph_cpu_load));
     // AudioQueue / AudioFile: report failure so the caller falls back or skips
     for (const char* n : {"_AudioQueueAllocateBuffer", "_AudioQueueAllocateBufferWithPacketDescriptions", "_AudioQueueDispose",
                           "_AudioQueueEnqueueBuffer", "_AudioQueueFlush", "_AudioQueueNewOutput", "_AudioQueueOfflineRender",
                           "_AudioQueueSetOfflineRenderFormat", "_AudioQueueSetProperty", "_AudioQueueStart", "_AudioQueueStop",
-                          "_AudioUnitRender", "_AudioFileClose", "_AudioFileGetProperty", "_AudioFileGetPropertyInfo",
+                          "_AudioFileClose", "_AudioFileGetProperty", "_AudioFileGetPropertyInfo",
                           "_AudioFileOpenWithCallbacks", "_AudioFileReadPacketData"})
         reg(n, reinterpret_cast<void*>(&native_ret_error));
 }
@@ -2568,6 +2757,12 @@ static void init_custom_shims() {
     g_custom_shims["_sscanf"] = allocate_trampoline(shim_sscanf, "_sscanf");
     g_custom_shims["_fscanf"] = allocate_trampoline(shim_fscanf, "_fscanf");
     g_custom_shims["_scanf"] = allocate_trampoline(shim_scanf, "_scanf");
+    g_custom_shims["_wprintf"] = allocate_trampoline(shim_wprintf, "_wprintf");
+    g_custom_shims["_fwprintf"] = allocate_trampoline(shim_fwprintf, "_fwprintf");
+    g_custom_shims["_swprintf"] = allocate_trampoline(shim_swprintf, "_swprintf");
+    g_custom_shims["_swscanf"] = allocate_trampoline(shim_swscanf, "_swscanf");
+    g_custom_shims["_fwscanf"] = allocate_trampoline(shim_fwscanf, "_fwscanf");
+    g_custom_shims["_wscanf"] = allocate_trampoline(shim_wscanf, "_wscanf");
     g_custom_shims["_syslog"] = allocate_trampoline(shim_syslog, "_syslog");
     g_custom_shims["_NSLog"] = allocate_trampoline(shim_NSLog, "_NSLog");
     g_custom_shims["___snprintf_chk"] = allocate_trampoline(shim_snprintf_chk, "___snprintf_chk");
@@ -2582,6 +2777,12 @@ static void init_custom_shims() {
     g_custom_shims["_vsscanf"] = reinterpret_cast<void*>(&native_vsscanf);
     g_custom_shims["_vfscanf"] = reinterpret_cast<void*>(&native_vfscanf);
     g_custom_shims["_vscanf"] = reinterpret_cast<void*>(&native_vscanf);
+    g_custom_shims["_vwprintf"] = reinterpret_cast<void*>(&native_vwprintf);
+    g_custom_shims["_vfwprintf"] = reinterpret_cast<void*>(&native_vfwprintf);
+    g_custom_shims["_vswprintf"] = reinterpret_cast<void*>(&native_vswprintf);
+    g_custom_shims["_vswscanf"] = reinterpret_cast<void*>(&native_vswscanf);
+    g_custom_shims["_vfwscanf"] = reinterpret_cast<void*>(&native_vfwscanf);
+    g_custom_shims["_vwscanf"] = reinterpret_cast<void*>(&native_vwscanf);
     g_custom_shims["_vsyslog"] = reinterpret_cast<void*>(&native_vsyslog);
     g_custom_shims["_NSLogv"] = reinterpret_cast<void*>(&native_NSLogv);
     g_custom_shims["___vsnprintf_chk"] = reinterpret_cast<void*>(&native___vsnprintf_chk);
@@ -2720,6 +2921,14 @@ static void init_custom_shims() {
     g_custom_shims["_mach_port_insert_right"] = reinterpret_cast<void*>(&native_mach_port_insert_right);
     g_custom_shims["_mach_port_mod_refs"] = reinterpret_cast<void*>(&native_mach_port_mod_refs);
     g_custom_shims["_vm_allocate"] = reinterpret_cast<void*>(&native_vm_allocate);
+    g_custom_shims["_sysconf"] = reinterpret_cast<void*>(&native_sysconf_darwin);
+    g_custom_shims["_sqlite3_mprintf"] = reinterpret_cast<void*>(&th_sqlite3_mprintf);
+    g_custom_shims["_sqlite3_snprintf"] = reinterpret_cast<void*>(&th_sqlite3_snprintf);
+    g_custom_shims["_sqlite3_vmprintf"] = reinterpret_cast<void*>(&native_sqlite3_vmprintf);
+    g_custom_shims["_sqlite3_vsnprintf"] = reinterpret_cast<void*>(&native_sqlite3_vsnprintf);
+    g_custom_shims["_sqlite3_log"] = reinterpret_cast<void*>(&th_sqlite3_log);
+    g_custom_shims["_sqlite3_config"] = reinterpret_cast<void*>(&th_sqlite3_config);
+    g_custom_shims["_sqlite3_db_config"] = reinterpret_cast<void*>(&th_sqlite3_db_config);
     g_custom_shims["_vm_deallocate"] = reinterpret_cast<void*>(&native_vm_deallocate);
 
     // Dynamic ObjC message dispatch; engine mode already bound the guest-runtime dispatchers, which must win.
@@ -2738,6 +2947,28 @@ static void init_custom_shims() {
         g_custom_shims["_AudioUnitUninitialize"] = reinterpret_cast<void*>(&native_au_zero);
         g_custom_shims["_AudioOutputUnitStart"] = reinterpret_cast<void*>(&native_au_start);
         g_custom_shims["_AudioOutputUnitStop"] = reinterpret_cast<void*>(&native_au_stop);
+        g_custom_shims["_AudioUnitSetParameter"] = reinterpret_cast<void*>(&native_au_set_parameter);
+        g_custom_shims["_AudioUnitGetParameter"] = reinterpret_cast<void*>(&native_au_get_parameter);
+        g_custom_shims["_AudioUnitRender"] = reinterpret_cast<void*>(&native_au_render);
+        g_custom_shims["_NewAUGraph"] = reinterpret_cast<void*>(&native_augraph_new);
+        g_custom_shims["_AUGraphAddNode"] = reinterpret_cast<void*>(&native_augraph_add_node);
+        g_custom_shims["_AUGraphOpen"] = reinterpret_cast<void*>(&native_augraph_open);
+        g_custom_shims["_AUGraphNodeInfo"] = reinterpret_cast<void*>(&native_augraph_node_info);
+        g_custom_shims["_AUGraphSetNodeInputCallback"] = reinterpret_cast<void*>(&native_augraph_set_node_input_callback);
+        g_custom_shims["_AUGraphConnectNodeInput"] = reinterpret_cast<void*>(&native_augraph_connect);
+        g_custom_shims["_AUGraphDisconnectNodeInput"] = reinterpret_cast<void*>(&native_augraph_disconnect);
+        g_custom_shims["_AUGraphStart"] = reinterpret_cast<void*>(&native_augraph_start);
+        g_custom_shims["_AUGraphStop"] = reinterpret_cast<void*>(&native_augraph_stop);
+        g_custom_shims["_AUGraphIsRunning"] = reinterpret_cast<void*>(&native_augraph_is_running);
+        g_custom_shims["_AUGraphGetNodeCount"] = reinterpret_cast<void*>(&native_augraph_node_count);
+        g_custom_shims["_AUGraphGetIndNode"] = reinterpret_cast<void*>(&native_augraph_ind_node);
+        g_custom_shims["_DisposeAUGraph"] = reinterpret_cast<void*>(&native_augraph_dispose);
+        g_custom_shims["_AUGraphInitialize"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphUninitialize"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphClose"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphUpdate"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_CAShow"] = reinterpret_cast<void*>(&native_augraph_zero);
+        g_custom_shims["_AUGraphGetCPULoad"] = reinterpret_cast<void*>(&native_augraph_cpu_load);
     }
 
     // Data symbols
@@ -2778,6 +3009,17 @@ static void init_custom_shims() {
 }
 
 // Resolver for dyld bindings
+// A guest dlsym sees what imports bind to: app-mode frameworks, the shims and the built-in SQLite. Unknown names stay
+// null (apps probe for optional APIs this way), unlike an import, which gets a stub.
+static void* guest_dlsym_lookup(const char* name) {
+    std::string n = std::string("_") + name;
+    if (g_app_mode) if (void* p = app::resolve_symbol(n)) return p;
+    auto it = g_custom_shims.find(n);
+    if (it != g_custom_shims.end()) return it->second;
+    if (n.rfind("_sqlite3_", 0) == 0) return sqlite_symbol(name);
+    return nullptr;
+}
+
 static void* resolve_symbol(const std::string& name) {
     auto cache_it = g_resolved_cache.find(name);
     if (cache_it != g_resolved_cache.end()) return cache_it->second;
@@ -2789,6 +3031,18 @@ static void* resolve_symbol(const std::string& name) {
             g_resolved_cache[name] = p;
             return p;
         }
+    }
+
+    // Darwin symbol variants (_fopen$DARWIN_EXTSN, _open$NOCANCEL, ...) without a dedicated shim take the base symbol
+    size_t dollar = name.find('$');
+    if (dollar != std::string::npos && dollar > 1 && name.rfind("_OBJC_", 0) != 0 && !g_custom_shims.count(name)) {   // not Swift's _$s...
+        void* p = resolve_symbol(name.substr(0, dollar));
+        g_resolved_cache[name] = p;
+        return p;
+    }
+
+    if (name.rfind("_sqlite3_", 0) == 0 && !g_custom_shims.count(name)) {
+        if (void* p = sqlite_symbol(name.c_str() + 1)) { g_resolved_cache[name] = p; return p; }
     }
 
     auto it = g_custom_shims.find(name);
@@ -2874,6 +3128,9 @@ static void* resolve_symbol(const std::string& name) {
                                                           : reinterpret_cast<void*>(fake_make(7, name.substr(18)));
         g_resolved_cache[name] = obj;
         return obj;
+    }
+    if (!is_fn && g_app_mode) {
+        if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
     }
     if (!is_fn) {
         // DATA import: PROT_NONE poison slot, so the first touch names the symbol.
@@ -3111,6 +3368,9 @@ extern "C" int loader_main(int argc, char** argv) {
     if (const char* dir = getenv("LOADER_MSL_TEST")) return gles::msl_selftest(dir) == 0 ? 0 : 1;
 
     init_safe_read();
+    // iOS code opts out of SIGPIPE per socket (SO_NOSIGPIPE, F_SETNOSIGPIPE), which Linux does not have: a write
+    // to a closed connection has to come back as EPIPE, not end the process.
+    signal(SIGPIPE, SIG_IGN);
     if (const char* tm = getenv("LOADER_TRACE_DIRECT")) {
         g_trace_mode = std::strcmp(tm, "all") == 0 ? 2 : std::strcmp(tm, "list") == 0 ? 3 : 1;
     }
@@ -3123,6 +3383,13 @@ extern "C" int loader_main(int argc, char** argv) {
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);  // std::terminate / abort() -> full dump
     sigaction(SIGILL, &sa, nullptr);
+    // SIGUSR2 to any thread prints its stack to stderr (e.g. `run-as <package> kill -USR2 <tid>` on a hung app)
+    {
+        struct sigaction sa{};
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sa.sa_sigaction = thread_dump_handler;
+        sigaction(SIGUSR2, &sa, nullptr);
+    }
     if (const char* wd = getenv("LOADER_WATCHDOG")) start_watchdog(static_cast<unsigned>(atoi(wd)));
 
     printf("=== Native ARM64 Mach-O Android Loader ===\n");
@@ -3162,11 +3429,19 @@ extern "C" int loader_main(int argc, char** argv) {
         fprintf(stderr, "[-] Failed to open %s: %s\n", bin_path, strerror(errno));
         return 1;
     }
-    struct stat st;
-    fstat(fd, &st);
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size < 32) {
+        fprintf(stderr, "[FATAL] %s is empty or unreadable (%lld bytes)\n", bin_path, static_cast<long long>(st.st_size));
+        close(fd);
+        return 1;
+    }
     size_t file_size = st.st_size;
     uint8_t* file_data = reinterpret_cast<uint8_t*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
     close(fd);
+    if (file_data == MAP_FAILED) {
+        fprintf(stderr, "[FATAL] cannot map %s: %s\n", bin_path, strerror(errno));
+        return 1;
+    }
     printf("[*] Mapped %s (%zu bytes) at %p\n", bin_path, file_size, file_data);
 
     // A fat/universal binary (0xcafebabe, big-endian) holds several slices; iOS 5/6-era apps are usually
@@ -3196,8 +3471,15 @@ extern "C" int loader_main(int argc, char** argv) {
     }
 
     // 4. Parse Mach-O 64 header
+    if (file_size < 32 || *reinterpret_cast<uint32_t*>(file_data) != 0xfeedfacf || *reinterpret_cast<uint32_t*>(file_data + 4) != 0x0100000c) {
+        // 0xfeedface is a 32-bit (armv7) image: the guest code runs natively, so only arm64 can work
+        fprintf(stderr, "[FATAL] %s is not a 64-bit arm64 Mach-O (magic 0x%08x, cputype 0x%08x)\n", bin_path,
+                file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data) : 0, file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data + 4) : 0);
+        return 1;
+    }
     uint32_t ncmds = *reinterpret_cast<uint32_t*>(file_data + 16);
     uint32_t cur = 32;
+    bool chained_fixups = false, has_dyld_info = false;
 
     struct SegmentInfo {
         std::string name;
@@ -3219,11 +3501,18 @@ extern "C" int loader_main(int argc, char** argv) {
     uint64_t objc_selrefs_vm = 0, objc_selrefs_size = 0, objc_protolist_vm = 0, objc_protolist_size = 0;
     uint64_t lc_main_entryoff = 0;
     uint64_t mod_init_vm_scan = 0, mod_init_size_scan = 0;
+    uint64_t tlv_lo = UINT64_MAX, tlv_hi = 0, tlv_data_vm = 0, tlv_data_size = 0;
 
     for (uint32_t i = 0; i < ncmds; ++i) {
+        if (static_cast<uint64_t>(cur) + 8 > file_size) { fprintf(stderr, "[FATAL] load command %u starts past the end of the file\n", i); return 1; }
         uint32_t cmd = *reinterpret_cast<uint32_t*>(file_data + cur);
         uint32_t cmdsize = *reinterpret_cast<uint32_t*>(file_data + cur + 4);
+        if (cmdsize < 8 || cmdsize > file_size - cur) { fprintf(stderr, "[FATAL] load command %u (0x%x) has a bad size %u\n", i, cmd, cmdsize); return 1; }
         if (cmd == 0x19) { // LC_SEGMENT_64
+            if (cmdsize < 72 || (cmdsize - 72) / 80 < *reinterpret_cast<uint32_t*>(file_data + cur + 64)) {
+                fprintf(stderr, "[FATAL] segment command %u is shorter than its section list\n", i);
+                return 1;
+            }
             char segname[17] = {0};
             std::memcpy(segname, file_data + cur + 8, 16);
             uint64_t vmaddr = *reinterpret_cast<uint64_t*>(file_data + cur + 24);
@@ -3231,6 +3520,10 @@ extern "C" int loader_main(int argc, char** argv) {
             uint64_t fileoff = *reinterpret_cast<uint64_t*>(file_data + cur + 40);
             uint64_t filesize = *reinterpret_cast<uint64_t*>(file_data + cur + 48);
             uint32_t initprot = *reinterpret_cast<uint32_t*>(file_data + cur + 60);
+            if (fileoff > file_size || filesize > file_size - fileoff || filesize > vmsize) {
+                fprintf(stderr, "[FATAL] segment %s lies outside the file or its own mapping (truncated or damaged binary)\n", segname);
+                return 1;
+            }
             segments.push_back({segname, vmaddr, vmsize, fileoff, filesize, initprot});
             uint32_t nsects = *reinterpret_cast<uint32_t*>(file_data + cur + 64);
             for (uint32_t k = 0; k < nsects; ++k) {
@@ -3247,10 +3540,24 @@ extern "C" int loader_main(int argc, char** argv) {
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_selrefs", 16) == 0) { objc_selrefs_vm = saddr; objc_selrefs_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__objc_protolist", 16) == 0) { objc_protolist_vm = saddr; objc_protolist_size = ssize; }
                 if (std::strncmp(reinterpret_cast<const char*>(sp), "__mod_init_func", 16) == 0) { mod_init_vm_scan = saddr; mod_init_size_scan = ssize; }
+                // S_THREAD_LOCAL_REGULAR / S_THREAD_LOCAL_ZEROFILL: the thread-local template, in address order
+                uint32_t stype = *reinterpret_cast<const uint32_t*>(sp + 64) & 0xff;
+                if (stype == 0x11 || stype == 0x12) {
+                    tlv_lo = std::min(tlv_lo, saddr);
+                    tlv_hi = std::max(tlv_hi, saddr + ssize);
+                    if (stype == 0x11) { tlv_data_vm = saddr; tlv_data_size = ssize; }
+                }
             }
         } else if (cmd == 0x80000028) { // LC_MAIN
             lc_main_entryoff = *reinterpret_cast<uint64_t*>(file_data + cur + 8);
-        } else if (cmd == 0x22 || cmd == 0x80000022) { // LC_DYLD_INFO
+        } else if (cmd == 0x2c && cmdsize >= 20 && *reinterpret_cast<uint32_t*>(file_data + cur + 16) != 0) { // LC_ENCRYPTION_INFO_64, cryptid
+            // not fatal: some dumpers write the decrypted pages back and leave the flag set
+            fprintf(stderr, "[WARN] %s is marked FairPlay encrypted (cryptid %u). If it crashes at once, it was never decrypted.\n", bin_path,
+                    *reinterpret_cast<uint32_t*>(file_data + cur + 16));
+        } else if (cmd == 0x80000034) { // LC_DYLD_CHAINED_FIXUPS
+            chained_fixups = true;
+        } else if ((cmd == 0x22 || cmd == 0x80000022) && cmdsize >= 48) { // LC_DYLD_INFO
+            has_dyld_info = true;
             rebase_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
             rebase_size = *reinterpret_cast<uint32_t*>(file_data + cur + 12);
             bind_off = *reinterpret_cast<uint32_t*>(file_data + cur + 16);
@@ -3259,8 +3566,16 @@ extern "C" int loader_main(int argc, char** argv) {
             lazy_size = *reinterpret_cast<uint32_t*>(file_data + cur + 36);
             export_off = *reinterpret_cast<uint32_t*>(file_data + cur + 40);
             export_size = *reinterpret_cast<uint32_t*>(file_data + cur + 44);
+            const uint32_t spans[4][2] = {{rebase_off, rebase_size}, {bind_off, bind_size}, {lazy_off, lazy_size}, {export_off, export_size}};
+            for (const auto& s : spans)
+                if (s[1] && (s[0] > file_size || s[1] > file_size - s[0])) { fprintf(stderr, "[FATAL] dyld info lies outside the file (truncated binary)\n"); return 1; }
         }
         cur += cmdsize;
+    }
+    if (chained_fixups && !has_dyld_info) {
+        // rebases and binds would silently be skipped and the first pointer the guest follows would be a file offset
+        fprintf(stderr, "[FATAL] %s uses chained fixups (built for iOS 15 or later); only LC_DYLD_INFO images are supported\n", bin_path);
+        return 1;
     }
 
     // Decide app mode now: resolve_symbol and init_custom_shims both depend on it, and binds happen below.
@@ -3658,6 +3973,7 @@ extern "C" int loader_main(int argc, char** argv) {
         ai.selrefs = rt(objc_selrefs_vm); ai.selrefs_size = objc_selrefs_size;
         ai.methname = rt(objc_methname_vm); ai.methname_size = objc_methname_size;
         ai.protolist = rt(objc_protolist_vm); ai.protolist_size = objc_protolist_size;
+        if (tlv_hi > tlv_lo) { ai.tlv_start = rt(tlv_lo); ai.tlv_size = tlv_hi - tlv_lo; ai.tlv_data = rt(tlv_data_vm); ai.tlv_data_size = tlv_data_size; }
         app::boot(ai);
         if (mod_init_size_scan) {
             uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm_scan - min_vm));

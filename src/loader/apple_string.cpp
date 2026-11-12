@@ -6,6 +6,9 @@
 // object we hand back must have exactly this layout. The guest only imports a few out-of-line members — __init,
 // the copy constructor and the destructor — which we implement here; crucially __init must be shimmed too, or it
 // binds to the system libc++ (the default, data-last layout) and every subsequent inlined read is wrong.
+#include <dlfcn.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -192,7 +195,26 @@ void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmP
     str->assign(tmp.c_str(), tmp.size());
     return t;
 }
-void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm(void* t, size_t old_cap, size_t delta, size_t, size_t, size_t, size_t) { S(t)->reserve(old_cap + delta); return t; }
+// __grow_by(old_cap, delta_cap, old_sz, n_copy, n_del, n_add): the guest's inlined insert/replace/append asks for new
+// storage that keeps [0, n_copy), leaves a gap of n_add for what it writes next, and moves the rest (after the n_del
+// characters being dropped) behind the gap. libc++ leaves the size to the caller.
+void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm(void* t, size_t old_cap, size_t delta, size_t old_sz, size_t n_copy, size_t n_del, size_t n_add) {
+    auto* str = S(t);
+    if (n_copy > old_sz) n_copy = old_sz;
+    if (n_del > old_sz - n_copy) n_del = old_sz - n_copy;
+    const size_t tail = old_sz - n_copy - n_del;
+    size_t p = 32;
+    while (p < std::max({old_cap + delta, 2 * old_cap, n_copy + n_add + tail}) + 1) p <<= 1;
+    const size_t new_cap = p - 1;
+    char* buf = static_cast<char*>(malloc(new_cap + 1));
+    const char* old = str->c_str();
+    if (n_copy) std::memcpy(buf, old, n_copy);
+    if (tail) std::memcpy(buf + n_copy + n_add, old + n_copy + n_del, tail);
+    buf[n_copy + n_add + tail] = 0;
+    str->free_buffer();
+    str->set_long(buf, n_copy + n_add + tail, new_cap);
+    return t;
+}
 
 size_t __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4findEcm(const void* t, char c, size_t pos) { return CS(t)->find(c, pos); }
 size_t __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5rfindEcm(const void* t, char c, size_t pos) { return CS(t)->rfind(c, pos); }
@@ -203,6 +225,86 @@ int __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmm
     int rc = std::memcmp(str->c_str() + pos1, s2 ? s2 : "", std::min(len1, n2));
     if (rc) return rc;
     return len1 < n2 ? -1 : len1 > n2 ? 1 : 0;
+}
+
+int __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc(const void* t, size_t pos1, size_t n1, const char* s) {
+    return __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKcm(t, pos1, n1, s, s ? std::strlen(s) : 0);
+}
+
+char* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm(void* t, size_t pos) {
+    if (pos >= S(t)->size()) fprintf(stderr, "[WARN] std::string::at(%zu) past size %zu\n", pos, S(t)->size());
+    return S(t)->data() + pos;
+}
+size_t __ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4copyEPcmm(const void* t, char* dst, size_t n, size_t pos) {
+    size_t sz = CS(t)->size();
+    if (pos > sz) return 0;
+    size_t k = std::min(n, sz - pos);
+    std::memcpy(dst, CS(t)->c_str() + pos, k);
+    return k;
+}
+// replace [pos, pos + n1) with s[0, n2); insert is a replace of nothing
+void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm(void* t, size_t pos, size_t n1, const char* s, size_t n2) {
+    auto* str = S(t);
+    size_t cur = str->size();
+    if (pos > cur) pos = cur;
+    if (n1 > cur - pos) n1 = cur - pos;
+    std::string tmp(str->c_str(), pos);
+    if (s) tmp.append(s, n2);
+    tmp.append(str->c_str() + pos + n1, cur - pos - n1);
+    str->assign(tmp.c_str(), tmp.size());
+    return t;
+}
+void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc(void* t, size_t pos, size_t n1, const char* s) {
+    return __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm(t, pos, n1, s, s ? std::strlen(s) : 0);
+}
+void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm(void* t, size_t pos, const char* s, size_t n) {
+    return __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm(t, pos, 0, s, n);
+}
+char* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertENS_11__wrap_iterIPKcEEc(void* t, const char* it, char c) {
+    size_t pos = static_cast<size_t>(it - S(t)->c_str());
+    __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm(t, pos, 0, &c, 1);
+    return S(t)->data() + pos;
+}
+
+// std::wstring::resize, Apple's alternate layout for 4-byte characters: long {data*, size, cap+1 | flag},
+// short {wchar_t[5], 3 pad bytes, size byte (bit 7 = long)} holding up to 4 characters.
+void __ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw(void* t, size_t n, wchar_t c) {
+    auto* raw = static_cast<uint8_t*>(t);
+    bool is_long = raw[23] & 0x80;
+    wchar_t* d = is_long ? *reinterpret_cast<wchar_t**>(raw) : reinterpret_cast<wchar_t*>(raw);
+    size_t sz = is_long ? *reinterpret_cast<size_t*>(raw + 8) : (raw[23] & 0x7f);
+    size_t cap = is_long ? (*reinterpret_cast<size_t*>(raw + 16) & ~String::LONG_FLAG) - 1 : 4;
+    if (n > cap) {
+        size_t alloc = 8;
+        while (alloc < n + 1) alloc <<= 1;
+        auto* buf = static_cast<wchar_t*>(malloc(alloc * sizeof(wchar_t)));
+        std::memcpy(buf, d, sz * sizeof(wchar_t));
+        if (is_long) free(d);
+        d = buf;
+        is_long = true;
+        *reinterpret_cast<wchar_t**>(raw) = d;
+        *reinterpret_cast<size_t*>(raw + 16) = alloc | String::LONG_FLAG;
+    }
+    for (size_t i = sz; i < n; ++i) d[i] = c;
+    d[n] = 0;
+    if (is_long) *reinterpret_cast<size_t*>(raw + 8) = n;
+    else raw[23] = static_cast<uint8_t>(n);
+}
+
+float __ZNSt3__14stofERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm(const void* s, size_t* idx) {
+    const char* p = CS(s)->c_str();
+    char* end = nullptr;
+    float v = strtof(p, &end);
+    if (idx) *idx = static_cast<size_t>(end - p);
+    return v;
+}
+
+// system_error(error_code, const string&): the system libc++ builds it from its own string type
+void* __ZNSt3__112system_errorC2ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE(void* self, uint64_t ev, const void* cat, const void* what) {
+    using Ctor = void* (*)(void*, uint64_t, const void*, const std::string*);
+    static Ctor ctor = reinterpret_cast<Ctor>(dlsym(RTLD_DEFAULT, "_ZNSt3__112system_errorC2ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE"));
+    std::string msg(CS(what)->c_str(), CS(what)->size());
+    return ctor ? ctor(self, ev, cat, &msg) : self;
 }
 
 void __ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv(const void*) { fprintf(stderr, "[FATAL] std::string length error\n"); std::abort(); }
@@ -219,6 +321,21 @@ RetStr __ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_
     RetStr r; r.s.init_empty();
     if (lhs) { auto* x = CS(lhs); r.s.assign(x->c_str(), x->size()); }
     if (rhs) r.s.append(rhs);
+    return r;
+}
+
+// std::filesystem::__absolute(const path&, error_code*): path is a single std::string
+RetStr __ZNSt3__14__fs10filesystem10__absoluteERKNS1_4pathEPNS_10error_codeE(const void* path, void* ec) {
+    RetStr r; r.s.init_empty();
+    auto* p = CS(path);
+    if (p->size() && p->c_str()[0] == '/') {
+        r.s.assign(p->c_str(), p->size());
+    } else {
+        char cwd[4096];
+        if (getcwd(cwd, sizeof cwd)) r.s.assign(cwd);
+        if (p->size()) { r.s.append("/"); r.s.append(p->c_str(), p->size()); }
+    }
+    if (ec) *static_cast<int*>(ec) = 0;
     return r;
 }
 
@@ -260,5 +377,16 @@ void register_apple_string_shims(std::unordered_map<std::string, void*>& m) {
     A(__ZNKSt3__121__basic_string_commonILb1EE20__throw_out_of_rangeEv);
     A(__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EEPKS6_RKS9_);
     A(__ZNSt3__1plIcNS_11char_traitsIcEENS_9allocatorIcEEEENS_12basic_stringIT_T0_T1_EERKS9_PKS6_);
+    A(__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEmmPKc);
+    A(__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE2atEm);
+    A(__ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE4copyEPcmm);
+    A(__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKcm);
+    A(__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7replaceEmmPKc);
+    A(__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm);
+    A(__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertENS_11__wrap_iterIPKcEEc);
+    A(__ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw);
+    A(__ZNSt3__14stofERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm);
+    A(__ZNSt3__112system_errorC2ENS_10error_codeERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEE);
+    A(__ZNSt3__14__fs10filesystem10__absoluteERKNS1_4pathEPNS_10error_codeE);
 #undef A
 }

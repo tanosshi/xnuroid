@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import plistlib
 import webbrowser
 import zipfile
@@ -334,23 +335,28 @@ class Helper(tk.Tk):
         pending_log = []
         try:
             while True:
-                kind, payload = self.events.get_nowait()
-                if kind == "log":
-                    pending_log.append(payload)
-                elif kind == "call":
-                    payload()
-                elif kind == "progress":
-                    self.show_progress(*payload)
-                elif kind == "line":
-                    self.on_build_line(payload)
-                elif kind == "phones":
-                    self.show_phones(payload)
-        except queue.Empty:
-            pass
-        if pending_log:
-            self.append_log(pending_log)
-        if not self.stop.is_set():
-            self.after(80, self.drain)
+                try:
+                    kind, payload = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if kind == "log":
+                        pending_log.append(payload)
+                    elif kind == "call":
+                        payload()
+                    elif kind == "progress":
+                        self.show_progress(*payload)
+                    elif kind == "line":
+                        self.on_build_line(payload)
+                    elif kind == "phones":
+                        self.show_phones(payload)
+                except Exception:  # one failing handler must not stop the pump, or the window stays busy for good
+                    pending_log.extend(traceback.format_exc().splitlines())
+            if pending_log:
+                self.append_log(pending_log)
+        finally:
+            if not self.stop.is_set():
+                self.after(80, self.drain)
 
     def append_log(self, lines: list[str]) -> None:
         self.log_lines.extend(lines)
@@ -402,11 +408,16 @@ class Helper(tk.Tk):
         self.set_status("")
         if job.cancelled.is_set():
             self.set_status("Cancelled.", WARN)
-        elif error is not None:
-            self.set_status(str(error).splitlines()[0], BAD)
-            messagebox.showerror("Something went wrong", str(error), parent=self)
-        elif done:
-            done(result)
+        else:
+            if error is None and done:
+                try:
+                    done(result)
+                except Exception as exc:  # shown like a failed job, e.g. a read-only project folder
+                    error = exc
+            if error is not None:
+                text = str(error) or repr(error)
+                self.set_status(text.splitlines()[0], BAD)
+                messagebox.showerror("Something went wrong", text, parent=self)
         if self.queued and not self.job:
             self.run_job(*self.queued.pop(0))
         self.update_actions()
@@ -622,13 +633,18 @@ class Helper(tk.Tk):
                     report = None
                 if not force and not report.usable:
                     return Rejected(choice, report)
-                root = games.extract_ipa(choice, games_dir, job.progress)
+                root = games.extract_ipa(choice, games_dir, job.progress, job.cancelled.is_set)
                 candidates = games.bundle_candidates(root / "Payload")
                 if not candidates:
                     raise ValueError(f"There is no app inside {choice.name}.")
                 app = self.pick_bundle(candidates)
                 if app is None:
                     job.cancelled.set()
+                elif report is not None and app.name != report.app_name:
+                    # The check above looked at the first app of the file; the user picked another one.
+                    report = games.check_encryption(app, app)
+                    if not force and not report.usable:
+                        return Rejected(app, report)
                 return report, app
 
             self.run_job("Checking that the game is decrypted…", work, lambda r: self.after_pick(r, force))
@@ -857,6 +873,7 @@ class Helper(tk.Tk):
         phone = self.selected_phone()
         if phone is not None:
             extra["ANDROID_SERIAL"] = phone.serial
+        extra.update(env.java_env() or {})
         return extra
 
     def build(self, install: bool) -> None:

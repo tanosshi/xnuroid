@@ -67,19 +67,19 @@ struct BReader {
             }
             case 0x3: { uint64_t v = be(at, 8); double d; std::memcpy(&d, &v, 8); return retain(make_date(d)); }
             case 0x4: {
-                if (!count(at, m, c) || at + c > n) return nullptr;
+                if (!count(at, m, c) || at > n || c > n - at) return nullptr;   // not at + c > n: a huge count would wrap
                 id d = data_new(p + at, c);
                 if (mut) { id md = send(d, "mutableCopy"); release(d); return md; }
                 return d;
             }
             case 0x5: {
-                if (!count(at, m, c) || at + c > n) return nullptr;
+                if (!count(at, m, c) || at > n || c > n - at) return nullptr;
                 std::u16string s(c, u'\0');
                 for (uint64_t i = 0; i < c; ++i) s[i] = p[at + i];
                 return str16_new(s, mut);
             }
             case 0x6: {
-                if (!count(at, m, c) || at + c * 2 > n) return nullptr;
+                if (!count(at, m, c) || at > n || c > (n - at) / 2) return nullptr;
                 std::u16string s(c, u'\0');
                 for (uint64_t i = 0; i < c; ++i) s[i] = static_cast<char16_t>(p[at + 2 * i] << 8 | p[at + 2 * i + 1]);
                 return str16_new(s, mut);
@@ -696,6 +696,8 @@ bool json_value(id o, std::string& out, bool pretty, int indent) {
 
 id plist_parse(const uint8_t* p, size_t n, bool mut) {
     if (!p || !n) return nullptr;
+    if (n >= 3 && p[0] == 0xef && p[1] == 0xbb && p[2] == 0xbf) { p += 3; n -= 3; }   // UTF-8 byte order mark
+    if (!n) return nullptr;
     if (n >= 8 && std::memcmp(p, "bplist00", 8) == 0) return parse_binary(p, n, mut);
     std::string s(reinterpret_cast<const char*>(p), n);
     // UTF-16 text (.strings files are often UTF-16)

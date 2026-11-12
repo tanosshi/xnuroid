@@ -343,11 +343,19 @@ inline bool class_message(CallFrame& frame, const std::string& cls, const std::s
         uint64_t h = fake_make(8, "NSNumber");
         FakeObjcObj* n = fake_lookup(h);
         bool fp = sel == "numberWithFloat:" || sel == "numberWithDouble:";
-        double v = fp ? in[0] : static_cast<double>(static_cast<int64_t>(frame.x[2]));
+        // An argument narrower than 64 bits sits in the low bits of x2; the bits above it are undefined, so
+        // @(-1) as an int arrives as 0x00000000ffffffff.
+        const bool uns = sel.compare(10, 8, "Unsigned") == 0;
+        const std::string ty = sel.substr(uns ? 18 : 10);
+        int64_t iv = static_cast<int64_t>(frame.x[2]);
+        if (ty == "Int:") iv = uns ? static_cast<int64_t>(static_cast<uint32_t>(frame.x[2])) : static_cast<int32_t>(frame.x[2]);
+        else if (ty == "Short:") iv = uns ? static_cast<int64_t>(static_cast<uint16_t>(frame.x[2])) : static_cast<int16_t>(frame.x[2]);
+        else if (ty == "Char:") iv = uns ? static_cast<int64_t>(static_cast<uint8_t>(frame.x[2])) : static_cast<int8_t>(frame.x[2]);
+        else if (ty == "Bool:") iv = (frame.x[2] & 0xff) ? 1 : 0;
+        double v = fp ? in[0] : uns ? static_cast<double>(static_cast<uint64_t>(iv)) : static_cast<double>(iv);
         if (sel == "numberWithFloat:") { float f; std::memcpy(&f, &in[0], 4); v = f; }
-        if (sel == "numberWithBool:") v = (frame.x[2] & 0xff) ? 1 : 0;
         if (fp) n->props["#real"] = 1;
-        n->props["value"] = fp ? static_cast<uint64_t>(static_cast<int64_t>(v)) : frame.x[2];
+        n->props["value"] = fp ? static_cast<uint64_t>(static_cast<int64_t>(v)) : static_cast<uint64_t>(iv);
         setd(n, "value", v);
         frame.ret_x0 = h;
         return true;
@@ -639,7 +647,11 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
             frame.ret_x0 = fake_make(2, buf);
             return true;
         }
-        if (sel.size() > 5 && sel.compare(sel.size() - 5, 5, "Value") == 0) { frame.ret_x0 = static_cast<uint64_t>(static_cast<int64_t>(v)); return true; }
+        if (sel.size() > 5 && sel.compare(sel.size() - 5, 5, "Value") == 0) {
+            // integers come back exactly; a double only holds them up to 2^53
+            frame.ret_x0 = getp(st, "#real") ? static_cast<uint64_t>(static_cast<int64_t>(v)) : getp(st, "value");
+            return true;
+        }
     }
     if (c == "UIScreenMode") {
         if (sel == "size") { objc_ret_rect(kScreenW * kScreenScale, screen::g_height * kScreenScale, 0, 0); return true; }
@@ -1116,6 +1128,7 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
 
     if (sel == "performSelector:withObject:afterDelay:") {
         std::lock_guard<std::mutex> l(g_loop_mu);
+        fake_retain(frame.x[3]);   // an autoreleased argument must outlive the pool it was made in
         g_delayed.push_back({self, reinterpret_cast<const char*>(frame.x[2]), frame.x[3], now_s() + in[0]});
         frame.ret_x0 = 0;
         return true;
@@ -1243,6 +1256,7 @@ static void fakeui_run_loop_once() {
         printf("[UI] delayed perform -[%#llx %s]\n", static_cast<unsigned long long>(d.target), d.sel);
         fflush(stdout);
         send_sel(d.target, d.sel, d.arg);
+        fake_release(d.arg);
     }
     uint64_t root = 0;
     if (appear && key) {
@@ -1335,6 +1349,7 @@ extern "C" void host_touch(int id, int phase, float nx, float ny) {
         g_host_touches.back().y = ny;
         return;
     }
+    if (g_host_touches.size() >= 4096) g_host_touches.clear();   // nobody is draining: the app-mode queue owns the input
     g_host_touches.push_back({id, phase, nx, ny});
 }
 static void deliver_host_touches() {
