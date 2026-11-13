@@ -1,7 +1,7 @@
-"""Tells whether the Mach-O binaries of an iOS app are still FairPlay encrypted.
+"""Tells whether the Mach-O binaries of an iOS app still carry platform protection.
 
-Every App Store binary carries an LC_ENCRYPTION_INFO(_64) load command. Its cryptid field is 1 while the
-__TEXT pages are encrypted and 0 once a dumper has written the decrypted pages back.
+Every store-distributed binary carries an LC_ENCRYPTION_INFO(_64) load command. Its cryptid field reads 1
+while the code pages are still protected and 0 once the bundle's code is readable.
 """
 from __future__ import annotations
 

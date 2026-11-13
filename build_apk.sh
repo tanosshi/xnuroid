@@ -2,6 +2,8 @@
 # Builds build/xnuroid.apk: the loader as libxnuroid.so behind a NativeActivity (android/AndroidManifest.xml).
 #   ./build_apk.sh            build
 #   ./build_apk.sh install    build, install, launch
+#   KEEP_SPLASH=1 ./build_apk.sh   keep the game's own launch video (the splash scene is left alone instead of
+#                                  being skipped), i.e. LOADER_NO_VIDEO_SKIP=1 is the built-in default
 # The configured game bundle (tools/game_config.py) is packaged as assets/game/ and copied out on first launch.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
@@ -25,7 +27,11 @@ mkdir -p "$OUT/lib/arm64-v8a"
 "$CXX" -std=c++17 -O3 -fPIC -fvisibility=hidden -c src/gfx/pvrtc.cpp -o build/pvrtc_apk.o
 # iOS ships libsqlite3; the amalgamation is built in with default visibility so guest imports bind to it
 [ build/sqlite3_apk.o -nt src/third_party/sqlite/sqlite3.c ] || "$CC" -c -O2 -fPIC -DSQLITE_THREADSAFE=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_OMIT_LOAD_EXTENSION=1 -DHAVE_USLEEP=1 src/third_party/sqlite/sqlite3.c -o build/sqlite3_apk.o
-"$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY -I"$GLUE" \
+# KEEP_SPLASH=1 bakes LOADER_NO_VIDEO_SKIP=1 into the APK, so the game plays its own splash; loader.env can still
+# turn skipping back on with LOADER_NO_VIDEO_SKIP=0.
+SPLASH_FLAGS=""
+[ -n "${KEEP_SPLASH:-}" ] && SPLASH_FLAGS="-DXNUROID_KEEP_SPLASH"
+"$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY $SPLASH_FLAGS -I"$GLUE" \
     -Isrc/loader -Isrc/objc -Isrc/gfx -Isrc/platform -Isrc/app \
     src/loader/android_loader.cpp src/loader/apple_string.cpp src/loader/trampolines.s src/gfx/gles_backend.cpp src/gfx/msl_glsl.cpp src/platform/audio_unit.cpp \
     src/platform/haptics.cpp src/loader/darwin_pthread.cpp src/platform/android_app.cpp \
@@ -55,6 +61,12 @@ mkdir -p build/classes build/dex
 # Package id, label and launcher icon come from the configured game's Info.plist (tools/game_config.py).
 rm -rf build/res build/res.zip build/static_res.zip
 PKG=$(python -I tools/apk_branding.py build/res android/AndroidManifest.xml build/AndroidManifest.xml)
+# PKG_SUFFIX=.diagnostic installs a build beside the normal one instead of replacing it.
+if [ -n "${PKG_SUFFIX:-}" ]; then
+    sed -i "s/package=\"$PKG\"/package=\"$PKG$PKG_SUFFIX\"/" build/AndroidManifest.xml
+    PKG="$PKG$PKG_SUFFIX"
+    echo "package id: $PKG"
+fi
 "$BT/aapt2.exe" compile --dir build/res -o build/res.zip
 "$BT/aapt2.exe" compile --dir android/res -o build/static_res.zip
 "$BT/aapt2.exe" link -o build/base.apk --manifest build/AndroidManifest.xml -I "$PLATFORM" \

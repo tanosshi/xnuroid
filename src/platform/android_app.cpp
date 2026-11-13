@@ -603,6 +603,11 @@ void configure(android_app* app) {
     setenv("LOADER_ENGINE", "8", 0);
     setenv("LOADER_FDE", "all", 0);
     setenv("LOADER_FRAMES", "100000000", 0);
+#ifdef XNUROID_KEEP_SPLASH
+    // Built with KEEP_SPLASH=1: leave a splash scene that waits on a VideoPlayer alone, so the game plays its own
+    // launch video. loader.env can override this with LOADER_NO_VIDEO_SKIP=0.
+    setenv("LOADER_NO_VIDEO_SKIP", "1", 0);
+#endif
     apply_env_file(g_files + "/loader.env");
     freopen((g_files + "/out.txt").c_str(), "w", stdout);
     setvbuf(stdout, nullptr, _IOLBF, 0);   // line by line, so the log is current (and complete if the app dies)

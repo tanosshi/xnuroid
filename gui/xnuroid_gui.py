@@ -1,13 +1,17 @@
-"""xnuroid helper: a point-and-click front end for turning a decrypted iOS game into an Android app.
+"""xnuroid helper: a step-by-step front end for turning an iOS app into an Android app.
 
 Run with `python gui/xnuroid_gui.py`, or the packaged xnuroid-helper.exe placed in the project folder.
 Dropping an .ipa onto the exe opens it straight away.
+
+The window is a six-step wizard (Set up, Game, Phone, Review, Build, Play). The look is in m3.py, one class per step
+is in pages.py, and this file holds the state and the work: jobs, adb, the encryption check and the build.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import plistlib
 import queue
 import shutil
 import subprocess
@@ -16,32 +20,25 @@ import threading
 import time
 import tkinter as tk
 import traceback
-import plistlib
 import webbrowser
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import filedialog, messagebox
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import environment as env  # noqa: E402
 import game as games  # noqa: E402
+import m3 as m  # noqa: E402
+import pages  # noqa: E402
+from m3 import C, px  # noqa: E402
 
 SETTINGS = Path(os.environ.get("APPDATA", Path.home())) / "xnuroid" / "helper.json"
 PHONE_POLL_SECONDS = 3
 CRASH_WATCH_SECONDS = 10
 
-BG = "#f4f1f8"
-CARD = "#ffffff"
-INK = "#1d1b20"
-MUTED = "#625b71"
-ACCENT = "#6750a4"
-ACCENT_DARK = "#4f378b"
-GOOD = "#1b7f3b"
-BAD = "#b3261e"
-WARN = "#8a5a00"
-FONT = "Segoe UI"
+STEPS = ["Set up", "Game", "Phone", "Review", "Build", "Play"]
+S_SETUP, S_GAME, S_PHONE, S_REVIEW, S_BUILD, S_DONE = range(6)
 
 BUILD_STAGES = [
     ("assets:", 0.80, "Packing the game into the app"),
@@ -54,12 +51,13 @@ BUILD_STAGES = [
 BUILD_HINTS = [
     ("connect the arm64 device once", "Plug in your phone the first time you build. The build copies one file from it."),
     ("INSTALL_FAILED_UPDATE_INCOMPATIBLE",
-     "An older copy of this game, signed on another PC, is on the phone. Use 'Remove from phone', then try again."),
+     "An older copy of this game, signed on another PC, is on the phone. Uninstall the old app on the phone "
+     "(Settings > Apps), then try again."),
     ("INSTALL_FAILED_INSUFFICIENT_STORAGE", "Your phone is out of space. Free some space and try again."),
     ("INSTALL_FAILED_USER_RESTRICTED",
      "Your phone blocked the install. On Xiaomi/Redmi/POCO phones turn on 'Install via USB' in Developer options."),
     ("INSTALL_FAILED_NO_MATCHING_ABIS", "This phone is not a 64-bit ARM phone, so the app cannot run on it."),
-    ("debug.keystore", "The app signing key is missing. Use the 'Fix' button next to 'App signing key'."),
+    ("debug.keystore", "The app signing key is missing. Go back to step 1 and press Fix next to 'App signing key'."),
     ("python: command not found", "Git Bash cannot find Python. Reinstall Python and tick 'Add python.exe to PATH'."),
     ("no devices/emulators found", "The phone disconnected during the build. Plug it back in and try again."),
     ("device unauthorized", "Tap 'Allow' on the USB debugging prompt on your phone, then try again."),
@@ -146,25 +144,10 @@ class Job:
                            stderr=subprocess.DEVNULL, creationflags=env.NO_WINDOW)
 
 
-class Card(tk.Frame):
-    def __init__(self, parent, number: str, title: str):
-        super().__init__(parent, bg=CARD, highlightbackground="#e7e0ec", highlightthickness=1, padx=18, pady=14)
-        head = tk.Frame(self, bg=CARD)
-        head.pack(fill="x")
-        tk.Label(head, text=number, bg=ACCENT, fg="white", font=(FONT, 11, "bold"), width=2).pack(side="left")
-        tk.Label(head, text=title, bg=CARD, fg=INK, font=(FONT, 13, "bold")).pack(side="left", padx=10)
-        self.badge = tk.Label(head, bg=CARD, font=(FONT, 10, "bold"))
-        self.badge.pack(side="right")
-        self.body = tk.Frame(self, bg=CARD)
-        self.body.pack(fill="x", pady=(10, 0))
-
-    def set_badge(self, text: str, color: str) -> None:
-        self.badge.config(text=text, fg=color)
-
-
 class Helper(tk.Tk):
     def __init__(self, project: Path, start_with: Path | None):
         super().__init__()
+        m.init(self)
         self.project = project
         self.settings = load_settings()
         self.settings["project"] = str(project)
@@ -172,161 +155,214 @@ class Helper(tk.Tk):
         self.events: queue.Queue = queue.Queue()
         self.stop = threading.Event()
         self.job: Job | None = None
+        self.job_kind = ""
         self.queued: list[tuple] = []
+        self.log_lines: list[str] = []
+        self.status_is_hint = False
+        self.pending_start = start_with is not None
+
+        # computer and phone
         self.found: dict = {}
         self.checks: list[env.Check] = []
         self.adb: env.Adb | None = None
         self.phones: list[env.Phone] = []
+        self.phone_serial = ""
+
+        # game
         self.game: games.Game | None = None
         self.package = ""
+        self.report = None                 # the encryption report of the chosen game
         self.encryption_ok: bool | None = None
         self.forced = False
-        self.rejected: Path | None = None
+        self.rejected: Path | None = None  # set when the user may override a refusal
+        self.reject_path: Path | None = None
+        self.reject_message = ""
         self.icon_image: tk.PhotoImage | None = None
-        self.log_lines: list[str] = []
-        self.status_is_hint = False
+
+        # build and play
+        self.install_mode = True
+        self.skip_splash = tk.BooleanVar(value=bool(self.settings.get("skip_splash", True)))
+        self.build_install = True
+        self.build_state = "idle"          # idle, running, failed, cancelled, done
+        self.build_error = ""
+        self.build_started = 0.0
+        self.build_result: float | None = None
+        self.stage = 0.0
+        self.crashed = False
+
+        self.step = S_SETUP
+        self.reached = S_SETUP
 
         self.title("xnuroid helper")
-        self.configure(bg=BG)
-        self.scale = self.winfo_fpixels("1i") / 96
-        self._style()
+        self.configure(bg=C.surface)
+        self._size_window()
         self._layout()
-        self.update_idletasks()
-        self.minsize(self.winfo_reqwidth(), min(self.winfo_reqheight(), self.winfo_screenheight() - 80))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.drain)
+        self.go(S_SETUP)
         self.refresh_computer()
         self.load_saved_game()
         threading.Thread(target=self.poll_phones, daemon=True).start()
         if start_with:
             self.after(300, lambda: self.choose(start_with))
 
+    # ------------------------------------------------------------------ derived state
+
+    @property
+    def computer_ok(self) -> bool:
+        return bool(self.checks) and all(c.ok for c in self.checks)
+
+    @property
+    def game_ok(self) -> bool:
+        return self.game is not None and (bool(self.encryption_ok) or self.forced)
+
+    @property
+    def phone_ok(self) -> bool:
+        phone = self.selected_phone()
+        return phone is not None and phone.usable
+
+    @property
+    def has_helper_lib(self) -> bool:
+        return (self.project / "build" / "libsysc++.so").is_file()
+
+    @property
+    def page(self) -> pages.Page:
+        return self.pages[self.step]
+
+    def apk_path(self) -> str:
+        return str(self.project / "build" / "xnuroid.apk")
+
     # ------------------------------------------------------------------ layout
 
-    def _style(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        def flat(name, font, fg, bg, hover, disabled, padding):
-            style.configure(name, font=font, foreground=fg, background=bg, lightcolor=bg, darkcolor=bg,
-                            bordercolor=bg, focuscolor=bg, borderwidth=0, padding=padding)
-            states = [("disabled", disabled), ("pressed", hover), ("active", hover)]
-            style.map(name, background=states, lightcolor=states, darkcolor=states, bordercolor=states,
-                      foreground=[("disabled", "#8d8794")])
-
-        flat("Accent.TButton", (FONT, 12, "bold"), "white", ACCENT, ACCENT_DARK, "#ddd8e3", (22, 12))
-        flat("Soft.TButton", (FONT, 10), ACCENT_DARK, "#e8def8", "#d6c8f5", "#eeeaf2", (14, 7))
-        flat("Fix.TButton", (FONT, 9, "bold"), "white", BAD, "#8c1d18", "#ddd8e3", (10, 3))
-        style.configure("Horizontal.TProgressbar", troughcolor="#e7e0ec", background=ACCENT, borderwidth=0,
-                        thickness=8)
-        style.configure("TCombobox", padding=4)
-
-    def px(self, value: int) -> int:
-        return round(value * self.scale)
-
-    def _label(self, parent, text="", size=10, color=INK, bold=False, **kwargs) -> tk.Label:
-        return tk.Label(parent, text=text, bg=parent["bg"], fg=color, justify="left", anchor="w",
-                        font=(FONT, size, "bold" if bold else "normal"), **kwargs)
+    def _size_window(self) -> None:
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(px(1000), sw - px(60)), min(px(720), sh - px(110))
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - px(20))}")
+        self.minsize(min(px(940), w), min(px(640), h))
 
     def _layout(self) -> None:
-        outer = tk.Frame(self, bg=BG, padx=22, pady=16)
-        outer.pack(fill="both", expand=True)
+        self.rail = m.StepRail(self, STEPS, self.go, self.can_go)
+        self.rail.pack(side="left", fill="y")
+        self.main = tk.Frame(self, bg=C.surface)
+        self.main.pack(side="left", fill="both", expand=True)
+        main = self.main
 
-        self._label(outer, "Play your iOS game on Android", 18, bold=True).pack(fill="x")
-        self._label(outer, "Follow the three steps. Anything with a red button needs your attention.",
-                    10, MUTED).pack(fill="x", pady=(2, 12))
+        # bottom bar
+        self.footer = tk.Frame(main, bg=C.surface_low, padx=px(32), pady=px(14))
+        self.footer.pack(side="bottom", fill="x")
+        self.divider = tk.Frame(main, bg=C.outline_variant, height=1)
+        self.divider.pack(side="bottom", fill="x")
+        footer = self.footer
+        footer.columnconfigure(1, weight=1)
+        tools = tk.Frame(footer, bg=C.surface_low)
+        tools.grid(row=0, column=0, sticky="w")
+        self.details_button = m.Button(tools, "Show details", self.toggle_details, kind="text", compact=True)
+        self.details_button.pack(side="left")
+        self.problems_button = m.Button(tools, "Check for problems", self.check_problems, kind="text",
+                                        compact=True)
+        self.problems_button.pack(side="left", padx=(px(6), 0))
+        middle = tk.Frame(footer, bg=C.surface_low)
+        middle.grid(row=0, column=1, sticky="ew", padx=px(14))
+        self.status = m.Label(middle, "", "body", C.on_surface_variant, wrap=True)
+        self.status.pack(fill="x")
+        self.busy_row = tk.Frame(middle, bg=C.surface_low)
+        self.progress = m.LinearProgress(self.busy_row)
+        self.cancel_button = m.Button(self.busy_row, "Cancel", self.cancel, kind="text", compact=True)
+        self.cancel_button.pack(side="right", padx=(px(10), 0))
+        self.progress.pack(side="left", fill="x", expand=True)
+        buttons = tk.Frame(footer, bg=C.surface_low)
+        buttons.grid(row=0, column=2, sticky="e")
+        self.back_button = m.Button(buttons, "Back", kind="text")
+        self.primary_button = m.Button(buttons, "Continue", kind="filled")
 
-        self.computer_card = Card(outer, "1", "Your computer")
-        self.computer_card.pack(fill="x")
-        self.check_rows = tk.Frame(self.computer_card.body, bg=CARD)
-        self.check_rows.pack(fill="x")
-
-        self.phone_card = Card(outer, "2", "Your phone")
-        self.phone_card.pack(fill="x", pady=10)
-        self.phone_text = self._label(self.phone_card.body, "Looking for your phone…", 11, bold=True)
-        self.phone_text.pack(fill="x")
-        self.phone_help = self._label(self.phone_card.body, "", 10, MUTED, wraplength=self.px(780))
-        self.phone_help.pack(fill="x", pady=(2, 0))
-        self.phone_pick = ttk.Combobox(self.phone_card.body, state="readonly", width=50)
-        self.phone_pick.bind("<<ComboboxSelected>>", lambda _e: self.update_actions())
-
-        self.game_card = Card(outer, "3", "Your game")
-        self.game_card.pack(fill="x")
-        row = tk.Frame(self.game_card.body, bg=CARD)
-        row.pack(fill="x")
-        self.icon_label = tk.Label(row, bg="#efe9f5", width=9, height=4)
-        self.icon_label.pack(side="left")
-        text = tk.Frame(row, bg=CARD)
-        text.pack(side="left", fill="x", expand=True, padx=14)
-        self.game_title = self._label(text, "No game chosen yet", 13, bold=True)
-        self.game_title.pack(fill="x")
-        self.game_detail = self._label(text, "Pick a decrypted .ipa file, or a folder you already unpacked.",
-                                       10, MUTED, wraplength=self.px(520))
-        self.game_detail.pack(fill="x")
-        self.game_crypt = self._label(text, "", 10, bold=True, wraplength=self.px(520))
-        self.game_crypt.pack(fill="x", pady=(4, 0))
-        pick = tk.Frame(row, bg=CARD)
-        pick.pack(side="right")
-        self.pick_ipa = ttk.Button(pick, text="Choose .ipa file…", style="Soft.TButton", command=self.ask_ipa)
-        self.pick_ipa.pack(fill="x")
-        self.pick_folder = ttk.Button(pick, text="Choose folder…", style="Soft.TButton", command=self.ask_folder)
-        self.pick_folder.pack(fill="x", pady=(6, 0))
-        self.override_button = ttk.Button(pick, text="Use it anyway…", style="Fix.TButton",
-                                          command=self.use_anyway)
-
-        actions = tk.Frame(outer, bg=BG)
-        actions.pack(fill="x", pady=(16, 0))
-        self.go_button = ttk.Button(actions, text="Put the game on my phone", style="Accent.TButton",
-                                    command=lambda: self.build(install=True))
-        self.go_button.pack(side="left")
-        self.cancel_button = ttk.Button(actions, text="Cancel", style="Soft.TButton", command=self.cancel)
-        more = tk.Frame(actions, bg=BG)
-        more.pack(side="right")
-        self.more_buttons = {
-            "start": ttk.Button(more, text="Start game", style="Soft.TButton", command=self.start_game),
-            "logs": ttk.Button(more, text="What went wrong?", style="Soft.TButton", command=self.show_phone_log),
-            "apk": ttk.Button(more, text="Only build the APK", style="Soft.TButton",
-                              command=lambda: self.build(install=False)),
-            "save": ttk.Button(more, text="Save APK…", style="Soft.TButton", command=self.save_apk),
-            "remove": ttk.Button(more, text="Remove from phone", style="Soft.TButton", command=self.uninstall),
-        }
-        for index, key in enumerate(("start", "logs", "remove", "apk", "save")):
-            self.more_buttons[key].grid(row=index // 3, column=index % 3, padx=3, pady=3, sticky="ew")
-
-        status = tk.Frame(outer, bg=BG)
-        status.pack(fill="x", pady=(12, 0))
-        self.status_text = self._label(status, "", 10, MUTED)
-        self.status_text.pack(fill="x")
-        self.progress = ttk.Progressbar(status, mode="determinate", maximum=1.0)
-        self.progress.pack(fill="x", pady=(4, 0))
-
-        toggle_row = tk.Frame(outer, bg=BG)
-        toggle_row.pack(fill="x", pady=(8, 0))
-        self.toggle = tk.Label(toggle_row, text="▸ Show details", bg=BG, fg=ACCENT, cursor="hand2",
-                               font=(FONT, 10, "underline"))
-        self.toggle.pack(side="left")
-        self.toggle.bind("<Button-1>", lambda _e: self.toggle_details())
-        self.copy_log = tk.Label(toggle_row, text="Copy details", bg=BG, fg=ACCENT, cursor="hand2",
-                                 font=(FONT, 10, "underline"))
-        self.copy_log.bind("<Button-1>", lambda _e: self.copy_details())
-        self.details = ScrolledText(outer, height=12, font=("Consolas", 9), bg="#1d1b20", fg="#e6e0e9",
-                                    insertbackground="white", relief="flat", state="disabled")
+        # page header and scrolling body
+        self.header = tk.Frame(main, bg=C.surface)
+        self.title_label = m.Label(self.header, "", "headline", wrap=True)
+        self.title_label.pack(fill="x")
+        self.subtitle_label = m.Label(self.header, "", "body_l", C.on_surface_variant, wrap=True)
+        self.subtitle_label.pack(fill="x", pady=(px(2), 0))
+        self.scroll = m.ScrollFrame(main, C.surface)
+        self.scroll.pack(fill="both", expand=True)
+        self.pages = [pages.SetupPage(self, self.scroll.inner), pages.GamePage(self, self.scroll.inner),
+                      pages.PhonePage(self, self.scroll.inner), pages.ReviewPage(self, self.scroll.inner),
+                      pages.BuildPage(self, self.scroll.inner), pages.DonePage(self, self.scroll.inner)]
+        self.drawer = m.LogView(main, height=9)
+        self.snack = m.Snackbar(main)
 
     def toggle_details(self) -> None:
-        if self.details.winfo_ismapped():
-            self.details.pack_forget()
-            self.copy_log.pack_forget()
-            self.toggle.config(text="▸ Show details")
+        if self.drawer.winfo_ismapped():
+            self.drawer.pack_forget()
+            self.details_button.set_text("Show details")
         else:
-            self.details.pack(fill="both", expand=True, pady=(4, 0))
-            self.copy_log.pack(side="right")
-            self.toggle.config(text="▾ Hide details")
+            self.drawer.pack(side="bottom", fill="x", before=self.scroll)
+            self.drawer.text.see("end")
+            self.details_button.set_text("Hide details")
 
-    def copy_details(self) -> None:
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(self.log_lines))
-        self.set_status("Details copied. Paste them wherever you ask for help.", GOOD)
+    # ------------------------------------------------------------------ navigation
 
-    # ------------------------------------------------------------------ events
+    def can_go(self, index: int) -> bool:
+        if index == self.step or self.job_kind == "build":
+            return False
+        if index == S_BUILD:
+            return False
+        if index == S_DONE:
+            return self.build_result is not None
+        return index <= self.reached
+
+    def go(self, index: int) -> None:
+        current = getattr(self, "_shown", None)
+        if current is not None:
+            current.frame.pack_forget()
+        self.step = index
+        self.reached = max(self.reached, index)
+        page = self.pages[index]
+        self._shown = page
+        if page.header:
+            self.title_label.config(text=page.title)
+            self.subtitle_label.config(text=page.subtitle)
+            self.header.pack(fill="x", padx=px(32), pady=(px(28), px(4)), before=self.scroll)
+        else:
+            self.header.pack_forget()
+        page.frame.pack(fill="x", padx=px(32), pady=(px(4), px(28)))
+        self.scroll.to_top()
+        self.rail.set_state(index, self.reached)
+        page.on_show()
+        self.update_actions()
+
+    def refresh_page(self) -> None:
+        self.page.refresh()
+        self.update_actions()
+
+    def update_actions(self) -> None:
+        busy = self.job is not None
+        footer = self.page.footer()
+        self.back_button.pack_forget()
+        self.primary_button.pack_forget()
+        if footer.back:
+            self.back_button.set_text(footer.back)
+            self.back_button.command = footer.back_action
+            self.back_button.set_enabled(not busy)
+            self.back_button.pack(side="left", padx=(0, px(8)))
+        if footer.primary:
+            self.primary_button.set_text(footer.primary)
+            self.primary_button.command = footer.primary_action
+            self.primary_button.set_enabled(footer.primary_enabled)
+            self.primary_button.pack(side="left")
+        if busy:
+            if not self.busy_row.winfo_ismapped():
+                self.busy_row.pack(fill="x", pady=(px(6), 0))
+            if self.step == S_BUILD:
+                self.progress.pack_forget()
+            elif not self.progress.winfo_ismapped():
+                self.progress.pack(side="left", fill="x", expand=True)
+        else:
+            self.busy_row.pack_forget()
+        self.rail.set_state(self.step, self.reached)
+        self.problems_button.set_text("Check for problems" if self.phones else "What went wrong?")
+        if not busy and (self.status_is_hint or not self.status["text"]):
+            self.set_status(self.page.hint(), hint=True)
+
+    # ------------------------------------------------------------------ events and jobs
 
     def post(self, kind: str, payload=None) -> None:
         self.events.put((kind, payload))
@@ -360,54 +396,49 @@ class Helper(tk.Tk):
 
     def append_log(self, lines: list[str]) -> None:
         self.log_lines.extend(lines)
-        self.details.config(state="normal")
-        self.details.insert("end", "\n".join(lines) + "\n")
-        if int(self.details.index("end-1c").split(".")[0]) > 5000:
-            self.details.delete("1.0", "1000.0")
-        self.details.see("end")
-        self.details.config(state="disabled")
+        self.drawer.append(lines)
 
-    def set_status(self, text: str, color: str = MUTED, hint: bool = False) -> None:
-        self.status_text.config(text=text, fg=color)
+    def set_status(self, text: str, color: str = C.on_surface_variant, hint: bool = False) -> None:
+        self.status.config(text=text, fg=color)
         self.status_is_hint = hint
 
     def show_progress(self, fraction: float | None, text: str) -> None:
         if fraction is None:
-            if str(self.progress["mode"]) != "indeterminate":
-                self.progress.config(mode="indeterminate")
-                self.progress.start(12)
+            self.progress.start()
         else:
-            if str(self.progress["mode"]) != "determinate":
-                self.progress.stop()
-                self.progress.config(mode="determinate")
-            self.progress["value"] = fraction
+            self.progress.set(fraction)
         if text:
             self.set_status(text)
+        self.page.on_progress(fraction, text)
 
-    def run_job(self, title: str, work, done=None) -> None:
+    def run_job(self, title: str, work, done=None, on_error=None, on_cancel=None, kind: str = "") -> None:
         if self.job:
-            self.queued.append((title, work, done))
+            self.queued.append((title, work, done, on_error, on_cancel, kind))
             return
         job = Job(self.post)
         self.job = job
+        self.job_kind = kind
         self.show_progress(None, title)
-        self.update_actions()
+        self.refresh_page()
 
         def worker():
             try:
                 result, error = work(job), None
             except Exception as exc:  # shown to the user, never swallowed
                 result, error = None, exc
-            self.post("call", lambda: self.finish_job(job, result, error, done))
+            self.post("call", lambda: self.finish_job(job, result, error, done, on_error, on_cancel))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_job(self, job: Job, result, error, done) -> None:
+    def finish_job(self, job: Job, result, error, done, on_error, on_cancel) -> None:
         self.job = None
-        self.show_progress(0.0, "")
+        self.job_kind = ""
+        self.progress.set(0.0)
         self.set_status("")
         if job.cancelled.is_set():
-            self.set_status("Cancelled.", WARN)
+            self.set_status("Cancelled.", C.warn)
+            if on_cancel:
+                on_cancel()
         else:
             if error is None and done:
                 try:
@@ -416,24 +447,52 @@ class Helper(tk.Tk):
                     error = exc
             if error is not None:
                 text = str(error) or repr(error)
-                self.set_status(text.splitlines()[0], BAD)
-                messagebox.showerror("Something went wrong", text, parent=self)
+                self.set_status(text.splitlines()[0], C.error)
+                if on_error:
+                    on_error(text)
+                else:
+                    m.ask(self, "Something went wrong", text)
         if self.queued and not self.job:
             self.run_job(*self.queued.pop(0))
-        self.update_actions()
+        self.refresh_page()
 
     def cancel(self) -> None:
         if self.job:
             self.job.kill()
 
     def on_close(self) -> None:
-        if self.job and not messagebox.askyesno(
-                "Still working", "I am still working. Stop and close anyway?", parent=self):
+        if self.job and not m.ask(self, "Still working", "xnuroid is still working. Stop and close anyway?",
+                                  ok="Stop and close", cancel="Keep working", danger=True):
             return
         if self.job:
             self.job.kill()
         self.stop.set()
         self.destroy()
+
+    def check_problems(self) -> None:
+        """Footer entry point: the game's own log on a phone, or this helper's log when no phone is connected."""
+        phone = self.selected_phone()
+        if phone is None:
+            if not self.drawer.winfo_ismapped():
+                self.toggle_details()
+            return
+        problem = phone.problem()
+        if problem:
+            self.snack.show(problem)
+            return
+        if not self.package:
+            self.snack.show("Choose a game first, then check for problems.")
+            return
+        self.show_phone_log()
+
+    def remember_splash(self) -> None:
+        self.settings["skip_splash"] = bool(self.skip_splash.get())
+        save_settings(self.settings)
+
+    def copy_details(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(self.log_lines))
+        self.snack.show("Details copied. Paste them wherever you ask for help.")
 
     # ------------------------------------------------------------------ step 1: computer
 
@@ -445,79 +504,54 @@ class Helper(tk.Tk):
             self.checks, self.found = result
             adb = self.found.get("adb")
             self.adb = env.Adb(adb) if adb and Path(adb).is_file() else None
-            self.show_checks()
+            if self.pending_start and self.computer_ok:
+                self.pending_start = False
+                if self.step == S_SETUP:
+                    self.go(S_GAME)
 
-        self.run_job("Checking your computer…", work, done)
-
-    def show_checks(self) -> None:
-        for child in self.check_rows.winfo_children():
-            child.destroy()
-        for check in self.checks:
-            row = tk.Frame(self.check_rows, bg=CARD)
-            row.pack(fill="x", pady=1)
-            self._label(row, "✓" if check.ok else "✕", 11, GOOD if check.ok else BAD, bold=True,
-                        width=2).pack(side="left")
-            self._label(row, check.title, 10, bold=True, width=22).pack(side="left")
-            self._label(row, check.detail, 10, MUTED).pack(side="left", fill="x", expand=True)
-            if check.fix:
-                ttk.Button(row, text="Fix", style="Fix.TButton",
-                           command=lambda c=check: self.fix(c)).pack(side="right")
-        refresh = tk.Label(self.check_rows, text="Check again", bg=CARD, fg=ACCENT, cursor="hand2",
-                           font=(FONT, 9, "underline"))
-        refresh.pack(anchor="e", pady=(4, 0))
-        refresh.bind("<Button-1>", lambda _e: self.refresh_computer())
-        missing = sum(not c.ok for c in self.checks)
-        self.computer_card.set_badge("Ready ✓" if not missing else f"{missing} to fix", GOOD if not missing else BAD)
-        if self.adb is None:
-            self.phone_text.config(text="Finish step 1 first", fg=MUTED)
-            self.phone_help.config(text="I need Android Studio's Platform-Tools to talk to your phone.")
-            self.phone_card.set_badge("Waiting", WARN)
-        self.update_actions()
+        self.run_job("Checking your computer…", work, done, kind="setup")
 
     def fix(self, check: env.Check) -> None:
+        def open_page(title: str, text: str, url: str) -> None:
+            if m.ask(self, title, text, ok="Open download page", cancel="Not now"):
+                webbrowser.open(url)
+
         if check.fix == "git":
-            messagebox.showinfo("Install Git for Windows",
-                                "Your browser will open the Git download page.\n\nRun the installer and keep "
-                                "every default option. Then come back and press 'Check again'.", parent=self)
-            webbrowser.open(env.GIT_URL)
+            open_page("Install Git for Windows",
+                      "Your browser will open the Git download page.\n\nRun the installer and keep every default "
+                      "option. Then come back and press Check again.", env.GIT_URL)
         elif check.fix == "python":
-            messagebox.showinfo("Install Python",
-                                "Your browser will open the Python download page.\n\nIMPORTANT: on the first "
-                                "installer screen, tick 'Add python.exe to PATH'. Then come back and press "
-                                "'Check again'.", parent=self)
-            webbrowser.open(env.PYTHON_URL)
+            open_page("Install Python",
+                      "Your browser will open the Python download page.\n\nIMPORTANT: on the first installer "
+                      "screen, tick 'Add python.exe to PATH'. Then come back and press Check again.", env.PYTHON_URL)
         elif check.fix == "studio":
-            messagebox.showinfo("Install Android Studio",
-                                "Your browser will open the Android Studio page.\n\nInstall it, open it once and "
-                                "let it finish its setup wizard. Then come back and press 'Check again'.",
-                                parent=self)
-            webbrowser.open(env.STUDIO_URL)
+            open_page("Install Android Studio",
+                      "Your browser will open the Android Studio page.\n\nInstall it, open it once and let it "
+                      "finish its setup wizard. Then come back and press Check again.", env.STUDIO_URL)
         elif check.fix == "sdk_parts":
             self.install_sdk_parts()
         elif check.fix == "keystore":
             self.run_job("Creating the app signing key…", lambda _job: env.create_debug_keystore(),
-                         lambda _path: self.refresh_computer())
+                         lambda _path: self.refresh_computer(), kind="setup")
 
     def install_sdk_parts(self) -> None:
         sdk = self.found.get("sdk")
         manager = env.find_sdkmanager(sdk) if sdk else None
         if manager is None:
-            messagebox.showinfo(
-                "Install the missing Android parts",
-                "Open Android Studio and choose More Actions > SDK Manager.\n\n"
-                "1. On the 'SDK Platforms' tab tick Android 16 (API 36).\n"
-                "2. On the 'SDK Tools' tab tick 'Show Package Details', then tick:\n"
-                f"     • NDK (Side by side) > {env.NDK_VERSION}\n"
-                "     • Android SDK Build-Tools > 36.1.0\n"
-                "     • Android SDK Command-line Tools\n"
-                "     • Android SDK Platform-Tools\n"
-                "3. Press OK and wait for the download.\n\n"
-                "Then come back and press 'Check again'.", parent=self)
+            m.ask(self, "Install the missing Android parts",
+                  "Open Android Studio and choose More Actions > SDK Manager.\n\n"
+                  "1. On the 'SDK Platforms' tab tick Android 16 (API 36).\n"
+                  "2. On the 'SDK Tools' tab tick 'Show Package Details', then tick:\n"
+                  f"     • NDK (Side by side) > {env.NDK_VERSION}\n"
+                  "     • Android SDK Build-Tools > 36.1.0\n"
+                  "     • Android SDK Command-line Tools\n"
+                  "     • Android SDK Platform-Tools\n"
+                  "3. Press OK and wait for the download.\n\n"
+                  "Then come back and press Check again.")
             return
-        if not messagebox.askokcancel(
-                "Install the missing Android parts",
-                "I will download the missing Android parts now (about 1 GB) and accept Google's SDK "
-                "licences for you.\n\nContinue?", parent=self):
+        if not m.ask(self, "Install the missing Android parts",
+                     "xnuroid will download the missing Android parts now (about 1 GB) and accept Google's SDK "
+                     "licences for you.\n\nContinue?", ok="Download", cancel="Cancel"):
             return
 
         keytool = env.find_keytool()
@@ -526,11 +560,12 @@ class Helper(tk.Tk):
         def work(job: Job):
             code, _ = job.stream([manager, "--install", *env.SDK_PACKAGES], sdk, java, stdin_text="y\n" * 30)
             if code != 0 and not job.cancelled.is_set():
-                raise RuntimeError("The Android download failed. Open 'Show details' to see why.")
+                raise RuntimeError("The Android download failed. Press Show details to see why.")
 
-        self.run_job("Downloading Android parts. This can take a while…", work, lambda _r: self.refresh_computer())
+        self.run_job("Downloading Android parts. This can take a while…", work, lambda _r: self.refresh_computer(),
+                     kind="setup")
 
-    # ------------------------------------------------------------------ step 2: phone
+    # ------------------------------------------------------------------ step 3: phone
 
     def poll_phones(self) -> None:
         last = None
@@ -549,43 +584,31 @@ class Helper(tk.Tk):
 
     def show_phones(self, phones: list[env.Phone]) -> None:
         self.phones = phones
-        if not phones:
-            self.phone_text.config(text="No phone found", fg=BAD)
-            self.phone_help.config(text=(
-                "1. Plug your phone into this PC with a USB cable.\n"
-                "2. On the phone open Settings > About phone and tap 'Build number' 7 times.\n"
-                "3. Open Settings > Developer options and turn on 'USB debugging'.\n"
-                "4. Tap 'Allow' when the phone asks about USB debugging.\n"
-                "This page updates by itself when the phone appears."))
-            self.phone_card.set_badge("Waiting", WARN)
-        if len(phones) > 1:
-            current = self.phone_pick.get()
-            values = [p.label for p in phones]
-            self.phone_pick.config(values=values)
-            self.phone_pick.set(current if current in values else values[0])
-            self.phone_pick.pack(anchor="w", pady=(6, 0))
-        else:
-            self.phone_pick.pack_forget()
-        if phones:
-            self.show_selected_phone()
+        if self.phone_serial not in {p.serial for p in phones}:
+            self.phone_serial = ""
+        if self.step in (S_PHONE, S_REVIEW):
+            self.page.refresh()
         self.update_actions()
 
     def selected_phone(self) -> env.Phone | None:
-        if len(self.phones) > 1:
-            label = self.phone_pick.get()
-            return next((p for p in self.phones if p.label == label), self.phones[0])
-        return self.phones[0] if self.phones else None
+        if not self.phones:
+            return None
+        match = next((p for p in self.phones if p.serial == self.phone_serial), None)
+        return match or next((p for p in self.phones if p.usable), self.phones[0])
 
-    def show_selected_phone(self) -> None:
-        phone = self.selected_phone()
-        if phone is None:
-            return
-        problem = phone.problem()
-        self.phone_text.config(text=phone.label, fg=INK if not problem else BAD)
-        self.phone_help.config(text=problem or "Connected and ready.")
-        self.phone_card.set_badge("Ready ✓" if not problem else "Needs attention", GOOD if not problem else BAD)
+    def pick_phone(self, phone: env.Phone) -> None:
+        self.phone_serial = phone.serial
+        self.refresh_page()
 
-    # ------------------------------------------------------------------ step 3: game
+    def use_phone(self) -> None:
+        self.install_mode = True
+        self.go(S_REVIEW)
+
+    def skip_phone(self) -> None:
+        self.install_mode = False
+        self.go(S_REVIEW)
+
+    # ------------------------------------------------------------------ step 2: game
 
     def load_saved_game(self) -> None:
         saved = games.read_config(self.project)
@@ -598,10 +621,10 @@ class Helper(tk.Tk):
         def work(_job):
             return games.check_encryption(game.app, game.app)
 
-        self.run_job("Checking that the game is decrypted…", work, self.show_encryption)
+        self.run_job("Checking the app bundle…", work, self.apply_report, kind="game")
 
     def ask_ipa(self) -> None:
-        path = filedialog.askopenfilename(parent=self, title="Choose your decrypted .ipa file",
+        path = filedialog.askopenfilename(parent=self, title="Choose your .ipa file",
                                           initialdir=self.settings.get("last_dir") or str(Path.home()),
                                           filetypes=[("iOS app", "*.ipa"), ("All files", "*.*")])
         if path:
@@ -617,19 +640,20 @@ class Helper(tk.Tk):
         self.settings["last_dir"] = str(choice.parent)
         save_settings(self.settings)
         games_dir = self.project / "games"
+        title = "Checking the app bundle…"
 
         if choice.is_file():
             if choice.suffix.lower() != ".ipa":
-                self.reject(choice, None, f"✕ {choice.name} is not an .ipa file.", allow_override=False)
+                self.reject(choice, None, f"{choice.name} is not an .ipa file.", allow_override=False)
                 return
 
             def work(job: Job):
-                job.progress(None, "Checking that the game is decrypted…")
+                job.progress(None, title)
                 try:
                     report = games.check_encryption(choice, None)
                 except (ValueError, OSError, zipfile.BadZipFile, plistlib.InvalidFileException) as error:
                     if not force:
-                        return Rejected(choice, None, f"✕ I could not read this file as an iOS app ({error}).")
+                        return Rejected(choice, None, f"This file could not be read as an iOS app ({error}).")
                     report = None
                 if not force and not report.usable:
                     return Rejected(choice, report)
@@ -647,11 +671,11 @@ class Helper(tk.Tk):
                         return Rejected(app, report)
                 return report, app
 
-            self.run_job("Checking that the game is decrypted…", work, lambda r: self.after_pick(r, force))
+            self.run_job(title, work, lambda r: self.after_pick(r, force), kind="game")
         elif choice.is_dir():
             candidates = games.bundle_candidates(choice)
             if not candidates:
-                self.reject(choice, None, "✕ There is no iOS app in this folder. Pick the folder that contains "
+                self.reject(choice, None, "There is no iOS app in this folder. Pick the folder that contains "
                                           "'Payload', the 'Payload' folder itself, or a folder ending in '.app'.",
                             allow_override=False)
                 return
@@ -667,38 +691,43 @@ class Helper(tk.Tk):
                 root = games.adopt_loose_app(app, games_dir, job.progress)
                 return report, root / "Payload" / app.name
 
-            self.run_job("Checking that the game is decrypted…", work, lambda r: self.after_pick(r, force))
+            self.run_job(title, work, lambda r: self.after_pick(r, force), kind="game")
         else:
-            messagebox.showerror("Not found", f"There is nothing at\n{choice}", parent=self)
+            m.ask(self, "Not found", f"There is nothing at\n{choice}")
 
     def pick_bundle(self, candidates: list[Path]) -> Path | None:
         """Called from a worker; asks on the UI thread when the file holds several apps."""
+        answer: dict = {}
         if len(candidates) == 1:
             return candidates[0]
-        answer: dict = {}
         ready = threading.Event()
 
         def ask():
-            dialog = tk.Toplevel(self, bg=CARD, padx=20, pady=16)
-            dialog.title("Which app?")
-            dialog.transient(self)
-            dialog.grab_set()
-            self._label(dialog, "This contains more than one app. Which one is the game?", 11, bold=True).pack()
-            listbox = tk.Listbox(dialog, height=min(8, len(candidates)), font=(FONT, 10))
-            for app in candidates:
-                listbox.insert("end", app.stem)
-            listbox.selection_set(0)
-            listbox.pack(fill="x", pady=10)
+            dialog = m.Dialog(self, "Which app?", "Which one is the game?")
+            m.Label(dialog.body, "This file contains more than one app.", "body_l", C.on_surface_variant,
+                    wrap=dialog.inner_w).pack(fill="x", pady=(0, px(8)))
+            chosen = {"index": 0}
+            tiles: list[m.ChoiceTile] = []
 
-            def close(choice):
-                answer["app"] = choice
-                dialog.destroy()
+            def select(index: int) -> None:
+                chosen["index"] = index
+                for i, tile in enumerate(tiles):
+                    tile.set(selected=i == index)
+
+            for index, app in enumerate(candidates[:8]):
+                tile = m.ChoiceTile(dialog.body, app.stem, app.name, on_click=lambda i=index: select(i), height=62)
+                tile.pack(fill="x", pady=px(3))
+                tiles.append(tile)
+            select(0)
+
+            def closed(value):
+                answer["app"] = candidates[chosen["index"]] if value == "ok" else None
                 ready.set()
 
-            ttk.Button(dialog, text="Use this one", style="Accent.TButton",
-                       command=lambda: close(candidates[listbox.curselection()[0]] if listbox.curselection()
-                                             else candidates[0])).pack()
-            dialog.protocol("WM_DELETE_WINDOW", lambda: close(None))
+            dialog.on_close = closed
+            dialog.add_action("Use this one", "ok", kind="filled")
+            dialog.add_action("Cancel", None)
+            dialog.present()
 
         self.post("call", ask)
         ready.wait()
@@ -714,7 +743,7 @@ class Helper(tk.Tk):
         try:
             game = games.Game(app.parent.parent, app, games.load_info(app))
         except ValueError as error:
-            self.reject(app, report, f"✕ {error}", allow_override=False)
+            self.reject(app, report, str(error), allow_override=False)
             return
         games.write_config(self.project, game)
         self.forced = force
@@ -722,9 +751,26 @@ class Helper(tk.Tk):
         save_settings(self.settings)
         self.set_game(game, report)
         if force:
-            self.set_status(f"'{game.label}' is set up anyway. It might not work.", WARN)
+            self.set_status(f"'{game.label}' is set up anyway. It might not work.", C.warn)
         else:
-            self.set_status(f"'{game.label}' is ready. Press 'Put the game on my phone'.", GOOD)
+            self.set_status(f"'{game.label}' is ready.", C.primary)
+
+    def apply_report(self, report) -> None:
+        """Takes the result of the encryption check into the state the pages read."""
+        self.report = report
+        main = report.main
+        if report.encrypted:
+            self.encryption_ok = False
+        elif main is None or main.encrypted is None:
+            self.encryption_ok = None
+        elif not main.arm64:
+            self.encryption_ok = False
+        else:
+            self.encryption_ok = True
+        if report.usable:
+            self.rejected = None
+        elif self.game is not None and not self.forced:
+            self.rejected = self.game.app
 
     def reject(self, choice: Path, report, message: str = "", allow_override: bool = True) -> None:
         """Shows what was picked and why it was refused, instead of leaving the previous game on screen."""
@@ -732,139 +778,51 @@ class Helper(tk.Tk):
         self.package = ""
         self.forced = False
         self.rejected = choice if allow_override else None
+        self.reject_path = choice
+        self.reject_message = message
         self.icon_image = None
-        self.icon_label.config(image="", width=9, height=4)
-        self.game_title.config(text=choice.name)
-        self.game_detail.config(text=f"This cannot be used as it is.\n{choice}")
         if report is not None and not message:
-            self.show_encryption(report)
+            self.apply_report(report)
         else:
+            self.report = report
             self.encryption_ok = False
-            self.game_crypt.config(fg=BAD, text=message)
-            self.game_card.set_badge("Not usable", BAD)
-        if allow_override:
-            self.override_button.pack(fill="x", pady=(6, 0))
-        else:
-            self.override_button.pack_forget()
         self.set_status("That game cannot be used. Choose another one"
-                        + (", or press 'Use it anyway…'." if allow_override else "."), BAD)
-        self.update_actions()
+                        + (", or press Use it anyway." if allow_override else "."), C.error)
+        self.refresh_page()
 
     def use_anyway(self) -> None:
         choice = self.rejected
         if choice is None:
             return
-        if not messagebox.askyesno(
-                "Use it anyway?",
-                "The check says this app is encrypted, unreadable or not 64-bit ARM, so it will most likely "
-                "not work. The check can be wrong, though.\n\nUse it anyway?", icon="warning", parent=self):
+        if not m.ask(self, "Use it anyway?",
+                     "The check says this app is encrypted, unreadable or not 64-bit ARM, so it will most likely "
+                     "not work. The check can be wrong, though.\n\nUse it anyway?", ok="Use it anyway",
+                     cancel="Cancel", danger=True):
             return
         self.choose(choice, force=True)
-
 
     def set_game(self, game: games.Game, report) -> None:
         self.game = game
         self.package = games.package_id(self.project, game.info)
-        kind = "Unity game" if game.is_unity else "Regular iOS app (app mode, experimental)"
-        version = f"  ·  version {game.version}" if game.version else ""
-        self.game_title.config(text=game.label)
-        self.game_detail.config(text=f"{kind}{version}\nAndroid app id: {self.package}\n{game.app}")
         icon = games.icon_png(self.project, game)
         self.icon_image = None
         if icon:
             try:
                 image = tk.PhotoImage(data=base64.b64encode(icon))
-                factor = max(1, image.width() // self.px(72))
+                factor = max(1, image.width() // px(72))
                 self.icon_image = image.subsample(factor, factor)
             except tk.TclError:
                 self.icon_image = None
-        if self.icon_image:
-            self.icon_label.config(image=self.icon_image, width=self.icon_image.width(),
-                                   height=self.icon_image.height())
-        else:
-            self.icon_label.config(image="", width=9, height=4)
         self.rejected = None
-        self.override_button.pack_forget()
+        self.reject_path = None
+        self.reject_message = ""
+        self.report = None
         if report is not None:
-            self.show_encryption(report)
+            self.apply_report(report)
         elif self.forced:
             self.encryption_ok = False
-            self.game_crypt.config(fg=WARN, text="! Check skipped because you chose 'Use it anyway'. It might not work.")
-            self.game_card.set_badge("Used anyway", WARN)
-        else:
-            self.game_crypt.config(text="")
-            self.game_card.set_badge("", MUTED)
-        self.update_actions()
 
-    def show_encryption(self, report) -> None:
-        main = report.main
-        if report.encrypted:
-            names = ", ".join(b.name for b in report.encrypted)
-            self.encryption_ok = False
-            self.game_crypt.config(fg=BAD, text=(
-                f"✕ Encrypted ({names}). This copy came straight from the App Store and cannot run. "
-                "Use a decrypted copy instead (dumped from a jailbroken device)."))
-            self.game_card.set_badge("Encrypted", BAD)
-        elif main is None or main.encrypted is None:
-            self.encryption_ok = None
-            reason = main.problem if main else "no program file"
-            self.game_crypt.config(fg=WARN, text=f"? I could not check this app ({reason}). It may not work.")
-            self.game_card.set_badge("Unchecked", WARN)
-        elif not main.arm64:
-            self.encryption_ok = False
-            self.game_crypt.config(fg=BAD, text="✕ This app has no 64-bit ARM (arm64) code, so it cannot run.")
-            self.game_card.set_badge("Not supported", BAD)
-        else:
-            self.encryption_ok = True
-            extra = f" ({len(report.binaries)} program files checked)" if len(report.binaries) > 1 else ""
-            self.game_crypt.config(fg=GOOD, text=f"✓ Decrypted{extra}")
-            self.game_card.set_badge("Ready ✓", GOOD)
-        if report.usable:
-            self.override_button.pack_forget()
-        elif self.game is not None and self.forced:
-            self.game_crypt.config(fg=WARN, text=self.game_crypt["text"] + "\nYou chose 'Use it anyway', so it might not work.")
-            self.game_card.set_badge("Used anyway", WARN)
-        elif self.game is not None:
-            self.rejected = self.game.app
-            self.override_button.pack(fill="x", pady=(6, 0))
-        self.update_actions()
-
-    # ------------------------------------------------------------------ actions
-
-    def update_actions(self) -> None:
-        busy = self.job is not None
-        computer_ok = bool(self.checks) and all(c.ok for c in self.checks)
-        phone = self.selected_phone()
-        phone_ok = phone is not None and phone.usable
-        game_ok = self.game is not None and (bool(self.encryption_ok) or self.forced)
-        if phone is not None:
-            self.show_selected_phone()
-
-        def enable(widget, on: bool) -> None:
-            widget.state(["!disabled"] if on else ["disabled"])
-
-        enable(self.go_button, not busy and computer_ok and phone_ok and game_ok)
-        enable(self.more_buttons["apk"], not busy and computer_ok and game_ok)
-        enable(self.more_buttons["save"], not busy and (self.project / "build" / "xnuroid.apk").is_file())
-        for key in ("start", "logs", "remove"):
-            enable(self.more_buttons[key], not busy and phone_ok and bool(self.package))
-        enable(self.pick_ipa, not busy)
-        enable(self.pick_folder, not busy)
-        if busy:
-            self.cancel_button.pack(side="left", padx=10)
-        else:
-            self.cancel_button.pack_forget()
-        if not busy and (self.status_is_hint or not self.status_text["text"]):
-            self.set_status(self.next_hint(computer_ok, phone_ok, game_ok), hint=True)
-
-    def next_hint(self, computer_ok: bool, phone_ok: bool, game_ok: bool) -> str:
-        if not computer_ok:
-            return "Step 1: press the red 'Fix' buttons."
-        if not phone_ok:
-            return "Step 2: connect your phone."
-        if not game_ok:
-            return "Step 3: choose a decrypted game."
-        return "All set. Press 'Put the game on my phone'."
+    # ------------------------------------------------------------------ step 5: build
 
     def build_env(self) -> dict:
         extra = {}
@@ -874,25 +832,34 @@ class Helper(tk.Tk):
         if phone is not None:
             extra["ANDROID_SERIAL"] = phone.serial
         extra.update(env.java_env() or {})
+        if not self.skip_splash.get():
+            extra["KEEP_SPLASH"] = "1"
         return extra
 
     def build(self, install: bool) -> None:
         if self.game is None or self.found.get("bash") is None:
             return
-        if not (self.project / "build" / "libsysc++.so").is_file() and not (
-                self.selected_phone() and self.selected_phone().usable):
-            messagebox.showinfo("Phone needed once",
-                                "The first build copies one file from your phone. Plug the phone in, then try again.",
-                                parent=self)
+        if not self.has_helper_lib and not self.phone_ok:
+            m.ask(self, "Phone needed once", "The first build copies one file from your phone. Plug the phone in, "
+                                              "then try again.")
             return
         games.write_config(self.project, self.game)
         command = "./build_apk.sh install" if install else "./build_apk.sh"
         bash = self.found["bash"]
         log_file = self.project / "build" / "helper_last_build.log"
+        self.build_install = install
+        self.build_state = "running"
+        self.build_error = ""
+        self.build_result = None
+        self.build_started = time.monotonic()
+        self.stage = 0.0
+        self.crashed = False
+        self.go(S_BUILD)
 
         def work(job: Job):
             started = time.monotonic()
             job.log(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}  {command}")
+            job.log("splash: skipped" if self.skip_splash.get() else "splash: kept (the game plays its launch video)")
             code, output = job.stream([bash, "-lc", command], self.project, self.build_env())
             try:
                 log_file.parent.mkdir(exist_ok=True)
@@ -904,28 +871,38 @@ class Helper(tk.Tk):
             if code != 0 or (install and "Failure [" in output):
                 hint = next((text for marker, text in BUILD_HINTS if marker in output), "")
                 raise RuntimeError((hint or "The build stopped with an error.") +
-                                   "\n\nOpen 'Show details' below to see the full log, or press 'Copy details' "
-                                   "to share it.")
+                                   "\n\nPress Show details to see the full log, or Copy details to share it.")
+            job.log(f"APK: {self.apk_path()}")
             return time.monotonic() - started
 
         def done(seconds):
             if seconds is None:
                 return
-            self.progress["value"] = 1.0
-            minutes = f"{seconds / 60:.0f} min" if seconds >= 90 else f"{seconds:.0f} s"
+            self.build_state = "done"
+            self.build_result = seconds
+            self.stage = 1.0
+            self.go(S_DONE)
             if install:
-                self.set_status(f"Done in {minutes}. '{self.game.label}' is starting on your phone.", GOOD)
                 self.watch_for_crash()
-            else:
-                self.set_status(f"APK built in {minutes}. Use 'Save APK…' to copy it anywhere.", GOOD)
 
-        self.run_job("Building the Android app. The first build takes a few minutes…", work, done)
+        def failed(text: str):
+            self.build_state = "failed"
+            self.build_error = text
+
+        def cancelled():
+            self.build_state = "cancelled"
+
+        self.run_job("Building the Android app. The first build takes a few minutes…", work, done,
+                     on_error=failed, on_cancel=cancelled, kind="build")
 
     def on_build_line(self, line: str) -> None:
         for marker, fraction, text in BUILD_STAGES:
             if line.startswith(marker) or marker in line:
+                self.stage = max(self.stage, fraction)
                 self.show_progress(fraction, text)
                 return
+
+    # ------------------------------------------------------------------ step 6: play
 
     def watch_for_crash(self) -> None:
         phone, package, adb = self.selected_phone(), self.package, self.adb
@@ -942,30 +919,48 @@ class Helper(tk.Tk):
                 except (OSError, subprocess.TimeoutExpired):
                     return
                 if exited:
-                    self.post("call", self.offer_crash_log)
+                    self.post("call", self.on_crash)
                     return
 
         threading.Thread(target=watch, daemon=True).start()
 
-    def offer_crash_log(self) -> None:
-        self.set_status("The game closed right after starting.", BAD)
-        if messagebox.askyesno("The game closed", "The game closed right after it started.\n\n"
-                                                  "Do you want to see what it reported?", parent=self):
-            self.show_phone_log()
+    def on_crash(self) -> None:
+        self.crashed = True
+        self.set_status("The game closed right after starting.", C.error)
+        if self.step == S_DONE:
+            self.page.refresh()
 
     def start_game(self) -> None:
         phone, package = self.selected_phone(), self.package
 
         def work(_job):
             if not self.adb.is_installed(phone.serial, package):
-                raise RuntimeError("The game is not on this phone yet. Press 'Put the game on my phone' first.")
+                raise RuntimeError("The game is not on this phone yet. Build and install it first.")
             return self.adb.launch(phone.serial, package)
 
         def done(_out):
-            self.set_status("Started. Look at your phone.", GOOD)
+            self.crashed = False
+            self.set_status("Started. Look at your phone.", C.primary)
             self.watch_for_crash()
 
-        self.run_job("Starting the game…", work, done)
+        self.run_job("Starting the game…", work, done, kind="play")
+
+    def uninstall(self) -> None:
+        phone, package = self.selected_phone(), self.package
+        if phone is None or not hasattr(self.adb, "uninstall"):
+            return
+        label = self.game.label if self.game else package
+        if not m.ask(self, "Remove from phone?", f"This removes '{label}' and its saved data from {phone.label}.",
+                     ok="Remove", cancel="Keep it", danger=True):
+            return
+
+        def done(_out):
+            self.build_result = None
+            self.set_status("Removed from your phone.", C.primary)
+            self.go(S_REVIEW)
+
+        self.run_job("Removing the game from your phone…", lambda _job: self.adb.uninstall(phone.serial, package),
+                     done, kind="play")
 
     def show_phone_log(self) -> None:
         phone, package = self.selected_phone(), self.package
@@ -974,24 +969,21 @@ class Helper(tk.Tk):
             return {name: self.adb.read_app_file(phone.serial, package, name)
                     for name in ("exit.txt", "err.txt", "out.txt")}
 
-        self.run_job("Reading the game's log from the phone…", work, self.open_log_window)
+        self.run_job("Reading the game's log from the phone…", work, self.open_log_window, kind="play")
 
     def open_log_window(self, logs: dict) -> None:
         self.set_status("")
         if not any(logs.values()):
-            messagebox.showinfo("No log yet", "The game has not written a log on this phone yet.\n\n"
-                                              "Start it once, then try again.", parent=self)
+            m.ask(self, "No log yet", "The game has not written a log on this phone yet.\n\nStart it once, then "
+                                      "try again.")
             return
-        window = tk.Toplevel(self, bg=BG, padx=14, pady=12)
-        window.title(f"Log from the phone · {self.game.label if self.game else self.package}")
-        window.geometry(f"{self.px(860)}x{self.px(560)}")
         exit_text = (logs.get("exit.txt") or "").strip()
-        summary = (f"The game stopped ({exit_text})." if exit_text else "The game is still running or was killed.")
-        self._label(window, summary, 11, bold=True).pack(fill="x")
-        self._label(window, "Send this text to whoever helps you; it shows where the game stopped.", 10,
-                    MUTED).pack(fill="x", pady=(0, 8))
-        text = ScrolledText(window, font=("Consolas", 9), bg="#1d1b20", fg="#e6e0e9", relief="flat")
-        text.pack(fill="both", expand=True)
+        summary = f"The game stopped ({exit_text})." if exit_text else "The game is still running or was killed."
+        dialog = m.Dialog(self, f"Log from the phone · {self.game.label if self.game else self.package}",
+                          "Game log", width=820)
+        m.Label(dialog.body, summary, "subtitle", wrap=px(772)).pack(fill="x")
+        m.Label(dialog.body, "Send this text to whoever helps you. It shows where the game stopped.", "body",
+                C.on_surface_variant, wrap=px(772)).pack(fill="x", pady=(0, px(10)))
         combined = []
         for name in ("err.txt", "out.txt"):
             body = logs.get(name)
@@ -999,56 +991,48 @@ class Helper(tk.Tk):
                 lines = body.splitlines()
                 combined.append(f"===== {name} (last {min(400, len(lines))} of {len(lines)} lines) =====")
                 combined.extend(lines[-400:])
-        text.insert("end", "\n".join(combined))
-        text.see("end")
-        text.config(state="disabled")
-        buttons = tk.Frame(window, bg=BG)
-        buttons.pack(fill="x", pady=(8, 0))
+        view = m.LogView(dialog.body, height=18)
+        view.pack(fill="both", expand=True)
+        view.set_text("\n".join(combined))
 
         def copy():
             self.clipboard_clear()
             self.clipboard_append("\n".join(combined))
+            self.snack.show("Log copied.")
 
         def save():
-            target = filedialog.asksaveasfilename(parent=window, defaultextension=".txt",
+            target = filedialog.asksaveasfilename(parent=dialog, defaultextension=".txt",
                                                   initialfile="xnuroid-log.txt", filetypes=[("Text", "*.txt")])
             if target:
                 Path(target).write_text("\n".join(combined), encoding="utf-8")
 
-        ttk.Button(buttons, text="Copy", style="Soft.TButton", command=copy).pack(side="left")
-        ttk.Button(buttons, text="Save to file…", style="Soft.TButton", command=save).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Close", style="Soft.TButton", command=window.destroy).pack(side="right")
+        dialog.add_action("Close", True)
+        save_button = m.Button(dialog.actions, "Save to file…", save, kind="text")
+        save_button.pack(side="right")
+        m.Button(dialog.actions, "Copy", copy, kind="tonal").pack(side="right", padx=(0, px(8)))
+        dialog.present()
 
     def save_apk(self) -> None:
-        apk = self.project / "build" / "xnuroid.apk"
-        name = f"{self.game.label if self.game else 'xnuroid'}.apk"
-        target = filedialog.asksaveasfilename(parent=self, defaultextension=".apk", initialfile=name,
+        source = Path(self.apk_path())
+        if not source.is_file():
+            m.ask(self, "No APK found", f"There is no file at\n{source}")
+            return
+        name = "".join(ch for ch in (self.game.label if self.game else "xnuroid") if ch.isalnum() or ch in " -_")
+        target = filedialog.asksaveasfilename(parent=self, defaultextension=".apk", initialfile=f"{name.strip()}.apk",
                                               filetypes=[("Android app", "*.apk")])
-        if not target:
-            return
-        try:
-            shutil.copyfile(apk, target)
-        except OSError as error:
-            messagebox.showerror("Could not save", str(error), parent=self)
-            return
-        self.set_status(f"Saved to {target}. Copy it to any 64-bit Android 12+ phone to install.", GOOD)
+        if target:
+            try:
+                shutil.copyfile(source, target)
+                self.snack.show("APK saved.")
+            except OSError as error:
+                m.ask(self, "Could not save", str(error))
 
-    def uninstall(self) -> None:
-        if not messagebox.askyesno("Remove from phone",
-                                   f"Remove '{self.game.label if self.game else self.package}' from your phone?\n\n"
-                                   "Its saved progress on the phone is deleted too.", parent=self):
-            return
-        phone, package = self.selected_phone(), self.package
-
-        def work(_job):
-            return self.adb.uninstall(phone.serial, package)
-
-        def done(out):
-            ok = "Success" in out
-            self.set_status("Removed from your phone." if ok else "It was not installed on this phone.",
-                            GOOD if ok else WARN)
-
-        self.run_job("Removing the game from your phone…", work, done)
+    def show_apk_folder(self) -> None:
+        apk = Path(self.apk_path())
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(apk)])
+        else:
+            webbrowser.open(apk.parent.as_uri())
 
 
 def ask_project() -> Path | None:

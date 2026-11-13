@@ -12,6 +12,9 @@ The Android app is the playable host. It runs the same loader as a `NativeActivi
 ```
 
 The first command builds `build/xnuroid.apk`. The `install` command builds, installs, and launches the app.
+By default the loader follows the build's scene order past a splash scene whose video never prepares, so the game
+starts at its main menu. `KEEP_SPLASH=1 ./build_apk.sh` keeps that splash instead, and the helper has the same
+`Skip the launch video` tick box; the built APK then carries `LOADER_NO_VIDEO_SKIP=1` as its default.
 
 The game bundle configured in `tools/game_config.py` is packaged into the APK as `assets/game/`, so the APK is
 self-contained and can be installed on any arm64 device. The build also writes `assets/game.files` (the file list)
