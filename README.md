@@ -1,6 +1,6 @@
 # xnuroid
 
-xnuroid runs a decrypted iOS arm64 Mach-O: a Unity IL2CPP game inside a normal Android arm64
+xnuroid runs an iOS arm64 Mach-O whose code is already readable: a Unity IL2CPP game inside a normal Android arm64
 process. The iOS image is mapped, rebound, and executed natively. Calls into Darwin libc, dyld, Mach,
 pthread, Foundation, UIKit, Metal, and AudioUnit are handled by assembly trampolines, shims, fake
 objects, or translation layers.
@@ -68,7 +68,7 @@ every function or only offsets listed in a file.
 - Android NDK `28.2.13676358`
 - Android SDK build-tools `36.1.0` (or newer; scripts will fallback to the newest installed version) and platform `android-36`
 - An arm64 Android device, API 31 or newer
-- A **decrypted** IPA containing an arm64 Unity IL2CPP build (FairPlay encryption is not handled)
+- An IPA whose code is already readable, containing an arm64 Unity IL2CPP build (xnuroid never removes platform protection)
 
 The build scripts default the SDK location to `%LOCALAPPDATA%\Android\Sdk`
 (overridable with `ANDROID_SDK`). Edit the version variables if your SDK differs.
@@ -76,7 +76,7 @@ The build scripts default the SDK location to `%LOCALAPPDATA%\Android\Sdk`
 ### Pointing the analysis scripts at your IPA
 
 The scripts in `tools/` read the guest bundle location from
-`game_config.py`, which ships empty. Extract your decrypted IPA and create a
+`game_config.py`, which ships empty. Extract your IPA and create a
 local, git-ignored `game_config_local.py` beside it:
 
 ```python
@@ -97,7 +97,7 @@ without a terminal. Put the exe in the repository folder and open it, or drop an
 - Watches for a USB-debugging phone and reports unauthorized, non-arm64, or pre-Android 12 devices.
 - Takes an `.ipa`, an unpacked folder, a `Payload` folder, or a `.app`. IPAs are unpacked into `games/`. It reads the
   `cryptid` of every `LC_ENCRYPTION_INFO(_64)` command in the main executable and the bundled frameworks, and refuses
-  App Store copies that are still FairPlay encrypted.
+  copies whose code the platform still protects.
 - Writes `tools/game_config_local.py`, runs `./build_apk.sh install`, and reads `err.txt` / `out.txt` from the phone if
   the game closes right after launch. The last build log is kept in `build/helper_last_build.log`.
 
@@ -169,6 +169,13 @@ Note on development: This project is a 24 hour proof of concept generated using 
 
 See the [environment variables](docs/environment-variables.md) reference.
 
+## Rendering
+
+The Metal-to-GLES renderer is mapped in [graphics-pipeline.md](docs/graphics-pipeline.md): object model,
+per-frame call flow, function anchors, shader-translation rules and the measured invariants. The
+[rendering investigation](docs/rendering-investigation.md) log holds the per-title measurements, the
+diagnostic procedures (frame dumps, SOLID/coverage proofs, draw censuses) and the open questions.
+
 ## Test harness
 run_matrix.txt defines device runs as name|environment. The current entries are the default run
 and an engine-7/FDE run.
@@ -194,6 +201,6 @@ call-site unwinding but not a full replacement for compact unwind. Managed excep
 PARTIAL.
 - Unresolved imports remain. Calls to unresolved functions abort through shim_unresolved;
 unresolved data imports read from poison pages.
-- No FairPlay decryption. The input executable must already be decrypted.
+- No platform decryption. xnuroid never removes protection; the executable must already be readable.
 - No arm64e or pointer authentication support. The tested guest is arm64.
 - The CLI path is diagnostic. The playable experience is the APK host.

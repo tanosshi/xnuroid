@@ -138,6 +138,9 @@ static std::unordered_map<uint64_t, std::string> g_fake_born, g_fake_dead;
 static std::mutex g_grave_mu;
 static std::vector<Grave> g_graves;
 static std::atomic<uint64_t> g_present_count{0};   // advanced per presented frame (mtl_gles.hpp)
+static std::atomic<uint64_t> g_guest_msgs{0};      // every guest -> host message dispatch (activity meter)
+static std::mutex g_sel_mu;                       // LOADER_SELECTOR_COUNTS
+static std::unordered_map<std::string, uint64_t> g_sel_counts;
 static std::atomic<int> g_drawable_count{3};       // CAMetalLayer pool size (fake_uikit.hpp); LOADER_PRESENT_CTL can change it
 static void fake_release(uint64_t h) {
     FakeObjcObj* o = h ? fake_lookup(h) : nullptr;
@@ -278,6 +281,22 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
 
     if (mtl_gles_message(frame, sel, self)) return true;
 
+    // MTLRenderPassDescriptor attachments: guest code indexes colorAttachments[0] and sets its texture plus the
+    // load/store actions, and begin_pass() reads them back through child(). Answering nil leaves the pass without the
+    // drawable's texture as a render target, so Unity renders offscreen and never presents the drawable.
+    if (self && (sel == "colorAttachments" || sel == "depthAttachment" || sel == "stencilAttachment")) {
+        auto cached = self->props.find(sel);
+        uint64_t arr = cached != self->props.end() ? cached->second : 0;
+        if (!arr) {
+            FakeObjcObj* a = fake_metal_bag(&arr);
+            a->parent_owned = true;
+            fake_retain(arr);   // the descriptor keeps it across frames; unretained it is reaped and the pass goes empty
+            self->props[sel] = arr;
+        }
+        frame.ret_x0 = arr;
+        return true;
+    }
+
     // class-style constructors for descriptors
     if (sel == "texture2DDescriptorWithPixelFormat:width:height:mipmapped:" || sel == "textureCubeDescriptorWithPixelFormat:size:mipmapped:" ||
         sel == "textureBufferDescriptorWithPixelFormat:width:usage:") {
@@ -291,7 +310,10 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         d->props["depth"] = 1; d->props["arrayLength"] = 1; d->props["sampleCount"] = 1;
         frame.ret_x0 = h; return true;
     }
-    if (self && !is_class && self->kind == 3) {
+    // kind 5 descriptors (MTLRenderPipelineDescriptor, MTLDepthStencilDescriptor, ... created with +new) must store
+    // their properties too: without setVertexFunction:/setFragmentFunction: every pipeline is built empty and
+    // nothing draws.
+    if (self && !is_class && (self->kind == 3 || self->kind == 5)) {
         if (sel == "name") { frame.ret_x0 = fake_make(2, self->s == "device" ? "FakeGPU" : "fake"); return true; }
         if (sel == "description") { frame.ret_x0 = fake_make(2, "FakeMetalObject"); return true; }
         if (sel == "retain") { fake_retain(frame.x[0]); frame.ret_x0 = frame.x[0]; return true; }
@@ -390,6 +412,7 @@ static bool fake_metal_message(CallFrame& frame, const std::string& sel) {
         }
     }
     if (starts("new") || starts("make") || starts("heap") || sel == "device" || sel == "commandBuffer" ||
+        sel == "commandBufferWithDescriptor:" ||   // iOS 14+: a nil command buffer means Unity never encodes a frame
         sel == "commandBufferWithUnretainedReferences" || sel == "blitCommandEncoder" ||
         starts("renderCommandEncoderWith") || sel == "computeCommandEncoder" || sel == "parallelRenderCommandEncoderWithDescriptor:" ||
         sel == "commandQueue" || sel == "nextDrawable" || sel == "texture" || sel == "drawable") {
@@ -414,6 +437,26 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
             frame.ret_x0 = frame.x[0];
             return true;
         }
+    }
+    // Metal stand-ins must report the protocols a real Metal object adopts: Unity asks conformsToProtocol: on every
+    // resource it binds, and a NO answer sends it down a fallback path for an object that really is a texture.
+    if (sel == "conformsToProtocol:") {
+        FakeObjcObj* who = fake_lookup(frame.x[0]);
+        const char* pn = frame.x[2] ? *reinterpret_cast<const char**>(frame.x[2] + 8) : nullptr;
+        const std::string proto = pn ? pn : "?";
+        const bool yes = proto.rfind("MTL", 0) == 0 || proto == "NSObject" || proto == "NSCopying";
+        static std::mutex mu;
+        static std::unordered_set<std::string> seen;
+        bool first;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            first = seen.insert((who ? who->s : std::string("?")) + " -> " + proto).second;
+        }
+        if (first)
+            fprintf(stderr, "[OBJC] conformsToProtocol: %s / %s -> %d\n", who ? who->s.c_str() : "?", proto.c_str(),
+                    yes ? 1 : 0);
+        frame.ret_x0 = yes ? 1 : 0;
+        return true;
     }
     if (fake_uikit_message(frame, sel)) return true;
     FakeObjcObj* self = fake_lookup(frame.x[0]);
@@ -490,6 +533,10 @@ static bool fake_foundation(CallFrame& frame, const std::string& sel) {
         return true;
     }
     if (self && self->kind == 5) {      // generic foreign object (NSMutableArray, UIView, ...): inert, answers nil/0
+        // Metal descriptors are not inert: their properties (pipeline state, depth/stencil, and the render pass
+        // attachments that carry the drawable's texture) are read back by begin_pass(). Answering nil made Unity
+        // render offscreen and never present the drawable.
+        if (self->s.compare(0, 3, "MTL") == 0 && fake_metal_message(frame, sel)) return true;
         bool keep = sel.compare(0, 4, "init") == 0 || sel == "retain" || sel == "autorelease" || sel == "self" || sel == "copy" ||
                     sel == "mutableCopy" || sel == "alloc";
         frame.ret_x0 = keep ? frame.x[0] : 0;

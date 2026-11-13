@@ -393,6 +393,7 @@ private:
     std::map<std::string, int> block_index_;
     std::map<std::string, Texture> textures_;
     std::map<std::string, int> samplers_;
+    std::map<std::string, std::string> aggregate_return_;   // local stage-output value -> out assignments
     std::map<std::string, std::string> builtins_;   // param name -> GLSL expression
     std::string stage_in_struct_;
     std::map<std::string, SamplerUse> pairs_;       // uniform -> use
@@ -528,9 +529,20 @@ private:
         while (s0 < eq && (toks_[sig[s0]].s == "constexpr" || toks_[sig[s0]].s == "constant" || toks_[sig[s0]].s == "static" ||
                            toks_[sig[s0]].s == "const"))
             ++s0;
-        if (eq >= sig.size() || s0 + 1 >= eq) return fail("unparsed global constant");
+        if (s0 + 1 >= sig.size()) return fail("unparsed global constant");
         std::string type = toks_[sig[s0]].s;
         std::string name = toks_[sig[s0 + 1]].s;
+        if (eq >= sig.size()) {
+            // Metal allows a file-scope sampler: `constexpr sampler blit_tex( address::clamp_to_edge, filter::linear );`.
+            // GLSL has no equivalent declaration (sampler state is bound alongside the texture), so remember the name
+            // for sample() calls and emit nothing.
+            if (type == "sampler") {
+                samplers_[name] = 0;
+                i = semi + 1;
+                return true;
+            }
+            return fail("unparsed global constant: " + type + " " + name);
+        }
         bool array = eq > s0 + 2 && toks_[sig[s0 + 2]].s == "[";
         size_t vb = sig[eq] + 1;
         std::string init = trim(join(toks_, vb, semi));
@@ -990,6 +1002,29 @@ private:
                     }
                 }
             }
+            // statement: <StageStruct> local = { field0, field1, ... };  (shaders that build the stage output as a value
+            // and then `return local;` — GLSL has no such struct, so the initialiser becomes the out assignments)
+            if (toks_[s].k == Tok::Id && structs_.count(toks_[s].s)) {
+                const size_t nm = next_sig(toks_, s + 1);
+                const size_t eq = nm < body_e_ ? next_sig(toks_, nm + 1) : body_e_;
+                const size_t ob = eq < body_e_ && is(toks_, eq, "=") ? next_sig(toks_, eq + 1) : body_e_;
+                if (nm < body_e_ && ob < body_e_ && is(toks_, ob, "{")) {
+                    const std::string type = toks_[s].s;
+                    const std::vector<Field>& fields = structs_[type].fields;
+                    const size_t cb = match(toks_, ob);
+                    const size_t semi = next_sig(toks_, cb + 1);
+                    if (cb < body_e_ && is(toks_, semi, ";")) {
+                        const auto elems = split_args(toks_, ob + 1, cb);
+                        std::string asg;
+                        for (size_t k = 0; k < elems.size() && k < fields.size(); ++k)
+                            asg += io_name(true, fields[k].name) + " = " + trim(rewrite(elems[k].first, elems[k].second)) + "; ";
+                        aggregate_return_[toks_[nm].s] = asg;
+                        out += asg;
+                        i = semi + 1;
+                        continue;
+                    }
+                }
+            }
             // ordinary token run up to the next statement boundary
             size_t e = s;
             int depth = 0;
@@ -1009,6 +1044,8 @@ private:
     // `(Struct){ .field = value, ... }`, or a plain value for a non-struct return type.
     std::string return_value(size_t b, size_t e) {
         if (b >= e || (is(toks_, b, "output") && next_sig(toks_, b + 1) >= e)) return "";
+        if (toks_[b].k == Tok::Id && next_sig(toks_, b + 1) >= e && aggregate_return_.count(toks_[b].s))
+            return aggregate_return_[toks_[b].s];   // `return local;` for an aggregate built earlier
         if (is(toks_, b, "(")) {
             size_t cp = match(toks_, b);
             size_t ob = next_sig(toks_, cp + 1);

@@ -19,13 +19,23 @@
 #include <cstdarg>
 #include <map>
 #include <set>
+#include <mutex>
 #include <tuple>
 
 #include "msl_glsl.hpp"
 #include "pvrtc.hpp"
 #include "pvrtc_gpu.hpp"
 
+#include <thread>
+
 namespace mtlgl {
+
+inline std::atomic<uint64_t> g_draws_frame{0};        // draws issued since the last dumped frame
+inline std::atomic<uint64_t> g_last_big_target{0};    // target texture of the last full-size draw
+inline std::atomic<uint64_t> g_last_big_target_obj{0};  // metal texture object of the last full-size render pass
+inline std::atomic<uint64_t> g_presented_drawable{0};  // the CAMetalDrawable most recently presented
+// pass/draw census, drained by the frame dump: depth-attached passes are the ones a camera renders into
+inline std::atomic<uint64_t> g_passes_depth{0}, g_passes_nodepth{0}, g_draws_depth{0}, g_draws_nodepth{0};
 
 // ---- formats ----
 struct Fmt {
@@ -168,6 +178,7 @@ struct Blend {
 };
 struct Pipeline {
     GLuint prog = 0;
+    std::string vs_name, fs_name;   // MTLFunction names, for diagnostics
     msl::Shader vs, fs;
     std::vector<Attr> attrs;
     std::map<uint64_t, Layout> layouts;
@@ -187,6 +198,34 @@ struct BoundBuf {
         return static_cast<const uint8_t*>(buf->mem) + offset;
     }
 };
+// LOADER_PASS_TRACE: what the guest did inside one pass, accumulated between the encoder's begin and endEncoding.
+struct PassTrace {
+    int id = 0;                       // 1-based pass number; 0 when the pass is not observed
+    int w = 0, h = 0, colors = 0;
+    bool depth = false, valid = false;
+    int pipe_sets = 0, pipe_extra = 0;
+    std::vector<std::pair<std::string, int>> pipes;   // "vs" / "fs" prog N -> times set
+    struct Bound {
+        int idx = 0;
+        uint64_t obj = 0, off = 0;
+        int n = 0, texid = 0, tw = 0, th = 0;
+        uint64_t pf = 0;
+        bool bytes = false;
+    };
+    std::vector<Bound> vb, fb, vt, ft;
+    int vp_sets = 0;
+    double vpv[6] = {0, 0, 0, 0, 0, 1};
+    int sc_sets = 0;
+    uint64_t scv[4] = {0, 0, 0, 0};
+    int ds_sets = 0;
+    uint64_t ds_obj = 0;
+    int ds_func = -1, ds_write = 0, ds_stencil = 0;
+    int draws = 0, rejected = 0, draw_extra = 0, reject_extra = 0;
+    std::vector<std::pair<std::string, int>> drawlog, rejects;
+    Tex* sampled = nullptr;           // first texture the fragment stage sampled on an accepted draw
+    std::string last_vs, last_fs;     // pipeline of the last accepted draw
+};
+
 struct Encoder {
     Pipeline* pipe = nullptr;
     BoundBuf vbuf[32], fbuf[32];
@@ -202,6 +241,7 @@ struct Encoder {
     struct Resolve { GLuint src_tex, dst_tex; int w, h; GLenum attach; } resolve[8];
     int nresolve = 0;
     int draws = 0;
+    PassTrace pass;   // LOADER_PASS_TRACE: what the guest did in this pass
 };
 
 inline std::mutex g_gl_mu;
@@ -431,6 +471,17 @@ inline Tex* texture(FakeObjcObj* o) {
     t->w = static_cast<int>(std::max<uint64_t>(1, prop(o, "width", 1)));
     t->h = static_cast<int>(std::max<uint64_t>(1, prop(o, "height", 1)));
     t->d = static_cast<int>(std::max<uint64_t>(1, prop(o, "depth", 1)));
+    if (t->w <= 1 && t->h <= 1) {
+        static std::atomic<int> tiny{0};
+        if (tiny++ < 2) {
+            fprintf(stderr, "[MTLGL] texture realized 1x1: pixelFormat %llu, %zu properties, class %s\n",
+                    static_cast<unsigned long long>(t->pf), o->props.size(), o->s.c_str());
+            for (const auto& kv : o->props) {
+                if (kv.first.empty() || kv.first[0] == '#') continue;
+                fprintf(stderr, "[MTLGL]     prop %s = %llu\n", kv.first.c_str(), static_cast<unsigned long long>(kv.second));
+            }
+        }
+    }
     t->levels = static_cast<int>(std::max<uint64_t>(1, prop(o, "mipmapLevelCount", 1)));
     int full_chain = 1;   // glTexStorage rejects more levels than the size has
     for (int m = std::max(std::max(t->w, t->h), prop(o, "textureType", 2) == 7 ? t->d : 1); m > 1; m >>= 1) ++full_chain;
@@ -729,6 +780,13 @@ inline Pipeline* make_pipeline(FakeObjcObj* desc) {
     auto* p = new Pipeline();
     FakeObjcObj* vf = fake_lookup(prop(desc, "vertexFunction", 0));
     FakeObjcObj* ff = fake_lookup(prop(desc, "fragmentFunction", 0));
+    {
+        static std::atomic<int> calls{0};
+        const int call = calls++;
+        if (call < 12)
+            fprintf(stderr, "[MTLGL] make_pipeline #%d vf=%s ff=%s%s\n", call, vf ? vf->s.c_str() : "(none)",
+                    ff ? ff->s.c_str() : "(none)", desc ? "" : " (no descriptor)");
+    }
     auto source_of = [](FakeObjcObj* fn, std::string& src, FakeObjcObj*& opts) {
         FakeObjcObj* lib = fn ? fake_lookup(prop(fn, "#library", 0)) : nullptr;
         if (!lib) return false;
@@ -738,26 +796,65 @@ inline Pipeline* make_pipeline(FakeObjcObj* desc) {
     };
     std::string vsrc, fsrc;
     FakeObjcObj *vo = nullptr, *fo = nullptr;
-    if (!source_of(vf, vsrc, vo)) { fprintf(stderr, "[MTLGL] pipeline without vertex function source\n"); return p; }
+    if (!source_of(vf, vsrc, vo)) {
+        uint64_t fnh = prop(desc, "vertexFunction", 0), libh = vf ? prop(vf, "#library", 0) : 0;
+        FakeObjcObj* lib = fake_lookup(libh);
+        fprintf(stderr, "[MTLGL] pipeline without vertex function source (fn %#llx props %zu, lib %#llx source %zu)\n",
+                static_cast<unsigned long long>(fnh), vf ? vf->props.size() : 0, static_cast<unsigned long long>(libh),
+                lib ? lib->s.size() : 0);
+        return p;
+    }
+    p->vs_name = vf->s;
+    p->fs_name = ff ? ff->s : std::string();
     p->vs = msl::translate(vsrc, macros_of(vo), clip_control(), vf->s);
     bool have_fs = source_of(ff, fsrc, fo);
     if (have_fs) p->fs = msl::translate(fsrc, macros_of(fo), clip_control(), ff->s);
     else p->fs.ok = true, p->fs.glsl = "#version 320 es\nvoid main() {}\n";
     if (!p->vs.ok) { dump_failed_shader("vertex translation", vsrc, "", p->vs.error); return p; }
     if (!p->fs.ok) { dump_failed_shader("fragment translation", fsrc, "", p->fs.error); return p; }
-    if (getenv("LOADER_GL_SOLID") && p->fs.glsl.find("o_SV_Target0") != std::string::npos) {   // geometry debug: solid magenta
-        size_t end = p->fs.glsl.rfind('}');
-        p->fs.glsl.insert(end, "o_SV_Target0 = vec4(1.0, 0.0, 1.0, 1.0);\n");
-        static const std::string solid = "{o_SV_Target0 = vec4(1.0, 0.0, 1.0, 1.0); return;}";
-        for (size_t r = p->fs.glsl.find("return;"); r != std::string::npos; r = p->fs.glsl.find("return;", r + solid.size())) {
-            p->fs.glsl.replace(r, 7, solid);
+    if (getenv("LOADER_GL_SOLID")) {   // geometry debug: every fragment writes magenta, so coverage is visible
+        std::string& g = p->fs.glsl;
+        std::string outname;
+        for (size_t i = g.find("out "); i != std::string::npos; i = g.find("out ", i + 4)) {
+            const size_t semi = g.find(';', i);
+            if (semi == std::string::npos) break;
+            const std::string decl = g.substr(i, semi - i);
+            if (decl.find("vec4") == std::string::npos) continue;
+            const size_t sp = decl.find_last_of(" \t\n", decl.find("vec4") + 4);
+            if (sp == std::string::npos) continue;
+            outname = decl.substr(sp + 1);
+            while (!outname.empty() && (outname.back() == ' ' || outname.back() == '\t' || outname.back() == '\n')) outname.pop_back();
+            if (!outname.empty()) break;
         }
+        if (!outname.empty()) {
+            const std::string force = outname + " = vec4(1.0, 0.0, 1.0, 1.0);\n";
+            g.insert(g.rfind('}'), force);
+            const std::string solid = "{" + force + "return;}";
+            for (size_t r = g.find("return;"); r != std::string::npos && r < g.rfind('}'); r = g.find("return;", r + solid.size()))
+                g.replace(r, 7, solid);
+            static std::atomic<int> n{0};
+            if (n++ < 3) fprintf(stderr, "[MTLGL] SOLID: forcing %s magenta\n", outname.c_str());
+        } else {
+            static std::atomic<int> n{0};
+            if (n++ < 2) fprintf(stderr, "[MTLGL] SOLID: no vec4 output in fragment shader (%zu bytes)\n", g.size());
+        }
+    }
+    if (getenv("LOADER_GL_SOLID_VS")) {   // geometry debug: ignore the vertex transform, cover the whole target
+        std::string& g = p->vs.glsl;
+        const size_t end = g.rfind('}');
+        if (end != std::string::npos)
+            g.insert(end, "gl_Position = vec4(vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)) * 2.0 - 1.0, 0.0, 1.0);\n");
     }
     std::string log;
     GLuint vs = compile(GL_VERTEX_SHADER, p->vs.glsl, log);
     if (!vs) { dump_failed_shader("vertex compile", vsrc, p->vs.glsl, log); return p; }
     GLuint fs = compile(GL_FRAGMENT_SHADER, p->fs.glsl, log);
-    if (!fs) { dump_failed_shader("fragment compile", fsrc, p->fs.glsl, log); glDeleteShader(vs); return p; }
+    if (!fs) {
+        fprintf(stderr, "[MTLGL] fragment compile failed (%s): %.300s\n", p->fs_name.c_str(), log.c_str());
+        dump_failed_shader("fragment compile", fsrc, p->fs.glsl, log);
+        glDeleteShader(vs);
+        return p;
+    }
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
@@ -781,6 +878,18 @@ inline Pipeline* make_pipeline(FakeObjcObj* desc) {
     for (const msl::BlockUse& b : p->fs.blocks) { glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, b.block.c_str()), binding); p->fs_bind.push_back(binding++); }
     glUseProgram(0);
     p->prog = prog;
+    {
+        static std::atomic<int> made{0};
+        if (made++ < 12) fprintf(stderr, "[MTLGL] pipeline %s / %s -> prog %u\n", p->vs_name.c_str(), p->fs_name.c_str(), prog);
+    }
+    {
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> l(mu);
+        const std::string key = p->vs_name + " / " + p->fs_name;
+        if (seen.insert(key).second)
+            fprintf(stderr, "[MTLGL] pipeline new #%zu: %s -> prog %u\n", seen.size(), key.c_str(), prog);
+    }
     // vertex layout
     FakeObjcObj* vd = fake_lookup(prop(desc, "vertexDescriptor", 0));
     if (getenv("LOADER_GL_TRACE")) {
@@ -937,9 +1046,295 @@ inline void tex_profile_frame(uint64_t n) {
     g_seq.clear();
 }
 
+inline bool debug_clear_size_ok(int w, int h) {   // one-shot fuller-frame dump right after the clears
+    static std::atomic<int> n{0};
+    return w > 100 && h > 100 && n++ < 2;
+}
+
+// ---- LOADER_PASS_TRACE: what the guest does inside a pass -------------------------------------------------------
+// Recorded between renderCommandEncoderWithDescriptor: and endEncoding, printed once per pass (max 12 per run) as one
+// block: state bound, every draw entry point, draws dropped before rasterising with the code's reason, then the pass
+// size and its final draw count. LOADER_PASS_TEX_DUMP=<frame> reuses the same observation for its texture dump.
+inline bool pass_tracing() {
+    static const bool on = [] {
+        const char* v = getenv("LOADER_PASS_TRACE");
+        return v && v[0] && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+inline bool pass_tex_dump_wanted() {
+    static const bool on = getenv("LOADER_PASS_TEX_DUMP") != nullptr;
+    return on;
+}
+inline bool pass_observe() {
+    static const bool on = pass_tracing() || pass_tex_dump_wanted();
+    return on;
+}
+// The GL texture behind a bound texture handle (follows texture views), without realizing a new one.
+inline Tex* trace_tex(uint64_t handle) {
+    FakeObjcObj* o = handle ? fake_lookup(handle) : nullptr;
+    for (int i = 0; o && i < 4; ++i) {
+        if (Tex* t = gl_obj<Tex>(o)) return t;
+        const uint64_t src = prop(o, "#viewOf", 0);
+        o = src ? fake_lookup(src) : nullptr;
+    }
+    return nullptr;
+}
+inline void pass_note_pipe(Encoder* e, uint64_t handle) {
+    ++e->pass.pipe_sets;
+    Pipeline* p = gl_obj<Pipeline>(fake_lookup(handle));
+    const std::string key = p ? "\"" + p->vs_name + "\" / \"" + p->fs_name + "\" prog " + std::to_string(p->prog) : std::string("(null pipeline)");
+    for (auto& kv : e->pass.pipes)
+        if (kv.first == key) { ++kv.second; return; }
+    if (e->pass.pipes.size() < 6) e->pass.pipes.push_back({key, 1});
+    else ++e->pass.pipe_extra;
+}
+inline void pass_note_ds(Encoder* e, uint64_t handle) {
+    ++e->pass.ds_sets;
+    e->pass.ds_obj = handle;
+    DepthStencil* ds = gl_obj<DepthStencil>(fake_lookup(handle));
+    e->pass.ds_func = ds ? static_cast<int>(ds->depth_func) : -1;
+    e->pass.ds_write = ds && ds->depth_write;
+    e->pass.ds_stencil = ds && ds->stencil;
+}
+inline void pass_note_viewport(Encoder* e, const double* v) {
+    ++e->pass.vp_sets;
+    for (int i = 0; i < 6; ++i) e->pass.vpv[i] = v[i];
+}
+inline void pass_note_scissor(Encoder* e, const uint64_t* r) {
+    ++e->pass.sc_sets;
+    for (int i = 0; i < 4; ++i) e->pass.scv[i] = r[i];
+}
+inline void pass_note_bind(PassTrace& pt, bool vtx, int idx, uint64_t obj, uint64_t off) {
+    std::vector<PassTrace::Bound>& v = vtx ? pt.vb : pt.fb;
+    for (auto& b : v)
+        if (!b.bytes && b.idx == idx && b.obj == obj && b.off == off) { ++b.n; return; }
+    if (v.size() < 8) v.push_back(PassTrace::Bound{idx, obj, off, 1, 0, 0, 0, 0, false});
+}
+inline void pass_note_bytes(PassTrace& pt, bool vtx, int idx, uint64_t len) {
+    std::vector<PassTrace::Bound>& v = vtx ? pt.vb : pt.fb;
+    for (auto& b : v)
+        if (b.bytes && b.idx == idx && b.obj == len) { ++b.n; return; }
+    if (v.size() < 8) v.push_back(PassTrace::Bound{idx, len, 0, 1, 0, 0, 0, 0, true});
+}
+inline void pass_note_tex(PassTrace& pt, bool vtx, int idx, uint64_t handle) {
+    std::vector<PassTrace::Bound>& v = vtx ? pt.vt : pt.ft;
+    for (auto& b : v)
+        if (b.idx == idx && b.obj == handle) { ++b.n; return; }
+    if (v.size() < 8) {
+        Tex* t = trace_tex(handle);
+        v.push_back(PassTrace::Bound{idx, handle, 0, 1, t ? static_cast<int>(t->id) : 0, t ? t->w : 0, t ? t->h : 0, t ? t->pf : 0, false});
+    }
+}
+inline void pass_note_draw(Encoder* e, const std::string& text) {
+    for (auto& kv : e->pass.drawlog)
+        if (kv.first == text) { ++kv.second; return; }
+    if (e->pass.drawlog.size() < 8) e->pass.drawlog.push_back({text, 1});
+    else ++e->pass.draw_extra;
+}
+inline void pass_note_reject(Encoder* e, const std::string& why) {
+    if (!e) return;
+    ++e->pass.rejected;
+    for (auto& kv : e->pass.rejects)
+        if (kv.first == why) { ++kv.second; return; }
+    if (e->pass.rejects.size() < 8) e->pass.rejects.push_back({why, 1});
+    else ++e->pass.reject_extra;
+}
+// The reason the draw path gave for not rasterising; does not call ready() again (its skip counter advances per call).
+inline const char* draw_reject_reason(Encoder* e, uint64_t count) {
+    if (!count) return "count 0";
+    if (!e) return "no encoder";
+    if (!e->valid) return "framebuffer incomplete";
+    if (!e->pipe) return "no pipeline bound";
+    if (!e->pipe->prog) return "pipeline has no GL program";
+    return "dropped by LOADER_GL_SKIP_DRAW";
+}
+// First texture the fragment stage samples: what the draw actually reads.
+inline Tex* pass_sample_tex(Encoder* e) {
+    if (Pipeline* p = e->pipe)
+        for (const msl::SamplerUse& su : p->fs.samplers)
+            if (su.texture >= 0 && su.texture < 32)
+                if (Tex* t = trace_tex(e->ftex[su.texture])) return t;
+    return trace_tex(e->ftex[0]);
+}
+inline void pass_note_accepted(Encoder* e) {
+    ++e->pass.draws;
+    if (!e->pass.sampled) e->pass.sampled = pass_sample_tex(e);
+    if (e->pipe) {
+        e->pass.last_vs = e->pipe->vs_name;
+        e->pass.last_fs = e->pipe->fs_name;
+    }
+}
+inline std::string pass_draw_text(const char* entry, uint64_t prim, uint64_t start, uint64_t count, uint64_t inst) {
+    return std::string(entry) + " count=" + std::to_string(count) + " start=" + std::to_string(start) + " prim=" + std::to_string(prim) +
+           " inst=" + std::to_string(inst);
+}
+inline std::string pass_draw_indexed_text(uint64_t prim, uint64_t count, uint64_t type, uint64_t ibuf, uint64_t off, uint64_t inst) {
+    char h[32];
+    snprintf(h, sizeof h, "0x%llx", static_cast<unsigned long long>(ibuf));
+    return "drawIndexedPrimitives count=" + std::to_string(count) + " type=" + std::to_string(type) + " prim=" + std::to_string(prim) + " ibuf=" + h +
+           "+" + std::to_string(off) + " inst=" + std::to_string(inst);
+}
+inline void pass_trace_end(Encoder* e) {
+    if (!e || !e->pass.id || !pass_tracing()) return;
+    static std::mutex mu;
+    static int printed = 0;
+    std::string out;
+    {
+        std::lock_guard<std::mutex> l(mu);
+        if (printed >= 12) {
+            if (printed == 12) {
+                fprintf(stderr, "[PASSTRACE] 12 passes traced; no more (LOADER_PASS_TRACE is bounded)\n");
+                printed = 13;
+            }
+            return;
+        }
+        ++printed;
+        const PassTrace& p = e->pass;
+        auto add = [&out](const char* fmt, ...) {
+            char line[1024];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(line, sizeof line, fmt, ap);
+            va_end(ap);
+            out += line;
+        };
+        add("[PASSTRACE] pass %d %dx%d color=%d depth=%d valid=%d pipelineSets=%d\n", p.id, p.w, p.h, p.colors, p.depth ? 1 : 0,
+            p.valid ? 1 : 0, p.pipe_sets);
+        if (!p.pipes.empty()) {
+            std::string s;
+            for (const auto& kv : p.pipes) {
+                if (!s.empty()) s += ", ";
+                s += kv.first;
+                if (kv.second > 1) s += " x" + std::to_string(kv.second);
+            }
+            if (p.pipe_extra) s += " +" + std::to_string(p.pipe_extra) + " more";
+            add("[PASSTRACE]   pipeline %s\n", s.c_str());
+        }
+        auto binds = [](const std::vector<PassTrace::Bound>& v) {
+            std::string s;
+            for (const PassTrace::Bound& b : v) {
+                char one[128];
+                if (b.bytes) snprintf(one, sizeof one, " [%d]=bytes(%llu)", b.idx, static_cast<unsigned long long>(b.obj));
+                else snprintf(one, sizeof one, " [%d]=0x%llx+%llu", b.idx, static_cast<unsigned long long>(b.obj),
+                              static_cast<unsigned long long>(b.off));
+                s += one;
+                if (b.n > 1) s += " x" + std::to_string(b.n);
+            }
+            return s.empty() ? std::string("none") : s;
+        };
+        auto texts = [](const std::vector<PassTrace::Bound>& v) {
+            std::string s;
+            for (const PassTrace::Bound& b : v) {
+                char one[160];
+                if (b.texid)
+                    snprintf(one, sizeof one, " [%d]=0x%llx(gl tex %d %dx%d pf %llu)", b.idx, static_cast<unsigned long long>(b.obj), b.texid, b.tw,
+                             b.th, static_cast<unsigned long long>(b.pf));
+                else snprintf(one, sizeof one, " [%d]=0x%llx(no GL texture)", b.idx, static_cast<unsigned long long>(b.obj));
+                s += one;
+                if (b.n > 1) s += " x" + std::to_string(b.n);
+            }
+            return s.empty() ? std::string("none") : s;
+        };
+        add("[PASSTRACE]   vbuf %s\n[PASSTRACE]   fbuf %s\n", binds(p.vb).c_str(), binds(p.fb).c_str());
+        add("[PASSTRACE]   vtex %s\n[PASSTRACE]   ftex %s\n", texts(p.vt).c_str(), texts(p.ft).c_str());
+        if (p.vp_sets)
+            add("[PASSTRACE]   viewport %g,%g %gx%g znear %g zfar %g x%d\n", p.vpv[0], p.vpv[1], p.vpv[2], p.vpv[3], p.vpv[4], p.vpv[5],
+                p.vp_sets);
+        else add("[PASSTRACE]   viewport (never set; pass rect used)\n");
+        if (p.sc_sets)
+            add("[PASSTRACE]   scissor %llu,%llu %llux%llu x%d\n", static_cast<unsigned long long>(p.scv[0]),
+                static_cast<unsigned long long>(p.scv[1]), static_cast<unsigned long long>(p.scv[2]),
+                static_cast<unsigned long long>(p.scv[3]), p.sc_sets);
+        else add("[PASSTRACE]   scissor (never set; pass rect used)\n");
+        if (p.ds_sets)
+            add("[PASSTRACE]   depthstencil 0x%llx func 0x%x write %d stencil %d x%d\n", static_cast<unsigned long long>(p.ds_obj), p.ds_func,
+                p.ds_write, p.ds_stencil, p.ds_sets);
+        else add("[PASSTRACE]   depthstencil (never set; depth test off, no write)\n");
+        std::string d;
+        for (const auto& kv : p.drawlog) {
+            if (!d.empty()) d += ", ";
+            d += kv.first;
+            if (kv.second > 1) d += " x" + std::to_string(kv.second);
+        }
+        if (p.draw_extra) d += " +" + std::to_string(p.draw_extra) + " more";
+        add("[PASSTRACE]   draws %d: %s\n", p.draws, d.empty() ? "(no draw call)" : d.c_str());
+        if (p.rejected) {
+            std::string r;
+            for (const auto& kv : p.rejects) {
+                if (!r.empty()) r += ", ";
+                r += "\"" + kv.first + "\"";
+                if (kv.second > 1) r += " x" + std::to_string(kv.second);
+            }
+            if (p.reject_extra) r += " +" + std::to_string(p.reject_extra) + " more";
+            add("[PASSTRACE]   rejected %d: %s\n", p.rejected, r.c_str());
+        }
+        add("[PASSTRACE] end pass %d: %dx%d draws=%d rejected=%d\n", p.id, p.w, p.h, p.draws, p.rejected);
+    }
+    fputs(out.c_str(), stderr);
+    fflush(stderr);
+}
+// LOADER_PASS_TEX_DUMP=<frame>: at that frame, dump the texture the 1080x2340 no-depth pass (the guest's own
+// vertex/fragment pipeline over the screen target) samples, and print its colour histogram.
+inline void pass_tex_dump(Encoder* e) {
+    static const uint64_t want = getenv("LOADER_PASS_TEX_DUMP") ? strtoull(getenv("LOADER_PASS_TEX_DUMP"), nullptr, 10) : 0;
+    static bool done = false;
+    if (!e || !want || done || !e->pass.id || e->rt_w != 1080 || e->rt_h != 2340 || e->pass.depth) return;
+    const uint64_t frame = g_frame_no + 1;   // passes run before the commit that numbers the frame
+    if (frame != want) return;
+    Tex* t = e->pass.sampled;
+    if (!t && !e->pass.ft.empty()) t = trace_tex(e->pass.ft[0].obj);
+    done = true;
+    std::vector<uint8_t> px;
+    if (!t || !read_rgba(t, px) || px.empty()) {
+        fprintf(stderr, "[PASSTEX] frame %llu pass %d %dx%d: sampled texture %s not readable\n", static_cast<unsigned long long>(frame), e->pass.id,
+                e->rt_w, e->rt_h, t ? "(glReadPixels failed)" : "(none bound)");
+        return;
+    }
+    std::map<uint32_t, uint32_t> hist;
+    uint64_t other = 0;
+    const uint64_t np = px.size() / 4;
+    for (size_t i = 0; i + 3 < px.size(); i += 4) {
+        const uint32_t k = static_cast<uint32_t>(px[i]) << 24 | static_cast<uint32_t>(px[i + 1]) << 16 | static_cast<uint32_t>(px[i + 2]) << 8 | px[i + 3];
+        auto it = hist.find(k);
+        if (it != hist.end()) ++it->second;
+        else if (hist.size() < 4096) hist.emplace(k, 1);
+        else ++other;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> top(hist.begin(), hist.end());
+    std::sort(top.begin(), top.end(), [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) { return a.second > b.second; });
+    std::string s;
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        char one[64];
+        snprintf(one, sizeof one, "%08x %.2f%%%s", top[i].first, 100.0 * top[i].second / static_cast<double>(np),
+                 i + 1 < top.size() && i < 7 ? ", " : "");
+        s += one;
+    }
+    fprintf(stderr,
+            "[PASSTEX] frame %llu pass %d %dx%d vs \"%s\" fs \"%s\": samples tex %u %dx%d pf %llu, %llu px, %s%zu distinct colours, top: %s\n",
+            static_cast<unsigned long long>(frame), e->pass.id, e->rt_w, e->rt_h, e->pass.last_vs.c_str(), e->pass.last_fs.c_str(), t->id, t->w,
+            t->h, static_cast<unsigned long long>(t->pf), static_cast<unsigned long long>(np), other ? "4096+ (capped) " : "", hist.size(), s.c_str());
+    if (const char* dir = getenv("LOADER_FRAME_DIR")) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/pass_tex_f%llu_tex%u_%dx%d.png", dir, static_cast<unsigned long long>(frame), t->id, t->w, t->h);
+        const bool ok = gles::write_png(path, t->w, t->h, px.data());
+        fprintf(stderr, "[PASSTEX]   dumped %s (%s)\n", path, ok ? "ok" : "WRITE FAILED");
+    }
+}
 inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
     ThreadGL& g = tgl();
     if (!g.init) return;
+    {
+        static std::atomic<uint64_t> prev_draws{0};
+        static std::atomic<int> pseq{0};
+        if (pseq.load() < 24) {
+            if (pseq.load() > 0)
+                fprintf(stderr, "[MTLGL] pass %d issued %llu draws\n", pseq.load() - 1,
+                        static_cast<unsigned long long>(g_draws_frame.load() - prev_draws.load()));
+            prev_draws = g_draws_frame.load();
+            ++pseq;
+        }
+    }
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g.fbo);
     GLenum bufs[8];
     int nbufs = 0, w = 0, h = 0;
@@ -958,10 +1353,21 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
         int level = static_cast<int>(prop(c, "level", 0));
         int slice = static_cast<int>(t->target == GL_TEXTURE_3D ? prop(c, "depthPlane", 0) : prop(c, "slice", 0));
         attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, t, level, slice);
+        static std::atomic<int> at_logged{0};
+        if (at_logged++ < 8)
+            fprintf(stderr, "[MTLGL] attach color%d: tex %u target 0x%x internal 0x%x %dx%d level %d samples %d err 0x%x\n", i, t->id,
+                    t->target, t->f.internal, t->w, t->h, level, t->samples, glGetError());
+        if (t->w <= 4 && t->h <= 4) {
+            static std::atomic<int> tiny_passes{0};
+            if (tiny_passes++ < 8)
+                fprintf(stderr, "[MTLGL] tiny pass target: color tex %u %dx%d pf %llu\n", t->id, t->w, t->h,
+                        static_cast<unsigned long long>(t->pf));
+        }
         bufs[i] = GL_COLOR_ATTACHMENT0 + i;
         nbufs = i + 1;
         w = std::max(1, t->w >> level);
         h = std::max(1, t->h >> level);
+        if (w > 100 && h > 100 && prop(c, "texture", 0)) g_last_big_target_obj = prop(c, "texture", 0);
         if (prop(c, "loadAction", 0) == 2) {
             Clear cl{i, {propd(c, "#clear0", 0), propd(c, "#clear1", 0), propd(c, "#clear2", 0), propd(c, "#clear3", 1)}, t->f.integer};
             clears.push_back(cl);
@@ -971,6 +1377,17 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
         if (rt && e->nresolve < 8) e->resolve[e->nresolve++] = {t->id, rt->id, w, h, static_cast<GLenum>(GL_COLOR_ATTACHMENT0 + i)};
     }
     if (!nbufs) bufs[0] = GL_NONE;
+    if (!nbufs) {
+        static thread_local bool warned = false;
+        if (!warned) {   // where the attachment chain breaks: descriptor array, its first child, that child's texture
+            warned = true;
+            uint64_t arr = prop(pass, "colorAttachments", 0);
+            FakeObjcObj* c0 = fake_lookup(prop(fake_lookup(arr), "#obj0", 0));
+            fprintf(stderr, "[MTLGL] pass without color target: colorAttachments=%#llx child0=%p texture=%#llx\n",
+                    static_cast<unsigned long long>(arr), static_cast<void*>(c0),
+                    static_cast<unsigned long long>(c0 ? prop(c0, "texture", 0) : 0));
+        }
+    }
     glDrawBuffers(nbufs ? nbufs : 1, bufs);
     FakeObjcObj* da = fake_lookup(prop(pass, "depthAttachment", 0));
     FakeObjcObj* sa = fake_lookup(prop(pass, "stencilAttachment", 0));
@@ -978,6 +1395,7 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
     Tex* st = sa ? texture(fake_lookup(prop(sa, "texture", 0))) : nullptr;
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
     if (dt) { e->targets[8] = dt->id; ++dt->renders; }
+    (dt ? g_passes_depth : g_passes_nodepth) += 1;
     if (st) ++st->renders;
     if (tex_profiling()) ++g_texprof.renders;
     if (dt && st && dt == st && dt->f.stencil) {
@@ -993,6 +1411,47 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
     e->rt_h = h;
     GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
     e->valid = status == GL_FRAMEBUFFER_COMPLETE;
+    if (pass_observe()) {
+        static std::atomic<int> next{1};
+        e->pass.id = next++;
+        e->pass.w = w;
+        e->pass.h = h;
+        e->pass.colors = nbufs;
+        e->pass.depth = dt != nullptr;
+        e->pass.valid = e->valid;
+    }
+    static std::atomic<int> pass_logged{0};
+    if (pass_logged++ < 24) {
+        GLint bound = 0, obj = 0, objtype = 0, objlevel = 0, err = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &bound);
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &obj);
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &objtype);
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &objlevel);
+        err = glGetError();
+        GLint immutable = 0, is_tex = 0;
+        if (nbufs) {
+            glIsTexture(obj);
+            is_tex = glIsTexture(obj);
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(obj));
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
+        }
+        GLenum alt = 0;
+        if (status != GL_FRAMEBUFFER_COMPLETE) {   // same framebuffer with a texture known to be good
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.dummy2d, 0);
+            alt = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, static_cast<GLuint>(obj), 0);
+        }
+        const uint64_t ca_la = prop(child(pass, "colorAttachments", 0), "loadAction", 0);
+        const uint64_t ca_st = prop(child(pass, "colorAttachments", 0), "storeAction", 0);
+        fprintf(stderr,
+                "[MTLGL] pass %d: colors=%d depth=%d %dx%d status=0x%x fbo=%d att0=%d type=0x%x lvl=%d err=0x%x istex=%d immutable=%d "
+                "dummy_status=0x%x colorLA=%llu colorST=%llu clear=%g,%g,%g,%g depthLA=%llu\n",
+                pass_logged.load(), nbufs, dt != nullptr, w, h, status, bound, obj, objtype, objlevel, err, is_tex, immutable, alt,
+                static_cast<unsigned long long>(ca_la), static_cast<unsigned long long>(ca_st),
+                propd(child(pass, "colorAttachments", 0), "#clear0", 0), propd(child(pass, "colorAttachments", 0), "#clear1", 0),
+                propd(child(pass, "colorAttachments", 0), "#clear2", 0), propd(child(pass, "colorAttachments", 0), "#clear3", 1),
+                static_cast<unsigned long long>(prop(da, "loadAction", 2)));
+    }
     if (!e->valid) {
         if (tex_profiling()) {
             ++g_texprof.bad_passes;
@@ -1010,6 +1469,13 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
             glClearBufferuiv(GL_COLOR, c.i, u);
         } else {
             GLfloat f[4] = {static_cast<GLfloat>(c.c[0]), static_cast<GLfloat>(c.c[1]), static_cast<GLfloat>(c.c[2]), static_cast<GLfloat>(c.c[3])};
+            static const bool debug_clear = getenv("LOADER_DEBUG_CLEAR") != nullptr;   // coverage test: paint the target magenta
+            if (debug_clear && w > 100) {
+                f[0] = 1.0f;
+                f[1] = 0.0f;
+                f[2] = 1.0f;
+                f[3] = 1.0f;
+            }
             glClearBufferfv(GL_COLOR, c.i, f);
         }
     }
@@ -1023,6 +1489,18 @@ inline void begin_pass(Encoder* e, FakeObjcObj* pass) {
     else {
         if (clear_d) glClearBufferfv(GL_DEPTH, 0, &cd);
         if (clear_s) glClearBufferiv(GL_STENCIL, 0, &cs);
+    }
+    static const bool dbg_clear_dump = getenv("LOADER_DEBUG_CLEAR_DUMP") != nullptr;
+    if (dbg_clear_dump && debug_clear_size_ok(w, h)) {
+        std::vector<uint8_t> px(static_cast<size_t>(w) * static_cast<size_t>(h) * 4, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g.fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;
+        const bool ok = gles::write_png("/data/local/tmp/jc/frames/dbg_after_clear.png", w, h, px.data());
+        fprintf(stderr, "[MTLGL] debug dump after clear %dx%d -> %s\n", w, h, ok ? "written" : "WRITE FAILED");
     }
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, w, h);
@@ -1059,6 +1537,8 @@ inline void end_pass(Encoder* e) {
         glDeleteFramebuffers(1, &tmp);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    pass_trace_end(e);
+    pass_tex_dump(e);
 }
 
 inline void apply_state(Encoder* e) {
@@ -1262,7 +1742,11 @@ inline void trace_probe() {
 
 inline void draw(Encoder* e, uint64_t prim, uint64_t start, uint64_t count, uint64_t instances) {
     ThreadGL& g = tgl();
-    if (!ready(e) || !count) return;
+    if (!ready(e) || !count) {
+        if (pass_observe()) pass_note_reject(e, draw_reject_reason(e, count));
+        return;
+    }
+    if (pass_observe()) pass_note_accepted(e);
     glUseProgram(e->pipe->prog);
     apply_state(e);
     bind_resources(e, g, count);
@@ -1276,9 +1760,27 @@ inline void draw(Encoder* e, uint64_t prim, uint64_t start, uint64_t count, uint
 
 inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t type, FakeObjcObj* ibuf, uint64_t ioff, uint64_t instances) {
     ThreadGL& g = tgl();
-    if (!ready(e) || !count || !ibuf || !ibuf->mem) return;
+    if (!ready(e) || !count || !ibuf || !ibuf->mem) {
+        if (pass_observe())
+            pass_note_reject(e, !count ? "index count 0" : !ibuf ? "index buffer nil" : !ibuf->mem ? "index buffer has no storage" : draw_reject_reason(e, count));
+        static std::atomic<int> skipped{0};
+        if (skipped++ < 6)
+            fprintf(stderr, "[MTLGL] draw skipped: ready=%d count=%llu ibuf=%p mem=%p valid=%d pipe=%p prog=%u vs=%s\n",
+                    ready(e) ? 1 : 0, static_cast<unsigned long long>(count), static_cast<void*>(ibuf), ibuf ? ibuf->mem : nullptr,
+                    e->valid ? 1 : 0, static_cast<void*>(e->pipe), e->pipe ? e->pipe->prog : 0u,
+                    e->pipe ? e->pipe->vs_name.c_str() : "(none)");
+        return;
+    }
     size_t isz = type == 1 ? 4 : 2;
-    if (ioff + count * isz > ibuf->len) return;
+    if (ioff + count * isz > ibuf->len) {
+        if (pass_observe()) {
+            char why[160];
+            snprintf(why, sizeof why, "index range %llu+%llu*%zu past buffer end (%llu bytes)", static_cast<unsigned long long>(ioff),
+                     static_cast<unsigned long long>(count), isz, static_cast<unsigned long long>(ibuf->len));
+            pass_note_reject(e, why);
+        }
+        return;
+    }
     const uint8_t* idx = static_cast<const uint8_t*>(ibuf->mem) + ioff;
     uint64_t maxv = 0;
     for (uint64_t i = 0; i < count; ++i) {
@@ -1288,15 +1790,39 @@ inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t typ
     glUseProgram(e->pipe->prog);
     apply_state(e);
     bind_resources(e, g, count);
+    if (pass_observe()) pass_note_accepted(e);
     bind_vertices(e, g, maxv, instances ? instances : 1);
     if (tex_profiling()) tex_profile_read(idx, count * isz, e->pipe->prog, 'i');
     size_t off = g.ib.push(idx, count * isz, 4);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ib.buf);
     glDrawElementsInstanced(primitive(prim), static_cast<GLsizei>(count), isz == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
                             reinterpret_cast<const void*>(off), static_cast<GLsizei>(instances ? instances : 1));
+    ++g_draws_frame;
+    (e->targets[8] ? g_draws_depth : g_draws_nodepth) += 1;
+    if (e->rt_w > 100 && e->rt_h > 100) g_last_big_target = e->targets[0];
+    static const bool draw_dump = getenv("LOADER_DRAW_DUMP") != nullptr;   // coverage proof: read the target back right here
+    static std::atomic<int> draw_dump_n{0};
+    if (draw_dump && e->rt_w > 100 && e->rt_h > 100 && draw_dump_n++ < 3) {
+        std::vector<uint8_t> px(static_cast<size_t>(e->rt_w) * static_cast<size_t>(e->rt_h) * 4, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g.fbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, e->rt_w, e->rt_h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;
+        gles::write_png("/data/local/tmp/jc/frames/dbg_after_draw.png", e->rt_w, e->rt_h, px.data());
+        fprintf(stderr, "[MTLGL] debug dump after draw %dx%d target tex %u err 0x%x\n", e->rt_w, e->rt_h, e->targets[0],
+                glGetError());
+    }
+    static std::atomic<int> draws_logged{0};
+    if (draws_logged++ < 4)
+        fprintf(stderr, "[MTLGL] draw: prog %u count %llu maxv %llu attrs %zu rt %dx%d tex %u err 0x%x thread %zu\n", e->pipe->prog,
+                static_cast<unsigned long long>(count), static_cast<unsigned long long>(maxv), e->pipe->attrs.size(), e->rt_w, e->rt_h,
+                e->targets[0], glGetError(), std::hash<std::thread::id>{}(std::this_thread::get_id()));
     if (tex_profiling()) tex_profile_draw(e);
     if (tracing()) {
-        printf("[GLTRACE] drawElements prim %llu count %llu maxv %llu prog %u attrs %zu vsblocks %zu fs samplers %zu ftex0 %u err 0x%x\n",
+        printf("[GLTRACE] drawElements %s / %s prim %llu count %llu maxv %llu prog %u attrs %zu vsblocks %zu fs samplers %zu ftex0 %u err 0x%x\n",
+               e->pipe->vs_name.c_str(), e->pipe->fs_name.c_str(),
                static_cast<unsigned long long>(prim), static_cast<unsigned long long>(count), static_cast<unsigned long long>(maxv),
                e->pipe->prog, e->pipe->attrs.size(), e->pipe->vs.blocks.size(), e->pipe->fs.samplers.size(),
                texture(fake_lookup(e->ftex[0])) ? texture(fake_lookup(e->ftex[0]))->id : 0, glGetError());
@@ -1314,6 +1840,40 @@ inline void draw_indexed(Encoder* e, uint64_t prim, uint64_t count, uint64_t typ
         printf("[GLTRACE]   blend %d src 0x%x dst 0x%x mask %llu | vbuf0 %p+%llu fbuf0 %p\n", b0.enabled, b0.src_rgb, b0.dst_rgb,
                static_cast<unsigned long long>(b0.mask), static_cast<void*>(e->vbuf[0].buf), static_cast<unsigned long long>(e->vbuf[0].offset),
                static_cast<void*>(e->fbuf[0].buf));
+        printf("[GLTRACE]   targets %u %u depth %u | drawable obj %#llx\n", e->targets[0], e->targets[1], e->targets[8],
+               static_cast<unsigned long long>(g_presented_drawable.load()));
+        {
+            GLint sb[4] = {0, 0, 0, 0}, vp[4] = {0, 0, 0, 0}, sc = 0, dtest = 0, fbo = 0, prog_cur = 0;
+            glGetIntegerv(GL_SCISSOR_BOX, sb);
+            glGetIntegerv(GL_VIEWPORT, vp);
+            glGetIntegerv(GL_SCISSOR_TEST, &sc);
+            glGetIntegerv(GL_DEPTH_TEST, &dtest);
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &prog_cur);
+            printf("[GLTRACE]   gl: fbo %d (want %u) prog %d (want %u) scissor[%d %d %d %d] en %d viewport[%d %d %d %d] depthtest %d\n",
+                   fbo, g.fbo, prog_cur, e->pipe->prog, sb[0], sb[1], sb[2], sb[3], sc, vp[0], vp[1], vp[2], vp[3], dtest);
+        }
+        for (const Attr& a : e->pipe->attrs) {
+            if (a.buffer >= 32) continue;
+            size_t avail = 0;
+            const uint8_t* src = e->vbuf[a.buffer].data(avail);
+            if (!src || avail < a.offset + 48) continue;
+            const float* fv = reinterpret_cast<const float*>(src + a.offset);
+            size_t stride = static_cast<size_t>(e->pipe->layouts[a.buffer].stride / 4);
+            if (!stride) stride = 4;
+            printf("[GLTRACE]   attr loc %d fmt %llu off %llu buf %llu stride %llu: %g %g %g | %g %g %g\n", a.loc,
+                   static_cast<unsigned long long>(a.format), static_cast<unsigned long long>(a.offset),
+                   static_cast<unsigned long long>(a.buffer), static_cast<unsigned long long>(e->pipe->layouts[a.buffer].stride), fv[0],
+                   fv[1], fv[2], fv[stride], fv[stride + 1], fv[stride + 2]);
+        }
+        for (size_t bi = 0; bi < e->pipe->vs.blocks.size() && bi < 3; ++bi) {
+            const auto& bl = e->pipe->vs.blocks[bi];
+            size_t avail = 0;
+            const uint8_t* src = bl.buffer >= 0 && bl.buffer < 32 ? e->vbuf[bl.buffer].data(avail) : nullptr;
+            const float* fv = reinterpret_cast<const float*>(src);
+            printf("[GLTRACE]   vs block %s <- buf %d avail %zu first %g %g %g %g\n", bl.block.c_str(), bl.buffer, avail,
+                   src ? fv[0] : 0.0f, src ? fv[1] : 0.0f, src ? fv[2] : 0.0f, src ? fv[3] : 0.0f);
+        }
         trace_probe();
         static std::map<GLuint, bool> dumped;
         const char* dir = getenv("LOADER_FRAME_DIR");
@@ -1389,11 +1949,93 @@ inline bool read_columns(Tex* t, int x, std::vector<uint8_t>& out) {
 }
 
 // Command buffer commit: flush, then save presented drawables (LOADER_FRAME_DIR, every LOADER_FRAME_EVERY).
+// [CAMetalDrawable present] is the pre-iOS-13 presenting call: it arrives *after* the command buffer is committed,
+// so there is no #present property to hang the frame on. The drawable is queued here and saved on the next commit,
+// by which time its GL work has been flushed.
+inline void dump_presented(uint64_t drawable) {
+    static const char* dir = getenv("LOADER_FRAME_DIR");
+    static const uint64_t every = getenv("LOADER_FRAME_EVERY") ? strtoull(getenv("LOADER_FRAME_EVERY"), nullptr, 10) : 60;
+    static uint64_t seen = 0;
+    const uint64_t n = ++seen;
+    g_frame_no = n;   // so LOADER_GL_TRACE_AT / LOADER_TEX_PROFILE see the same frame numbers on this presenting path
+    if (!dir || !every || n % every) return;
+    Tex* t = texture(fake_lookup(prop(fake_lookup(drawable), "texture", 0)));
+    // The presenter is not always the buffer the last pass rendered into (Unity presents the previous frame's
+    // drawable), so fall back to whatever full-size texture the render passes actually wrote.
+    if (Tex* lt = texture(fake_lookup(g_last_big_target_obj.load())))
+        if (lt != t && lt->w > 100 && lt->h > 100) t = lt;
+    std::vector<uint8_t> px;
+    if (!read_rgba(t, px)) {
+        static std::atomic<int> missed{0};
+        if (missed++ < 4)
+            fprintf(stderr, "[MTLGL] dump frame %llu: no pixels (tex %p id %u, %dx%d)\n", static_cast<unsigned long long>(n),
+                    static_cast<void*>(t), t ? t->id : 0u, t ? t->w : 0, t ? t->h : 0);
+        return;
+    }
+    fprintf(stderr, "[MTLGL] dump: drawable tex id %u %dx%d rendered %llu times, %llu draws since last dump, thread %zu\n", t->id, t->w,
+            t->h, static_cast<unsigned long long>(t->renders), static_cast<unsigned long long>(g_draws_frame.exchange(0)),
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    fprintf(stderr, "[MTLGL] dump: last full-size draw target was tex %llu, %llu guest msgs since last dump\n",
+            static_cast<unsigned long long>(g_last_big_target.load()),
+            static_cast<unsigned long long>(g_guest_msgs.exchange(0)));
+    if (getenv("LOADER_SELECTOR_COUNTS")) {
+        std::vector<std::pair<uint64_t, std::string>> top;
+        {
+            std::lock_guard<std::mutex> l(g_sel_mu);
+            for (const auto& kv : g_sel_counts) top.emplace_back(kv.second, kv.first);
+            g_sel_counts.clear();
+        }
+        std::sort(top.rbegin(), top.rend());
+        for (size_t i = 0; i < top.size() && i < 14; ++i)
+            fprintf(stderr, "[SEL] %8llu  %s\n", static_cast<unsigned long long>(top[i].first), top[i].second.c_str());
+    }
+    fprintf(stderr, "[MTLGL] census: passes depth %llu nodepth %llu | draws depth %llu nodepth %llu\n",
+            static_cast<unsigned long long>(g_passes_depth.exchange(0)),
+            static_cast<unsigned long long>(g_passes_nodepth.exchange(0)),
+            static_cast<unsigned long long>(g_draws_depth.exchange(0)),
+            static_cast<unsigned long long>(g_draws_nodepth.exchange(0)));
+    char path[512];
+    snprintf(path, sizeof path, "%s/frame_%05llu.png", dir, static_cast<unsigned long long>(n));
+    for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // the layer is opaque
+    bool ok = gles::write_png(path, t->w, t->h, px.data());
+    printf("[MTLGL] frame %llu -> %s (%dx%d)%s\n", static_cast<unsigned long long>(n), path, t->w, t->h, ok ? "" : " WRITE FAILED");
+    fflush(stdout);
+}
+
 inline void commit(FakeObjcObj* cb) {
-    if (!tgl().init) return;
+    if (tgl().init) {
+        if (uint64_t d = g_presented_drawable.exchange(0)) dump_presented(d);
+    }
+    if (!tgl().init) {
+        // No GL context on this thread: nothing can be drawn or presented, so say so once per thread instead of
+        // silently dropping every frame.
+        static thread_local bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[MTLGL] commit without a GL context on tid %d (gles_enabled=%d)\n", gettid(), gles_enabled() ? 1 : 0);
+        }
+        return;
+    }
     if (tex_profiling()) tex_profile_check_reads(g_frame_no);
     uint64_t drawable = prop(cb, "#present", 0);
-    if (!drawable) { glFlush(); return; }
+    if (!drawable) {
+        // Legacy `[CAMetalDrawable present]` path: no presentDrawable: was issued, so the frame counter and the [MEM]
+        // block further down are never reached, and a title on this path would report no memory telemetry at all.
+        glFlush();
+        static const bool mem_stats_legacy = getenv("LOADER_MEM_STATS") != nullptr;
+        static uint64_t legacy_frames = 0;
+        if (mem_stats_legacy && ++legacy_frames % 600 == 0) {
+            size_t live;
+            {
+                std::lock_guard<std::mutex> l(g_fake_mu);
+                live = g_fake_objc.size();
+            }
+            printf("[MEM] frame %llu (legacy present): %zu live fakes, %.1f MB GL textures\n",
+                   static_cast<unsigned long long>(legacy_frames), live, g_texture_bytes.load() / 1048576.0);
+            fflush(stdout);
+        }
+        return;
+    }
     cb->props.erase("#present");
     uint64_t n = ++g_frame_no;
     ++g_present_count;
@@ -1482,6 +2124,12 @@ inline void commit(FakeObjcObj* cb) {
     if (dir && (traced || (every && n % every == 0))) {
         Tex* t = texture(fake_lookup(prop(fake_lookup(drawable), "texture", 0)));
         std::vector<uint8_t> px;
+        if (!read_rgba(t, px)) {
+            static std::atomic<int> missed{0};
+            if (missed++ < 4)
+                fprintf(stderr, "[MTLGL] dump frame %llu: no pixels (tex %p id %u, %dx%d)\n",
+                        static_cast<unsigned long long>(n), static_cast<void*>(t), t ? t->id : 0u, t ? t->w : 0, t ? t->h : 0);
+        }
         if (read_rgba(t, px)) {
             char path[512];
             snprintf(path, sizeof path, "%s/frame_%05llu.png", dir, static_cast<unsigned long long>(n));
@@ -1714,6 +2362,12 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
     }
     // command buffers / encoders
     if (sel == "renderCommandEncoderWithDescriptor:") {
+        static std::atomic<int> enc_logged{0};
+        if (enc_logged++ < 3) {
+            FakeObjcObj* p = fake_lookup(frame.x[2]);
+            fprintf(stderr, "[MTLGL] encoder pass %#llx%s\n", static_cast<unsigned long long>(frame.x[2]),
+                    p && p->props.count("colorAttachments") ? " (has attachments)" : " (no attachments stored)");
+        }
         uint64_t h;
         FakeObjcObj* enc = fake_metal_bag(&h);
         auto* e = new Encoder();
@@ -1731,8 +2385,16 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
     if (sel == "commit") { commit(self); return false; }   // handlers fire in the bag code
     if (Encoder* e = encoder()) {
         if (sel == "endEncoding") { end_pass(e); return true; }
-        if (sel == "setRenderPipelineState:") { e->pipe = gl_obj<Pipeline>(fake_lookup(frame.x[2])); return true; }
-        if (sel == "setDepthStencilState:") { e->ds = gl_obj<DepthStencil>(fake_lookup(frame.x[2])); return true; }
+        if (sel == "setRenderPipelineState:") {
+            e->pipe = gl_obj<Pipeline>(fake_lookup(frame.x[2]));
+            if (pass_observe()) pass_note_pipe(e, frame.x[2]);
+            return true;
+        }
+        if (sel == "setDepthStencilState:") {
+            e->ds = gl_obj<DepthStencil>(fake_lookup(frame.x[2]));
+            if (pass_observe()) pass_note_ds(e, frame.x[2]);
+            return true;
+        }
         if (sel == "setStencilReferenceValue:") { e->ref_front = e->ref_back = static_cast<GLuint>(frame.x[2]); return true; }
         if (sel == "setStencilFrontReferenceValue:backReferenceValue:") {
             e->ref_front = static_cast<GLuint>(frame.x[2]);
@@ -1751,6 +2413,10 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         }
         if (sel == "setViewport:") {
             const double* v = reinterpret_cast<const double*>(frame.x[2]);   // MTLViewport (6 doubles) by reference
+            static std::atomic<int> vp_logged{0};
+            if (v && vp_logged++ < 8)
+                fprintf(stderr, "[MTLGL] setViewport: %g %g %g %g %g %g\n", v[0], v[1], v[2], v[3], v[4], v[5]);
+            if (pass_observe() && v) pass_note_viewport(e, v);
             if (v && e->valid) {
                 for (int i = 0; i < 4; ++i) e->viewport[i] = static_cast<int>(v[i]);
                 glViewport(static_cast<GLint>(v[0]), static_cast<GLint>(v[1]), static_cast<GLsizei>(v[2]), static_cast<GLsizei>(v[3]));
@@ -1760,6 +2426,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
         }
         if (sel == "setScissorRect:") {
             const uint64_t* r = reinterpret_cast<const uint64_t*>(frame.x[2]);   // MTLScissorRect by reference
+            if (pass_observe() && r) pass_note_scissor(e, r);
             if (r && e->valid) for (int i = 0; i < 4; ++i) e->scissor[i] = static_cast<int>(r[i]);
             if (r && e->valid) glScissor(static_cast<GLint>(r[0]), static_cast<GLint>(r[1]), static_cast<GLsizei>(r[2]), static_cast<GLsizei>(r[3]));
             return true;
@@ -1778,6 +2445,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
                 BoundBuf& b = bufs[frame.x[4]];
                 b.buf = fake_lookup(frame.x[2]);
                 b.offset = frame.x[3];
+                if (pass_observe()) pass_note_bind(e->pass, vtx, static_cast<int>(frame.x[4]), frame.x[2], frame.x[3]);
                 b.bytes.clear();
                 return true;
             }
@@ -1788,16 +2456,24 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
                 b.bytes.assign(p, p + frame.x[3]);
                 if (b.bytes.empty()) b.bytes.push_back(0);
                 b.buf = nullptr;
+                if (pass_observe()) pass_note_bytes(e->pass, vtx, static_cast<int>(frame.x[4]), frame.x[3]);
                 return true;
             }
-            if (rest == "Texture:atIndex:" && frame.x[3] < 32) { (vtx ? e->vtex : e->ftex)[frame.x[3]] = frame.x[2]; return true; }
+            if (rest == "Texture:atIndex:" && frame.x[3] < 32) {
+                (vtx ? e->vtex : e->ftex)[frame.x[3]] = frame.x[2];
+                if (pass_observe()) pass_note_tex(e->pass, vtx, static_cast<int>(frame.x[3]), frame.x[2]);
+                return true;
+            }
             // array forms: (ids, [offsets,] NSRange{location, length}) with the range in two registers
             if (rest == "Textures:withRange:" || rest == "SamplerStates:withRange:") {
                 const uint64_t* ids = reinterpret_cast<const uint64_t*>(frame.x[2]);
                 bool tex = rest[0] == 'T';
                 uint64_t* slots = tex ? (vtx ? e->vtex : e->ftex) : (vtx ? e->vsamp : e->fsamp);
                 uint64_t limit = tex ? 32 : 16;
-                for (uint64_t i = 0; ids && i < frame.x[4] && frame.x[3] + i < limit; ++i) slots[frame.x[3] + i] = ids[i];
+                for (uint64_t i = 0; ids && i < frame.x[4] && frame.x[3] + i < limit; ++i) {
+                    slots[frame.x[3] + i] = ids[i];
+                    if (tex && pass_observe()) pass_note_tex(e->pass, vtx, static_cast<int>(frame.x[3] + i), ids[i]);
+                }
                 return true;
             }
             if (rest == "Buffers:offsets:withRange:") {
@@ -1807,6 +2483,7 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
                     BoundBuf& b = bufs[frame.x[4] + i];
                     b.buf = fake_lookup(ids[i]);
                     b.offset = offs ? offs[i] : 0;
+                    if (pass_observe()) pass_note_bind(e->pass, vtx, static_cast<int>(frame.x[4] + i), ids[i], b.offset);
                     b.bytes.clear();
                 }
                 return true;
@@ -1814,13 +2491,25 @@ static bool mtl_gles_message(CallFrame& frame, const std::string& sel, FakeObjcO
             if (rest == "SamplerState:atIndex:" && frame.x[3] < 16) { (vtx ? e->vsamp : e->fsamp)[frame.x[3]] = frame.x[2]; return true; }
             if (rest == "SamplerState:lodMinClamp:lodMaxClamp:atIndex:" && frame.x[3] < 16) { (vtx ? e->vsamp : e->fsamp)[frame.x[3]] = frame.x[2]; return true; }
         }
-        if (sel == "drawPrimitives:vertexStart:vertexCount:") { draw(e, frame.x[2], frame.x[3], frame.x[4], 1); return false; }
-        if (sel == "drawPrimitives:vertexStart:vertexCount:instanceCount:") { draw(e, frame.x[2], frame.x[3], frame.x[4], frame.x[5]); return false; }
+        if (sel == "drawPrimitives:vertexStart:vertexCount:") {
+            if (pass_observe()) pass_note_draw(e, pass_draw_text("drawPrimitives", frame.x[2], frame.x[3], frame.x[4], 1));
+            draw(e, frame.x[2], frame.x[3], frame.x[4], 1);
+            return false;
+        }
+        if (sel == "drawPrimitives:vertexStart:vertexCount:instanceCount:") {
+            if (pass_observe()) pass_note_draw(e, pass_draw_text("drawPrimitives", frame.x[2], frame.x[3], frame.x[4], frame.x[5]));
+            draw(e, frame.x[2], frame.x[3], frame.x[4], frame.x[5]);
+            return false;
+        }
         if (sel == "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:") {
+            if (pass_observe())
+                pass_note_draw(e, pass_draw_indexed_text(frame.x[2], frame.x[3], frame.x[4], frame.x[5], frame.x[6], 1));
             draw_indexed(e, frame.x[2], frame.x[3], frame.x[4], fake_lookup(frame.x[5]), frame.x[6], 1);
             return false;
         }
         if (sel == "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:") {
+            if (pass_observe())
+                pass_note_draw(e, pass_draw_indexed_text(frame.x[2], frame.x[3], frame.x[4], frame.x[5], frame.x[6], frame.x[7]));
             draw_indexed(e, frame.x[2], frame.x[3], frame.x[4], fake_lookup(frame.x[5]), frame.x[6], frame.x[7]);
             return false;
         }
