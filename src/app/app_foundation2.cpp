@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <map>
@@ -3253,6 +3254,66 @@ static void fn_NSSetUncaughtExceptionHandler(void* h) { g_uncaught_handler = h; 
 static double fn_NSTimeIntervalSince1970() { return 0; }
 }
 
+// NSDecimal: a 20-byte value type, four bitfield bytes then eight base-65536 limbs. NSDecimalRound is the only
+// entry point in this family a UI touches (prices, percentages), so the conversion is done through long double.
+struct DecimalLayout {
+    int32_t exponent : 8;
+    uint32_t length : 4;
+    uint32_t negative : 1;
+    uint32_t compact : 1;
+    uint32_t reserved : 18;
+    uint16_t mantissa[8];
+};
+static_assert(sizeof(DecimalLayout) == 20, "NSDecimal is 20 bytes");
+
+static long double decimal_to_ld(const DecimalLayout* d) {
+    long double m = 0;
+    for (int i = 7; i >= 0; --i) m = m * 65536.0L + d->mantissa[i];
+    if (d->negative) m = -m;
+    int e = d->exponent;
+    long double p = 1;
+    for (int i = 0; i < (e < 0 ? -e : e); ++i) p *= 10.0L;
+    return e < 0 ? m / p : m * p;
+}
+
+static void ld_to_decimal(long double v, int scale, DecimalLayout* d) {
+    std::memset(d, 0, sizeof *d);
+    const bool neg = v < 0;
+    if (neg) v = -v;
+    long double scaled = v;
+    for (int i = 0; i < scale; ++i) scaled *= 10.0L;
+    unsigned __int128 m = scaled < 3.4e38L ? static_cast<unsigned __int128>(scaled + 0.5L) : 0;
+    int limbs = 0;
+    while (m && limbs < 8) { d->mantissa[limbs++] = static_cast<uint16_t>(m & 0xFFFFu); m >>= 16; }
+    if (!limbs || m) {   // empty, or wider than eight limbs: keep the integer part at exponent 0
+        std::memset(d, 0, sizeof *d);
+        unsigned __int128 big = v < 3.4e38L ? static_cast<unsigned __int128>(v) : 0;
+        limbs = 0;
+        while (big && limbs < 8) { d->mantissa[limbs++] = static_cast<uint16_t>(big & 0xFFFFu); big >>= 16; }
+        scale = 0;
+    }
+    d->length = limbs;
+    d->negative = neg;
+    d->exponent = static_cast<int32_t>(-scale);
+}
+
+// void NSDecimalRound(NSDecimal *result, const NSDecimal *number, NSInteger scale, NSRoundingMode mode)
+static void fn_NSDecimalRound(void* result, const void* number, long scale, uint64_t mode) {
+    if (!result || !number) return;
+    const long double v = decimal_to_ld(static_cast<const DecimalLayout*>(number));
+    long double p = 1;
+    if (scale > 0) { for (long i = 0; i < scale; ++i) p *= 10.0L; }
+    else { for (long i = 0; i > scale; --i) p /= 10.0L; }
+    long double s = v * p;
+    switch (mode) {
+        case 1: s = s >= 0 ? std::floor(s) : std::ceil(s); break;   // NSRoundDown: toward zero
+        case 2: s = s >= 0 ? std::ceil(s) : std::floor(s); break;    // NSRoundUp: away from zero
+        case 3: s = std::nearbyint(s); break;                        // NSRoundBankers: half to even
+        default: s = std::round(s); break;                           // NSRoundPlain: half away from zero
+    }
+    ld_to_decimal(s / p, scale > 0 ? static_cast<int>(scale) : 0, static_cast<DecimalLayout*>(result));
+}
+
 void register_foundation2_symbols(std::unordered_map<std::string, void*>& m) {
     auto r = [&](const char* n, auto f) { m[n] = reinterpret_cast<void*>(f); };
     r("_NSStringFromClass", &fn_NSStringFromClass);
@@ -3267,6 +3328,7 @@ void register_foundation2_symbols(std::unordered_map<std::string, void*>& m) {
     r("_NSFullUserName", &fn_NSFullUserName);
     r("_NSGetUncaughtExceptionHandler", &fn_NSGetUncaughtExceptionHandler);
     r("_NSSetUncaughtExceptionHandler", &fn_NSSetUncaughtExceptionHandler);
+    r("_NSDecimalRound", &fn_NSDecimalRound);
     register_gcd_symbols(m);
 }
 

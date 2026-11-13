@@ -2263,6 +2263,11 @@ static bool is_function_import(const std::string& name) {
     if (g_lazy_names.count(name)) return true;
     for (const char* const* k = kKnownFunctionsInRegularStream; *k; ++k)
         if (name == *k) return true;
+    // A chained-fixups image has no lazy stream, so without these every runtime helper and framework C function
+    // below would be taken for data and bound to a synthesized string constant instead of a callable stub.
+    if (name == "_objc_opt_self" || name == "_NSDecimalRound" || name.rfind("_CTFontManager", 0) == 0) return true;
+    if (name.rfind("_objc_retain_x", 0) == 0 || name.rfind("_objc_release_x", 0) == 0) return true;
+    if (name.rfind("_swift_", 0) == 0) return true;
     return false;
 }
 
@@ -4127,6 +4132,28 @@ extern "C" int loader_main(int argc, char** argv) {
     for (const auto& n : g_unresolved_imports) {
         fprintf(stderr, "  UNRESOLVED %s %s\n", is_function_import(n) ? "fn  " : "data", n.c_str());
     }
+    // Preflight: without a Swift runtime every Swift ABI import becomes nil, so the guest walks through nil metadata
+    // and faults somewhere unrelated to the real cause. Count them while the fixups are still in hand and stop here
+    // instead. Gate on LC_MAIN rather than app mode: a SwiftUI executable calls UIApplicationMain from SwiftUI, so it
+    // never imports _UIApplicationMain and the app-mode heuristic would leave it to crash. LOADER_ALLOW_UNRESOLVED=1
+    // keeps the old degrade-and-run behaviour for experiments.
+    if (lc_main_entryoff && !getenv("LOADER_ALLOW_UNRESOLVED")) {
+        size_t swift_abi = 0, swift_rt = 0;
+        for (const auto& n : g_unresolved_imports) {
+            if (n.rfind("_$s", 0) == 0) ++swift_abi;
+            else if (n.rfind("_swift_", 0) == 0) ++swift_rt;
+        }
+        if (swift_abi || swift_rt) {
+            fprintf(stderr,
+                    "[preflight] Swift runtime required: %zu unresolved Swift imports (%zu mangled _$s, %zu _swift_ entries)\n"
+                    "[preflight] this loader carries no Swift runtime, so every one of those calls would return nil and the\n"
+                    "[preflight] guest would fault later, away from the real cause\n"
+                    "[preflight] refusing to boot this bundle (LOADER_ALLOW_UNRESOLVED=1 runs it anyway)\n",
+                    swift_abi + swift_rt, swift_abi, swift_rt);
+            return 3;
+        }
+    }
+
     if (g_trace_mode) dump_direct_bound_list();
 
     // 7. TLS veneers in the pool adjacent to the image.

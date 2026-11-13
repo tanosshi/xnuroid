@@ -1487,6 +1487,11 @@ static bool rt_opt_is_kind(id o, Class c) { return app::send<bool>(o, "isKindOfC
 static bool rt_opt_responds(id o, SEL s) { return app::send<bool>(o, "respondsToSelector:", s); }
 static id rt_retained_return(id o) { return o; }
 
+// objc_opt_self: the class of an object, with the isa mask applied (Swift calls it at every class-metadata entry).
+static id rt_opt_self(id o) {
+    return reinterpret_cast<id>(reinterpret_cast<uintptr_t>(o) & 0x00007ffffffffff8ULL);
+}
+
 }  // extern "C"
 
 namespace app {
@@ -1498,6 +1503,14 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("_objc_msgSendSuper", &app_objc_msgSendSuper);
     r("_objc_retain", &rt_retain);
     r("_objc_release", &rt_release);
+    r("_objc_opt_self", &rt_opt_self);
+    // Compiler-emitted aliases: _objc_retain_xN / _objc_release_xN take one argument like the base entry points.
+    for (int i = 1; i <= 28; ++i) {
+        std::string ret = "_objc_retain_x" + std::to_string(i);
+        std::string rel = "_objc_release_x" + std::to_string(i);
+        r(ret.c_str(), &rt_retain);
+        r(rel.c_str(), &rt_release);
+    }
     r("_objc_autorelease", &rt_autorelease);
     r("_objc_autoreleaseReturnValue", &rt_autorelease);
     r("_objc_retainAutorelease", &rt_retain_autorelease);

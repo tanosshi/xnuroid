@@ -670,6 +670,10 @@ void init_cg() {
     (void)S;
 }
 
+// CoreText cannot install a face into Android's font stack, so report success: the caller's fallback path (an
+// exception or a user-visible error) is worse than a no-op that keeps the app's font list consistent.
+static bool ct_font_manager_register(void*, unsigned, void*) { return true; }
+
 void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
     auto r = [&](const char* n, auto f) { m[n] = reinterpret_cast<void*>(f); };
     // CGGeometry
@@ -791,6 +795,7 @@ void register_cg_symbols(std::unordered_map<std::string, void*>& m) {
     r("_CGContextGetTextPosition", &cg_get_text_position);
     r("_CGContextRelease", +[](id ctx) { release(ctx); });
     r("_CTFontCreateUIFontForLanguage", &ct_font_create_ui);
+    r("_CTFontManagerRegisterFontsForURL", &ct_font_manager_register);
     r("_CTFontCreateWithName", &ct_font_create_with_name);
     r("_CTFontGetSize", &ct_font_get_size);
     r("_CTLineCreateWithAttributedString", &ct_line_create);

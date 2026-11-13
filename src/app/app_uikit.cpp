@@ -2082,6 +2082,14 @@ void register_uikit_symbols(std::unordered_map<std::string, void*>& m) {
     (void)long_press;
     static CGRect zero_rect{{0, 0}, {0, 0}};
     m["_UIEdgeInsetsZero"] = &zero_rect;
+    // CGFloat exports: a data import is dereferenced as a double at the bound address, so a string constant here
+    // would be read as the low bytes of a pointer.
+    static double font_weight_regular = 0.0;
+    static double font_weight_bold = 0.4;      // UIFontWeightBold
+    static double no_intrinsic_metric = -1.0;  // UIViewNoIntrinsicMetric
+    m["_UIFontWeightRegular"] = &font_weight_regular;
+    m["_UIFontWeightBold"] = &font_weight_bold;
+    m["_UIViewNoIntrinsicMetric"] = &no_intrinsic_metric;
 }
 
 }  // namespace app
