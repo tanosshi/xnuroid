@@ -54,6 +54,11 @@ struct Region {
     const char* what = "";
 };
 std::vector<Region> g_regions;
+// Absolute addresses of symbols exported by side images (the bundled Swift runtime), and the byte ranges of every
+// loaded image, so a guest call may cross from the app into the runtime.
+std::unordered_map<std::string, uint32_t> g_extern;
+std::vector<std::pair<uint32_t, uint32_t>> g_code_ranges;
+uint32_t g_swift_once = 0;   // resolved _swift_once, bit 0 set when the runtime exports it as Thumb
 
 bool in_regions(uint32_t addr, uint32_t len) {
     if (addr + len < addr) return false;
@@ -154,6 +159,42 @@ int32_t read_sleb(const uint8_t*& p) {
     return v;
 }
 
+// A stripped app keeps almost nothing in LC_SYMTAB; the export trie is where its own globals (the Swift
+// global-initializer function and its token, for one) are named. Self-binds must resolve against it.
+void parse_exports(const uint8_t* d, size_t size, uint32_t off, uint32_t len, Image& img) {
+    if (!len || off > size || len > size - off) return;
+    const uint8_t* const base = d + off;
+    const uint8_t* const end = base + len;
+    struct Frame { uint32_t node; std::string prefix; };
+    std::vector<Frame> stack;
+    stack.push_back({0, {}});
+    size_t visited = 0;
+    while (!stack.empty() && visited++ < 200000) {
+        Frame f = std::move(stack.back());
+        stack.pop_back();
+        if (f.node >= len) continue;
+        const uint8_t* p = base + f.node;
+        const uint64_t terminal = read_uleb(p);
+        if (terminal && p < end) {
+            const uint64_t flags = read_uleb(p);
+            if (!(flags & 0x08) && p < end) {   // 0x08: a re-export has an ordinal, not an address
+                const uint32_t addr = static_cast<uint32_t>(read_uleb(p));
+                if (addr) img.defined.emplace(f.prefix, addr);
+            }
+        }
+        if (p >= end) continue;
+        const uint64_t children = read_uleb(p);
+        for (uint64_t c = 0; c < children && p < end; ++c) {
+            const char* edge = reinterpret_cast<const char*>(p);
+            const size_t n = strnlen(edge, static_cast<size_t>(end - p));
+            p += n + 1;
+            if (p > end) break;
+            const uint64_t child = read_uleb(p);
+            stack.push_back({static_cast<uint32_t>(child), f.prefix + std::string(edge, n)});
+        }
+    }
+}
+
 bool apply_rebases(const Image& img, const uint8_t* data, uint32_t off, uint32_t size, uint32_t slide,
                    size_t* count) {
     if (!size) return true;
@@ -226,8 +267,11 @@ bool apply_binds(const Image& img, const uint8_t* data, uint32_t off, uint32_t s
             if (symbol.empty()) return true;
             uint32_t target = 0;
             auto def = img.defined.find(symbol);
+            auto ext = g_extern.find(symbol);
             if (def != img.defined.end()) {
                 target = img.base_addr + (def->second - img.min_vm);   // self-bind: guest code or data
+            } else if (ext != g_extern.end()) {
+                target = ext->second;   // a side image (the bundled Swift runtime) defines it
             } else {
                 target = add_stub(symbol);
                 if (!target) { ++*missing; return true; }
@@ -628,6 +672,7 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
     bool have_main = false;
     uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
     bool have_symtab = false;
+    uint32_t export_off = 0, export_size = 0;
     for (uint32_t i = 0; i < ncmds && off + 8 <= size; ++i) {
         const uint32_t cmd = rd32(d + off), cmdsize = rd32(d + off + 4);
         if (cmdsize < 8 || off + cmdsize > size) { std::fprintf(stderr, "[armv7] malformed load command\n"); return false; }
@@ -649,6 +694,8 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
             bind_size = rd32(d + off + 20);
             lazy_off = rd32(d + off + 32);
             lazy_size = rd32(d + off + 36);
+            export_off = rd32(d + off + 40);
+            export_size = rd32(d + off + 44);
         } else if (cmd == 0x2) {  // LC_SYMTAB
             symoff = rd32(d + off + 8);
             nsyms = rd32(d + off + 12);
@@ -684,18 +731,52 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
     if (img.segments.empty()) { std::fprintf(stderr, "[armv7] no segments\n"); return false; }
     img.min_vm = text_vm;
     img.span = max_vm - img.min_vm;
+    parse_exports(d, size, export_off, export_size, img);
     if (have_main && entryoff < img.span) img.entry = img.min_vm + static_cast<uint32_t>(entryoff);
-    if (!img.entry) { std::fprintf(stderr, "[armv7] no entry point\n"); return false; }
     img.entry_thumb = (img.entry & 1) != 0;
     return true;
 }
 
 }  // namespace
 
+// Loads the bundled Swift runtime (or any other armv7 dylib) into the same low arena. Its exports are recorded so the
+// app's Swift imports bind to real runtime code instead of trampolines.
+bool load_side_image(const char* path, uint32_t hint, std::vector<uint8_t>& store, Image& img) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::rewind(f);
+    if (n <= 0) { std::fclose(f); return false; }
+    store.resize(static_cast<size_t>(n));
+    const size_t got = std::fread(store.data(), 1, store.size(), f);
+    std::fclose(f);
+    if (got != store.size()) return false;
+
+    uint32_t ro = 0, rs = 0, bo = 0, bs = 0, lo = 0, ls = 0;
+    if (!parse(store.data(), store.size(), path, img, ro, rs, bo, bs, lo, ls)) return false;
+    const uint32_t span = (img.span + kPage - 1) & ~(kPage - 1);
+    void* map = nullptr;
+    if (!map_fixed(hint, span, &map)) return false;
+    img.base = static_cast<uint8_t*>(map);
+    img.base_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(map));
+    for (const Segment& s : img.segments) {
+        if (!s.filesize) continue;
+        if (s.fileoff + s.filesize > store.size()) return false;
+        std::memcpy(img.base + (s.vmaddr - img.min_vm), store.data() + s.fileoff, s.filesize);
+    }
+    g_regions.push_back({img.base_addr, img.base_addr + span, "side"});
+    g_code_ranges.push_back({img.base_addr, img.base_addr + span});
+    for (const auto& kv : img.defined) g_extern.emplace(kv.first, img.base_addr + (kv.second - img.min_vm));
+    std::printf("[armv7] runtime image %s at 0x%08x, %zu exports\n", path, img.base_addr, img.defined.size());
+    return true;
+}
+
 int run_image(uint8_t* data, size_t size, const char* path) {
     Image img;
     uint32_t rebase_off = 0, rebase_size = 0, bind_off = 0, bind_size = 0, lazy_off = 0, lazy_size = 0;
     if (!parse(data, size, path, img, rebase_off, rebase_size, bind_off, bind_size, lazy_off, lazy_size)) return 1;
+    if (!img.entry) { std::fprintf(stderr, "[armv7] no entry point\n"); return 1; }
 
     void* image_map = nullptr;
     uint32_t map_span = (img.span + kPage - 1) & ~(kPage - 1);
@@ -721,6 +802,19 @@ int run_image(uint8_t* data, size_t size, const char* path) {
     g_regions.push_back({img.base_addr, img.base_addr + map_span, "image"});
     g_regions.push_back({kStubHint, kStubHint + kPage, "stubs"});
     g_regions.push_back({kStackHint, kStackHint + kStackSize, "stack"});
+    g_code_ranges.push_back({img.base_addr, img.base_addr + map_span});
+
+    // Optional side image: the app bundle ships the armv7 Swift runtime. When it is present, Swift imports bind to it.
+    std::vector<uint8_t> side_store;
+    if (const char* side = std::getenv("LOADER_ARMV7_SWIFTCORE"); side && *side) {
+        Image side_img;
+        if (!load_side_image(side, 0x20000000u, side_store, side_img))
+            std::fprintf(stderr, "[armv7] could not load %s; Swift imports stay stubs\n", side);
+        else {
+            auto it = g_extern.find("_swift_once");
+            if (it != g_extern.end()) g_swift_once = it->second;
+        }
+    }
 
     size_t rebases = 0, binds = 0, missing = 0;
     if (!apply_rebases(img, data, rebase_off, rebase_size, slide, &rebases)) return 1;
@@ -764,8 +858,11 @@ int run_image(uint8_t* data, size_t size, const char* path) {
     // Runs a guest function to its return address. Used by the Swift runtime shim below.
     auto call_guest = [&](uint32_t fn, uint32_t ctx) -> bool {
         const uint32_t ret = 0xFFFFFFF0u;
-        if (fn < img.base_addr || fn >= img.base_addr + map_span) {
-            stop.reason = "initializer address outside the image";
+        bool mapped = false;
+        for (const auto& range : g_code_ranges)
+            if (fn >= range.first && fn < range.second) mapped = true;
+        if (!mapped) {
+            stop.reason = "initializer address outside every loaded image";
             return false;
         }
         const uint32_t saved_lr = cpu.r[14], saved_pc = cpu.r[15];
@@ -783,6 +880,31 @@ int run_image(uint8_t* data, size_t size, const char* path) {
         return true;
     };
 
+    // _swift_once(token, function, context): the runtime's own implementation uses dispatch_once, so keep running it
+    // here and call the initializer directly. Works whether the call landed on a stub or on the real runtime export.
+    auto handle_swift_once = [&]() -> bool {
+        const uint32_t token = cpu.r[0], fn = cpu.r[1], ctx = cpu.r[2];
+        bool ok = true;
+        const uint32_t before = mem32(token, &ok);
+        if (ok && before == 0) {
+            store32(token, 1, &ok);
+            std::printf("[armv7] swift_once -> running initializer 0x%08x\n", fn);
+            const uint64_t at = steps;
+            if (!ok || !call_guest(fn, ctx)) return false;
+            std::printf("[armv7] swift_once -> initializer returned after %llu instructions\n",
+                        static_cast<unsigned long long>(steps - at));
+        }
+        cpu.r[0] = 0;
+        const uint32_t ret = cpu.r[14];
+        if (ret == 0 || ret == 0xFFFFFFFEu || ret == 0xFFFFFFF0u || stub_name(ret)) {
+            stop.reason = "_swift_once has no usable return address";
+            return false;
+        }
+        cpu.r[15] = ret;
+        ++steps;
+        return true;
+    };
+
     while (true) {
         const uint32_t pc = cpu.r[15];
         if (static_cast<int>(steps) < trace)
@@ -790,27 +912,14 @@ int run_image(uint8_t* data, size_t size, const char* path) {
                         static_cast<unsigned long long>(pc), [&] { bool ok = true; return mem32(pc, &ok); }(),
                         cpu.r[0], cpu.r[1], cpu.r[13], cpu.r[14]);
 
+        if (g_swift_once && ((pc | 1u) == (g_swift_once | 1u))) {
+            if (!handle_swift_once()) break;
+            continue;
+        }
+
         if (const char* name = stub_name(pc)) {
             if (!std::strcmp(name, "_swift_once")) {
-                const uint32_t token = cpu.r[0], fn = cpu.r[1], ctx = cpu.r[2];
-                bool ok = true;
-                const uint32_t before = mem32(token, &ok);
-                if (ok && before == 0) {
-                    store32(token, 1, &ok);
-                    std::printf("[armv7] swift_once -> running initializer 0x%08x\n", fn);
-                    const uint64_t at = steps;
-                    if (!ok || !call_guest(fn, ctx)) break;
-                    std::printf("[armv7] swift_once -> initializer returned after %llu instructions\n",
-                                static_cast<unsigned long long>(steps - at));
-                }
-                cpu.r[0] = 0;
-                const uint32_t ret = cpu.r[14];
-                if (ret == 0 || ret == 0xFFFFFFFEu || ret == 0xFFFFFFF0u || stub_name(ret)) {
-                    stop.reason = "_swift_once has no usable return address";
-                    break;
-                }
-                cpu.r[15] = ret;
-                ++steps;
+                if (!handle_swift_once()) break;
                 continue;
             }
             if (!std::strcmp(name, "_swift_retain") || !std::strcmp(name, "_swift_release")) {
