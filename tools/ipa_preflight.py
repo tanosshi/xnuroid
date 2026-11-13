@@ -51,15 +51,24 @@ def read_bundle(path):
 
 
 def thin_slice(data):
-    """Pick the arm64 slice of a thin or fat Mach-O."""
+    """Pick the arm64 slice of a fat Mach-O, else the first 32-bit ARM slice."""
     magic = struct.unpack_from(">I", data, 0)[0]
-    if magic == FAT_MAGIC:
+    if magic in (FAT_MAGIC, 0xCAFEBABF):
+        wide = magic == 0xCAFEBABF
         n = struct.unpack_from(">I", data, 4)[0]
+        slices = []
         for i in range(n):
-            cpu, _sub, off, size, _align = struct.unpack_from(">IIIII", data, 8 + 20 * i)
+            if wide:
+                cpu, sub, off, size = struct.unpack_from(">IIQQ", data, 8 + 32 * i)
+            else:
+                cpu, sub, off, size = struct.unpack_from(">IIII", data, 8 + 20 * i)
+            slices.append((cpu, off, size))
+        for cpu, off, size in slices:
             if cpu == CPU_ARM64:
                 return data[off:off + size]
-        raise SystemExit("[preflight] fat binary without an arm64 slice")
+        if slices:
+            return data[slices[0][1]:slices[0][1] + slices[0][2]]
+        raise SystemExit("[preflight] empty fat binary")
     return data
 
 
@@ -88,26 +97,35 @@ def sleb(d, p):
 
 
 def parse_macho(d):
-    if struct.unpack_from("<I", d, 0)[0] != MH_MAGIC_64:
-        raise SystemExit("[preflight] not a 64-bit little-endian Mach-O")
+    magic = struct.unpack_from("<I", d, 0)[0]
+    if magic == MH_MAGIC_64:
+        bits, hdr = 64, 32
+    elif magic == 0xFEEDFACE:
+        bits, hdr = 32, 28
+    else:
+        raise SystemExit("[preflight] not a 64-bit or 32-bit little-endian Mach-O (magic 0x%08x)" % magic)
     cpu, sub = struct.unpack_from("<II", d, 4)
     ncmds = struct.unpack_from("<I", d, 16)[0]
-    out = {"cputype": cpu, "cpusubtype": sub, "ncmds": ncmds, "segs": [], "dylibs": [],
+    out = {"cputype": cpu, "cpusubtype": sub, "ncmds": ncmds, "segs": [], "dylibs": [], "bits": bits,
            "chained": None, "entry": None, "cryptid": None, "minos": None, "sdk": None,
            "dyld_info": None, "imports": []}
-    off = 32
+    off = hdr
     for _ in range(ncmds):
         cmd, size = struct.unpack_from("<II", d, off)
-        if cmd == LC_SEGMENT_64:
+        if bits == 64 and cmd == LC_SEGMENT_64:
             name = d[off + 8:off + 24].split(b"\0")[0].decode("ascii", "replace")
             vm, vs, fo, fs = struct.unpack_from("<QQQQ", d, off + 24)
+            out["segs"].append((name, vm, vs, fo, fs))
+        elif bits == 32 and cmd == 0x1:
+            name = d[off + 8:off + 24].split(b"\0")[0].decode("ascii", "replace")
+            vm, vs, fo, fs = struct.unpack_from("<IIII", d, off + 24)
             out["segs"].append((name, vm, vs, fo, fs))
         elif cmd in LC_DYLIB:
             so = struct.unpack_from("<I", d, off + 8)[0]
             out["dylibs"].append(d[off + so:off + size].split(b"\0")[0].decode("ascii", "replace"))
         elif cmd == LC_MAIN:
             out["entry"] = struct.unpack_from("<Q", d, off + 8)[0]
-        elif cmd == LC_ENCRYPTION_INFO_64:
+        elif cmd in (LC_ENCRYPTION_INFO_64, 0x21):
             out["cryptid"] = struct.unpack_from("<III", d, off + 8)[2]
         elif cmd == LC_BUILD_VERSION:
             plat, minos, sdk = struct.unpack_from("<III", d, off + 8)
@@ -120,8 +138,8 @@ def parse_macho(d):
         elif cmd == LC_CHAINED_FIXUPS:
             out["chained"] = struct.unpack_from("<II", d, off + 8)
         elif cmd in LC_DYLD_INFO:
-            out["dyld_info"] = struct.unpack_from("<II", d, off + 8)[0:2] + \
-                               struct.unpack_from("<II", d, off + 32)[0:2]
+            # rebase, bind, weak_bind, lazy_bind, export: keep all five pairs so callers pick the right stream
+            out["dyld_info"] = struct.unpack_from("<10I", d, off + 8)
         off += size
     return out
 
@@ -152,8 +170,10 @@ def chained_imports(d, chained):
 
 def classic_imports(d, dyld_info):
     """Walk the bind and lazy-bind streams; symbol names are what matter here."""
-    bind_off, bind_size, lazy_off, lazy_size = dyld_info
+    bind_off, bind_size = dyld_info[2], dyld_info[3]
+    lazy_off, lazy_size = dyld_info[6], dyld_info[7]
     names = []
+    seen = set()
     for is_lazy, (off, size) in ((False, (bind_off, bind_size)), (True, (lazy_off, lazy_size))):
         if not size:
             continue
@@ -172,7 +192,10 @@ def classic_imports(d, dyld_info):
                 ordinal = imm | 0xF0 if imm else 0
             elif op == 0x40:
                 end_sym = d.index(b"\0", p)
-                names.append((d[p:end_sym].decode("utf-8", "replace"), ordinal, is_lazy))
+                symbol = d[p:end_sym].decode("utf-8", "replace")
+                if symbol not in seen:   # the same import can appear in both streams
+                    seen.add(symbol)
+                    names.append((symbol, ordinal, is_lazy))
                 p = end_sym + 1
             elif op == 0x50:
                 pass
@@ -236,14 +259,20 @@ def owner_of(lib, libs):
     return libs[lib - 1].split("/")[-1] if 0 < lib <= len(libs) else "ord%d" % lib
 
 
+def is_objc_class(name):
+    return name.startswith("_OBJC_CLASS_$_") or name.startswith("_OBJC_METACLASS_$_")
+
+
+def is_swift(name):
+    return name.startswith("_$s") or name.startswith("_swift_")
+
+
 def classify(imports, prov, libs=()):
-    is_class = lambda s: s.startswith("_OBJC_CLASS_$_") or s.startswith("_OBJC_METACLASS_$_")
-    is_swift = lambda s: s.startswith("_$s") or s.startswith("_swift_")
     rows = {"provided": [], "class": [], "constant": [], "libc": [], "swift": [], "other": []}
     for name, lib, lazy in imports:
         if name in prov:
             rows["provided"].append(name)
-        elif is_class(name):
+        elif is_objc_class(name):
             rows["class"].append(name)
         elif is_swift(name):
             rows["swift"].append(name)
@@ -258,6 +287,7 @@ def classify(imports, prov, libs=()):
 
 def main(argv):
     as_json = "--json" in argv
+    owners = "--owners" in argv
     args = [a for a in argv[1:] if not a.startswith("--")]
     if len(args) != 1:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
@@ -266,6 +296,18 @@ def main(argv):
     pl, raw, display, sc_info = read_bundle(args[0])
     d = thin_slice(raw)
     m = parse_macho(d)
+    if m["bits"] == 32:
+        arch = {12: "armv7", 11: "armv7s", 6: "armv6"}.get(m["cpusubtype"], "armv7")
+        print("bundle      %s" % display, flush=True)
+        print("target      32-bit %s (cputype 0x%x, subtype %d) | minos %s | cryptid %s"
+              % (arch, m["cputype"], m["cpusubtype"], m["minos"], m["cryptid"]), flush=True)
+        imports = classic_imports(d, m["dyld_info"]) if m["dyld_info"] else []
+        swift = sum(1 for name, _l, _z in imports if is_swift(name))
+        classes = sum(1 for name, _l, _z in imports if is_objc_class(name))
+        print("imports     %d via classic dyld (%d Swift, %d ObjC classes, %d dylibs)"
+              % (len(imports), swift, classes, len(m["dylibs"])), flush=True)
+        print("verdict     unsupported: 32-bit %s; this loader runs 64-bit arm64 images only" % arch, flush=True)
+        return 5
     if m["chained"]:
         imports = chained_imports(d, m["chained"])
         stream = "chained fixups"
@@ -302,6 +344,19 @@ def main(argv):
         "other": len(rows["other"]), "supported": supported, "supported_pct": round(pct, 1),
         "verdict": verdict, "exit": code,
     }
+    if owners:
+        # Which dylib owns each import: the list of images a bundle needs, largest first.
+        stats = {}
+        for name, lib, lazy in imports:
+            owner = owner_of(lib, libs=m["dylibs"])
+            n_imports, n_swift = stats.get(owner, (0, 0))
+            stats[owner] = (n_imports + 1, n_swift + (1 if name.startswith(("_$s", "_swift_")) else 0))
+        if as_json:
+            report["owners"] = {k: {"imports": v[0], "swift": v[1]} for k, v in stats.items()}
+        else:
+            print("owners      imports (Swift) per dylib:")
+            for owner, (n_imports, n_swift) in sorted(stats.items(), key=lambda kv: -kv[1][0]):
+                print("  %6d %6d  %s" % (n_imports, n_swift, owner))
     if as_json:
         print(json.dumps(report, indent=2))
     else:
