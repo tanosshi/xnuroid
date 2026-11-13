@@ -18,8 +18,12 @@ namespace {
 
 constexpr uint32_t kImageHint = 0x10000000;
 constexpr uint32_t kStubHint = 0x30000000;
+constexpr uint32_t kHeapHint = 0x40000000;
 constexpr uint32_t kStackHint = 0x70000000;
 constexpr uint32_t kStackSize = 1u << 20;
+constexpr uint32_t kHeapSize = 1u << 16;
+constexpr uint32_t kGuestStringMagic = 0x47535452;   // 'RTSG'
+uint32_t g_heap_used = 0;
 constexpr uint32_t kStubStride = 8;
 constexpr uint32_t kMaxStubs = 4096;
 constexpr uint32_t kPage = 4096;
@@ -1128,6 +1132,39 @@ bool step_thumb(Cpu& c, Stop& stop) {
     return unhandled("thumb32");
 }
 
+// A guest-side string object: 16-byte header (magic, kind, length, reserved) followed by NUL-terminated bytes.
+// Everything the guest can ask about it goes through the Objective-C shim below, so the layout is ours to choose.
+uint32_t make_guest_string(const std::string& text) {
+    const uint32_t need = 16 + static_cast<uint32_t>(text.size()) + 1;
+    if (g_heap_used + need > kHeapSize) return 0;
+    const uint32_t base = kHeapHint + g_heap_used;
+    g_heap_used += (need + 7) & ~7u;
+    bool ok = true;
+    store32(base, kGuestStringMagic, &ok);
+    store32(base + 4, 1, &ok);
+    store32(base + 8, static_cast<uint32_t>(text.size()), &ok);
+    store32(base + 12, 0, &ok);
+    for (size_t i = 0; i < text.size() && ok; ++i) store8(base + 16 + static_cast<uint32_t>(i), static_cast<uint8_t>(text[i]), &ok);
+    if (ok) store8(base + 16 + static_cast<uint32_t>(text.size()), 0, &ok);
+    return ok ? base : 0;
+}
+
+bool is_guest_string(uint32_t addr) {
+    bool ok = true;
+    return mem32(addr, &ok) == kGuestStringMagic && ok;
+}
+
+std::string guest_cstr(uint32_t addr, size_t max = 128) {
+    std::string out;
+    for (size_t i = 0; i < max; ++i) {
+        bool ok = true;
+        const char ch = static_cast<char>(mem8(addr + static_cast<uint32_t>(i), &ok));
+        if (!ok || !ch) break;
+        out.push_back(ch);
+    }
+    return out;
+}
+
 // Loads the bundled Swift runtime (or any other armv7 dylib) into the same low arena. Its exports are recorded so the
 // app's Swift imports bind to real runtime code instead of trampolines.
 bool load_side_image(const char* path, uint32_t hint, std::vector<uint8_t>& store, Image& img) {
@@ -1199,7 +1236,10 @@ int run_image(uint8_t* data, size_t size, const char* path) {
     if (!map_fixed(kStackHint, kStackSize, &stack_map)) { std::fprintf(stderr, "[armv7] cannot reserve stack\n"); return 1; }
 
     g_regions.push_back({img.base_addr, img.base_addr + map_span, "image"});
+    void* heap_map = nullptr;
+    if (!map_fixed(kHeapHint, kHeapSize, &heap_map)) { std::fprintf(stderr, "[armv7] cannot reserve guest heap\n"); return 1; }
     g_regions.push_back({kStubHint, kStubHint + kPage, "stubs"});
+    g_regions.push_back({kHeapHint, kHeapHint + kHeapSize, "heap"});
     g_regions.push_back({kStackHint, kStackHint + kStackSize, "stack"});
     g_code_ranges.push_back({img.base_addr, img.base_addr + map_span});
 
@@ -1324,6 +1364,42 @@ int run_image(uint8_t* data, size_t size, const char* path) {
         if (const char* name = stub_name(pc)) {
             if (!std::strcmp(name, "_swift_once")) {
                 if (!handle_swift_once()) break;
+                continue;
+            }
+            if (!std::strcmp(name, "_objc_msgSend") || !std::strcmp(name, "_objc_msgSendSuper2")) {
+                const uint32_t receiver = cpu.r[0];
+                const std::string selector = guest_cstr(cpu.r[1], 96);
+                const bool guest_string = is_guest_string(receiver);
+                std::printf("[armv7] objc_msgSend(0x%08x%s, %s)\n", receiver, guest_string ? ", string" : "",
+                            selector.c_str());
+                uint32_t result = 0;
+                if (guest_string) {
+                    bool ok = true;
+                    const uint32_t length = mem32(receiver + 8, &ok);
+                    const uint32_t bytes = receiver + 16;
+                    if (selector == "UTF8String" || selector == "cString") result = bytes;
+                    else if (selector == "length" || selector == "count") result = length;
+                    else if (selector == "description" || selector == "self" || selector == "class") result = receiver;
+                    else if (selector == "hash") result = length * 31;
+                    else if (selector == "isEqualToString:") result = guest_cstr(bytes) == guest_cstr(cpu.r[2]) ? 1 : 0;
+                } else if (selector == "class" || selector == "self") {
+                    result = receiver;
+                } else if (selector == "isKindOfClass:" || selector == "respondsToSelector:" || selector == "conformsToProtocol:") {
+                    result = 1;
+                }
+                cpu.r[0] = result;
+                cpu.r[15] = cpu.r[14];
+                ++steps;
+                continue;
+            }
+            if (!std::strcmp(name, "_NSStringFromClass")) {
+                // The classic main() hands this name to UIApplicationMain as the principal class.
+                const uint32_t cls = cpu.r[0];
+                const uint32_t text = make_guest_string("Calculator.AppDelegate");
+                std::printf("[armv7] NSStringFromClass(0x%08x) -> \"Calculator.AppDelegate\"\n", cls);
+                cpu.r[0] = text;
+                cpu.r[15] = cpu.r[14];
+                ++steps;
                 continue;
             }
             if (!std::strcmp(name, "_swift_retain") || !std::strcmp(name, "_swift_release")) {
