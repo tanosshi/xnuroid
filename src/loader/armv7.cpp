@@ -89,6 +89,16 @@ uint8_t mem8(uint32_t addr, bool* ok) {
     return *reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
 }
 
+uint16_t mem16(uint32_t addr, bool* ok) {
+    if (!in_regions(addr, 2)) { *ok = false; return 0; }
+    return rd16(reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr)));
+}
+
+void store16(uint32_t addr, uint16_t v, bool* ok) {
+    if (!in_regions(addr, 2)) { *ok = false; return; }
+    std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &v, 2);
+}
+
 void store32(uint32_t addr, uint32_t v, bool* ok) {
     if (!in_regions(addr, 4)) { *ok = false; return; }
     std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &v, 4);
@@ -179,7 +189,8 @@ void parse_exports(const uint8_t* d, size_t size, uint32_t off, uint32_t len, Im
             const uint64_t flags = read_uleb(p);
             if (!(flags & 0x08) && p < end) {   // 0x08: a re-export has an ordinal, not an address
                 const uint32_t addr = static_cast<uint32_t>(read_uleb(p));
-                if (addr) img.defined.emplace(f.prefix, addr);
+                // The export trie keeps bit 0 for Thumb functions; LC_SYMTAB clears it. Prefer the trie.
+                if (addr) img.defined[f.prefix] = addr;
             }
         }
         if (p >= end) continue;
@@ -306,6 +317,9 @@ bool apply_binds(const Image& img, const uint8_t* data, uint32_t off, uint32_t s
 struct Cpu {
     uint32_t r[16] = {};
     uint32_t cpsr = 0x10;
+    bool thumb = false;
+    uint8_t it_count = 0, it_index = 0;   // pending IT block (Thumb only)
+    uint8_t it_cond[4] = {};
 };
 
 constexpr uint32_t kN = 1u << 31, kZ = 1u << 30, kC = 1u << 29, kV = 1u << 28;
@@ -373,9 +387,9 @@ bool step(Cpu& c, Stop& stop) {
             uint32_t off = ((instr & 0x00FFFFFF) << 2) | ((instr >> 24) & 1) << 1;
             if (off & 0x02000000) off |= 0xFC000000;
             c.r[14] = pc + 4;
-            uint32_t target = pc + 8 + off;
-            if (target & 1) { stop.reason = "entered Thumb state"; return false; }
-            c.r[15] = target & ~3u;
+            const uint32_t target = pc + 8 + off;
+            c.thumb = true;   // BLX immediate always switches to Thumb
+            c.r[15] = target & ~1u;
             return true;
         }
         stop.reason = "unconditional instruction";
@@ -400,8 +414,8 @@ bool step(Cpu& c, Stop& stop) {
         const uint32_t rm = instr & 0xF;
         const uint32_t target = c.r[rm];
         if ((instr & 0x0FFFFFF0) == 0x012FFF30) c.r[14] = pc + 4;
-        if (target & 1) { stop.reason = "entered Thumb state"; return false; }
-        c.r[15] = target & ~3u;
+        c.thumb = (target & 1) != 0;
+        c.r[15] = target & ~1u;
         return true;
     }
 
@@ -551,8 +565,8 @@ bool step(Cpu& c, Stop& stop) {
         const bool test_only = (op >= 8 && op <= 0xb);
         if (!test_only && rd != 15) c.r[rd] = res;
         if (!test_only && rd == 15) {
-            if (res & 1) { stop.reason = "entered Thumb state"; return false; }
-            c.r[15] = res & ~3u;
+            c.thumb = (res & 1) != 0;
+            c.r[15] = res & ~1u;
             return true;
         }
         c.r[15] = pc + 4;
@@ -588,8 +602,8 @@ bool step(Cpu& c, Stop& stop) {
             uint32_t v = byte ? mem8(addr, &mem_ok) : mem32(addr, &mem_ok);
             if (!mem_ok) { stop.reason = "load outside guest memory"; return false; }
             if (rd == 15) {
-                if (v & 1) { stop.reason = "entered Thumb state"; return false; }
-                c.r[15] = v & ~3u;
+                c.thumb = (v & 1) != 0;
+                c.r[15] = v & ~1u;
             } else {
                 c.r[rd] = v;
                 c.r[15] = pc + 4;
@@ -629,8 +643,8 @@ bool step(Cpu& c, Stop& stop) {
         if (wb) c.r[rn] = up ? base + 4 * count : base - 4 * count;
         if (load && (list & 0x8000)) {
             const uint32_t target = c.r[15];
-            if (target & 1) { stop.reason = "entered Thumb state"; return false; }
-            c.r[15] = target & ~3u;
+            c.thumb = (target & 1) != 0;
+            c.r[15] = target & ~1u;
         } else {
             c.r[15] = pc + 4;
         }
@@ -739,6 +753,381 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
 
 }  // namespace
 
+// ---------------------------------------------------------------------------------------------------------------
+// Thumb / T32 decoder. libswiftCore is built Thumb-2, so every runtime entry point arrives here. The subset below is
+// driven by what the runtime actually executes: 16-bit data processing, loads and stores, branches, push/pop and the
+// 32-bit BL, MOVW/MOVT, load/store forms and IT blocks that clang emits.
+// ---------------------------------------------------------------------------------------------------------------
+
+void thumb_set_pc(Cpu& c, uint32_t v) {
+    c.thumb = (v & 1) != 0;
+    c.r[15] = v & ~1u;
+}
+
+bool step_thumb(Cpu& c, Stop& stop) {
+    const uint32_t pc = c.r[15];
+    if (const char* called = stub_name(pc)) {
+        stop.hit = true;
+        stop.reason = called;
+        return false;
+    }
+    if (pc == 0 || pc == 0xFFFFFFFEu) { stop.reason = "guest returned"; return false; }
+    bool ok = true;
+    const uint32_t hw = mem16(pc, &ok);
+    if (!ok) { stop.reason = "pc outside mapped guest memory"; return false; }
+
+    uint32_t cond = 0xE;
+    if (c.it_count) {
+        cond = c.it_cond[c.it_index++];
+        if (c.it_index >= c.it_count) { c.it_count = 0; c.it_index = 0; }
+    }
+    const bool is32 = ((hw >> 11) >= 0x1D);   // 11101 / 11110 / 11111 prefixes
+    c.r[15] = pc + (is32 ? 4 : 2);
+    if (cond != 0xE && !cond_ok(cond, c.cpsr)) return true;
+
+    auto write = [&](uint32_t rd, uint32_t v) {
+        if (rd == 15) thumb_set_pc(c, v);   // bx-mov to pc selects the state from bit 0
+        else c.r[rd] = v;
+    };
+    auto addf = [&](uint32_t a, uint32_t b, uint32_t carry) -> uint32_t {
+        const uint64_t wide = static_cast<uint64_t>(a) + b + carry;
+        const uint32_t res = static_cast<uint32_t>(wide);
+        c.cpsr &= ~(kN | kZ | kC | kV);
+        if (res & 0x80000000u) c.cpsr |= kN;
+        if (!res) c.cpsr |= kZ;
+        if (wide >> 32) c.cpsr |= kC;
+        if ((~(a ^ b) & (a ^ res)) & 0x80000000u) c.cpsr |= kV;
+        return res;
+    };
+    auto subf = [&](uint32_t a, uint32_t b, uint32_t borrow) -> uint32_t {
+        const uint64_t wide = static_cast<uint64_t>(a) - b - borrow;
+        const uint32_t res = static_cast<uint32_t>(wide);
+        c.cpsr &= ~(kN | kZ | kC | kV);
+        if (res & 0x80000000u) c.cpsr |= kN;
+        if (!res) c.cpsr |= kZ;
+        if (static_cast<uint64_t>(a) >= static_cast<uint64_t>(b) + borrow) c.cpsr |= kC;
+        if (((a ^ b) & (a ^ res)) & 0x80000000u) c.cpsr |= kV;
+        return res;
+    };
+    auto branch = [&](uint32_t target, bool link) {
+        if (link) c.r[14] = (pc + (is32 ? 4 : 2)) | 1u;
+        c.thumb = true;
+        c.r[15] = target & ~1u;
+    };
+    auto unhandled = [&](const char* what) {
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%s at pc=0x%08x (hw=0x%04x)", what, pc, hw);
+        stop.reason = buf;
+        return false;
+    };
+
+    if (!is32) {
+        if (hw < 0x2000) {
+            const uint32_t kind = (hw >> 11) & 3;
+            const uint32_t rd = hw & 7, rm = (hw >> 3) & 7;
+            if (kind < 3) {
+                uint32_t shift = (hw >> 6) & 0x1F;
+                uint32_t v = c.r[rm];
+                if (kind == 0) v = shift ? (v << shift) : v;
+                else if (kind == 1) v = shift ? (v >> shift) : 0;
+                else v = shift ? static_cast<uint32_t>(static_cast<int32_t>(v) >> shift) : v;
+                write(rd, v);
+                set_nz(c, v);
+                return true;
+            }
+            const uint32_t subop = (hw >> 9) & 3;
+            const uint32_t b = (subop & 2) ? ((hw >> 6) & 7) : c.r[rm];
+            const uint32_t v = (subop & 1) ? subf(c.r[rd], b, 0) : addf(c.r[rd], b, 0);
+            write(rd, v);
+            return true;
+        }
+        if (hw < 0x4000) {
+            const uint32_t sub = (hw >> 11) & 3;
+            const uint32_t rd = (hw >> 8) & 7, imm = hw & 0xFF;
+            if (sub == 0) { write(rd, imm); set_nz(c, imm); }
+            else if (sub == 1) subf(c.r[rd], imm, 0);
+            else if (sub == 2) write(rd, addf(c.r[rd], imm, 0));
+            else write(rd, subf(c.r[rd], imm, 0));
+            return true;
+        }
+        if (hw < 0x4400) {   // data processing, register
+            const uint32_t op = (hw >> 6) & 0xF, rd = hw & 7, rm = (hw >> 3) & 7;
+            const uint32_t a = c.r[rd], b = c.r[rm];
+            switch (op) {
+                case 0x0: write(rd, a & b); set_nz(c, c.r[rd]); break;
+                case 0x1: write(rd, a ^ b); set_nz(c, c.r[rd]); break;
+                case 0x2: { uint32_t s = b & 0xFF; write(rd, s >= 32 ? 0 : a << s); set_nz(c, c.r[rd]); break; }
+                case 0x3: { uint32_t s = b & 0xFF; write(rd, s >= 32 ? 0 : a >> s); set_nz(c, c.r[rd]); break; }
+                case 0x4: { uint32_t s = b & 0xFF; write(rd, s >= 32 ? (a >> 31) : static_cast<uint32_t>(static_cast<int32_t>(a) >> s)); set_nz(c, c.r[rd]); break; }
+                case 0x5: write(rd, addf(a, b, (c.cpsr & kC) ? 1 : 0)); break;
+                case 0x6: write(rd, subf(a, b, (c.cpsr & kC) ? 1 : 0)); break;
+                case 0x7: { uint32_t s = b & 0xFF; s &= 31; write(rd, s ? ((a >> s) | (a << (32 - s))) : a); set_nz(c, c.r[rd]); break; }
+                case 0x8: subf(a, b, 0); break;
+                case 0x9: write(rd, subf(0, b, 0)); break;
+                case 0xA: subf(a, b, 0); break;
+                case 0xB: addf(a, b, 0); break;
+                case 0xC: write(rd, a | b); set_nz(c, c.r[rd]); break;
+                case 0xD: write(rd, a * b); set_nz(c, c.r[rd]); break;
+                case 0xE: write(rd, a & ~b); set_nz(c, c.r[rd]); break;
+                default: write(rd, ~b); set_nz(c, c.r[rd]); break;
+            }
+            return true;
+        }
+        if (hw < 0x4800) {   // high register operations, bx/blx
+            const uint32_t op = (hw >> 8) & 3;
+            const uint32_t rd = (hw & 7) | ((hw >> 4) & 8), rm = (hw >> 3) & 0xF;
+            const uint32_t pc_val = (pc + 4) & ~3u;   // Thumb reads PC with bit 1 cleared
+            const uint32_t rm_val = rm == 15 ? pc_val : c.r[rm];
+            const uint32_t rd_val = rd == 15 ? pc_val : c.r[rd];
+            if (op == 0) { const uint32_t v = rd_val + rm_val; if (rd == 15) branch(v, false); else c.r[rd] = v; }
+            else if (op == 1) subf(rd_val, rm_val, 0);
+            else if (op == 2) { if (rd == 15) branch(rm_val, false); else c.r[rd] = rm_val; }
+            else { if (hw & 0x80) c.r[14] = (pc + 2) | 1u; thumb_set_pc(c, rm_val); }
+            return true;
+        }
+        if (hw < 0x5000) {   // ldr literal
+            const uint32_t rt = (hw >> 8) & 7, imm = (hw & 0xFF) << 2;
+            const uint32_t v = mem32(((pc + 4) & ~3u) + imm, &ok);
+            if (!ok) { stop.reason = "thumb literal outside memory"; return false; }
+            write(rt, v);
+            return true;
+        }
+        if (hw < 0x6000) {   // load/store, register offset
+            const uint32_t op = (hw >> 9) & 7, rm = (hw >> 6) & 7, rn = (hw >> 3) & 7, rt = hw & 7;
+            const uint32_t addr = c.r[rn] + c.r[rm];
+            uint32_t v = 0;
+            switch (op) {
+                case 0: store32(addr, c.r[rt], &ok); break;
+                case 1: store16(addr, static_cast<uint16_t>(c.r[rt]), &ok); break;
+                case 2: store8(addr, static_cast<uint8_t>(c.r[rt]), &ok); break;
+                case 3: v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(mem8(addr, &ok)))); write(rt, v); break;
+                case 4: v = mem32(addr, &ok); write(rt, v); break;
+                case 5: v = mem16(addr, &ok); write(rt, v); break;
+                case 6: v = mem8(addr, &ok); write(rt, v); break;
+                default: v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(mem16(addr, &ok)))); write(rt, v); break;
+            }
+            if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+            return true;
+        }
+        if (hw < 0x7000) {   // load/store, immediate
+            const uint32_t op = (hw >> 11) & 3, imm = (hw >> 6) & 0x1F, rn = (hw >> 3) & 7, rt = hw & 7;
+            const uint32_t addr = c.r[rn] + (op == 0 ? imm << 2 : imm);
+            if (op == 0) store32(addr, c.r[rt], &ok);
+            else if (op == 1) write(rt, mem32(addr, &ok));
+            else if (op == 2) store8(addr, static_cast<uint8_t>(c.r[rt]), &ok);
+            else write(rt, mem8(addr, &ok));
+            if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+            return true;
+        }
+        if (hw < 0x8000) {   // load/store byte, register offset
+            const uint32_t rn = (hw >> 3) & 7, rm = (hw >> 6) & 7, rt = hw & 7;
+            const uint32_t addr = c.r[rn] + c.r[rm];
+            if (hw & 0x800) write(rt, mem8(addr, &ok));
+            else store8(addr, static_cast<uint8_t>(c.r[rt]), &ok);
+            if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+            return true;
+        }
+        if (hw < 0x9000) {   // load/store halfword, immediate
+            const uint32_t imm = ((hw >> 6) & 0x1F) << 1, rn = (hw >> 3) & 7, rt = hw & 7;
+            const uint32_t addr = c.r[rn] + imm;
+            if (hw & 0x800) write(rt, mem16(addr, &ok));
+            else store16(addr, static_cast<uint16_t>(c.r[rt]), &ok);
+            if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+            return true;
+        }
+        if (hw < 0xA000) {   // sp-relative load/store
+            const uint32_t rt = (hw >> 8) & 7, imm = (hw & 0xFF) << 2, addr = c.r[13] + imm;
+            if (hw & 0x800) write(rt, mem32(addr, &ok));
+            else store32(addr, c.r[rt], &ok);
+            if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+            return true;
+        }
+        if (hw < 0xB000) {   // adr
+            const uint32_t rd = (hw >> 8) & 7, imm = (hw & 0xFF) << 2;
+            const uint32_t base = (hw & 0x800) ? (c.r[13] & ~3u) : ((pc + 4) & ~3u);
+            write(rd, base + imm);
+            return true;
+        }
+        if (hw < 0xC000) {   // misc: IT, sp adjust, push/pop, cbz, extend
+            if ((hw & 0xFF00) == 0xBF00) {
+                const uint32_t mask = hw & 0xF;
+                if (!mask) return true;   // nop / yield / wfe
+                const uint8_t base = static_cast<uint8_t>((hw >> 4) & 0xF);
+                c.it_cond[0] = base;
+                c.it_count = 1;
+                c.it_index = 0;
+                switch (mask) {
+                    case 0x8: break;
+                    case 0xC: c.it_cond[1] = base; c.it_count = 2; break;
+                    case 0x4: c.it_cond[1] = base ^ 1; c.it_count = 2; break;
+                    case 0xE: c.it_cond[1] = base; c.it_cond[2] = base; c.it_count = 3; break;
+                    case 0x6: c.it_cond[1] = base ^ 1; c.it_cond[2] = base; c.it_count = 3; break;
+                    case 0x2: c.it_cond[1] = base ^ 1; c.it_cond[2] = base ^ 1; c.it_count = 3; break;
+                    default: return unhandled("thumb IT mask");
+                }
+                return true;
+            }
+            if ((hw & 0xFF00) == 0xB000) { c.r[13] += (hw & 0x7F) << 2; return true; }
+            if ((hw & 0xFF00) == 0xB080) { c.r[13] -= (hw & 0x7F) << 2; return true; }
+            if ((hw & 0xFE00) == 0xB400) {   // push
+                uint32_t list = hw & 0xFF, count = 0;
+                for (uint32_t i = 0; i < 8; ++i) if (list & (1u << i)) ++count;
+                if (hw & 0x100) ++count;
+                uint32_t addr = c.r[13] - 4 * count;
+                c.r[13] = addr;
+                for (uint32_t i = 0; i < 8; ++i) if (list & (1u << i)) { store32(addr, c.r[i], &ok); addr += 4; }
+                if (hw & 0x100) store32(addr, c.r[14], &ok);
+                if (!ok) { stop.reason = "thumb push outside memory"; return false; }
+                return true;
+            }
+            if ((hw & 0xFE00) == 0xBC00) {   // pop
+                uint32_t list = hw & 0xFF, addr = c.r[13];
+                for (uint32_t i = 0; i < 8; ++i) if (list & (1u << i)) { c.r[i] = mem32(addr, &ok); addr += 4; }
+                if (hw & 0x100) { const uint32_t v = mem32(addr, &ok); addr += 4; c.r[13] = addr; if (!ok) { stop.reason = "thumb pop outside memory"; return false; } branch(v, false); return true; }
+                c.r[13] = addr;
+                if (!ok) { stop.reason = "thumb pop outside memory"; return false; }
+                return true;
+            }
+            if ((hw & 0xF500) == 0xB100) {   // cbz / cbnz
+                const uint32_t rn = hw & 7;
+                const uint32_t off = ((hw >> 9) & 1) << 6 | ((hw >> 3) & 0x1F) << 1;
+                const bool zero = c.r[rn] == 0;
+                if (zero == ((hw & 0x800) == 0)) branch(pc + 4 + off, false);
+                return true;
+            }
+            if ((hw & 0xFF00) == 0xB200) {   // sxth/sxtb/uxth/uxtb
+                const uint32_t op = (hw >> 6) & 3, rm = (hw >> 3) & 7, rd = hw & 7;
+                const uint32_t v = c.r[rm];
+                if (op == 0) write(rd, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v))));
+                else if (op == 1) write(rd, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v))));
+                else if (op == 2) write(rd, v & 0xFFFF);
+                else write(rd, v & 0xFF);
+                return true;
+            }
+            return unhandled("thumb misc");
+        }
+        if (hw >= 0xC000 && hw < 0xD000) {   // ldm/stm
+            const bool load = (hw & 0x800) != 0;
+            const uint32_t rn = (hw >> 8) & 7;
+            const uint32_t list = hw & 0xFF;
+            uint32_t addr = c.r[rn];
+            bool wrote_base = false;
+            for (uint32_t i = 0; i < 8; ++i) {
+                if (!(list & (1u << i))) continue;
+                if (load) c.r[i] = mem32(addr, &ok);
+                else store32(addr, c.r[i], &ok);
+                addr += 4;
+                if (i == rn) wrote_base = true;
+            }
+            if (!ok) { stop.reason = "thumb block transfer outside memory"; return false; }
+            if (!load || !wrote_base) c.r[rn] = addr;
+            return true;
+        }
+        if (hw < 0xE000) {   // conditional branch
+            const uint32_t cc = (hw >> 8) & 0xF;
+            if (cc == 0xF) return unhandled("svc");
+            if (cc == 0xE) return unhandled("udf");
+            if (cond_ok(cc, c.cpsr)) {
+                uint32_t off = (hw & 0xFF) << 1;
+                if (off & 0x100) off |= 0xFFFFFE00u;
+                branch(pc + 4 + off, false);
+            }
+            return true;
+        }
+        uint32_t off = (hw & 0x7FF) << 1;
+        if (off & 0x800) off |= 0xFFFFF000u;
+        branch(pc + 4 + off, false);
+        return true;
+    }
+
+    // ---------------- 32-bit encodings ----------------
+    const uint32_t hw2 = mem16(pc + 2, &ok);
+    if (!ok) { stop.reason = "pc outside mapped guest memory"; return false; }
+    const uint32_t instr = (hw << 16) | hw2;
+
+    if ((instr & 0xF800D000) == 0xF000D000) {   // BL / BLX immediate
+        const uint32_t s = (instr >> 24) & 1, j1 = (instr >> 13) & 1, j2 = (instr >> 11) & 1;
+        const uint32_t i1 = (~(j1 ^ s)) & 1, i2 = (~(j2 ^ s)) & 1;
+        uint32_t off = (s << 24) | (i1 << 23) | (i2 << 22) | (((instr >> 12) & 0x3FF) << 12) | ((instr & 0x7FF) << 1);
+        if (off & 0x02000000u) off |= 0xFC000000u;
+        branch(pc + 4 + off, true);
+        return true;
+    }
+    if ((hw & 0xF800) == 0xF000 && (hw2 & 0xD000) == 0x9000) {   // B.W (T4)
+        const uint32_t s = (hw >> 10) & 1, j1 = (hw2 >> 13) & 1, j2 = (hw2 >> 11) & 1;
+        const uint32_t i1 = (~(j1 ^ s)) & 1, i2 = (~(j2 ^ s)) & 1;
+        uint32_t off = (s << 24) | (i1 << 23) | (i2 << 22) | ((hw & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1);
+        if (off & 0x02000000u) off |= 0xFC000000u;
+        branch(pc + 4 + off, false);
+        return true;
+    }
+    if ((hw & 0xFFF0) == 0xF240 || (hw & 0xFFF0) == 0xF2C0) {   // MOVW / MOVT
+        const uint32_t rd = (instr >> 8) & 0xF;
+        const uint32_t imm16 = ((instr >> 16) & 0xF) << 12 | (((instr >> 26) & 1) << 11) | (((instr >> 12) & 7) << 8) |
+                               (instr & 0xFF);
+        if ((instr & 0x00800000) != 0) c.r[rd] = (c.r[rd] & 0xFFFF) | (imm16 << 16);
+        else c.r[rd] = imm16;
+        return true;
+    }
+    const uint32_t hw1op = hw & 0xFFF0;
+    if (hw1op == 0xF8C0 || hw1op == 0xF8D0 || hw1op == 0xF880 || hw1op == 0xF890 || hw1op == 0xF8A0 ||
+        hw1op == 0xF8B0) {   // load/store, imm12
+        const uint32_t rn = hw & 0xF, rt = (instr >> 12) & 0xF, imm = instr & 0xFFF;
+        const uint32_t addr = c.r[rn] + imm;
+        if (hw1op == 0xF8D0) write(rt, mem32(addr, &ok));
+        else if (hw1op == 0xF8C0) store32(addr, c.r[rt], &ok);
+        else if (hw1op == 0xF890) write(rt, mem8(addr, &ok));
+        else if (hw1op == 0xF880) store8(addr, static_cast<uint8_t>(c.r[rt]), &ok);
+        else if (hw1op == 0xF8B0) write(rt, mem16(addr, &ok));
+        else store16(addr, static_cast<uint16_t>(c.r[rt]), &ok);
+        if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+        return true;
+    }
+    if (hw1op == 0xF850 || hw1op == 0xF840) {   // load/store, register offset
+        const uint32_t rn = hw & 0xF, rt = (instr >> 12) & 0xF, rm = instr & 0xF;
+        const uint32_t addr = c.r[rn] + c.r[rm];
+        if (hw1op == 0xF850) write(rt, mem32(addr, &ok));
+        else store32(addr, c.r[rt], &ok);
+        if (!ok) { stop.reason = "thumb transfer outside memory"; return false; }
+        return true;
+    }
+    if ((instr & 0xFFFF) == 0xE92D || (instr & 0xFFFF) == 0xE8BD) {   // push / pop
+        const bool pop = (instr & 0xFFFF) == 0xE8BD;
+        const uint32_t list = instr & 0xFFFF;
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < 15; ++i) if (list & (1u << i)) ++count;
+        uint32_t addr = pop ? c.r[13] : c.r[13] - 4 * count;
+        c.r[13] = addr;
+        for (uint32_t i = 0; i < 15; ++i) {
+            if (!(list & (1u << i))) continue;
+            if (pop) c.r[i] = mem32(addr, &ok);
+            else store32(addr, c.r[i], &ok);
+            addr += 4;
+        }
+        if (!ok) { stop.reason = "thumb push/pop outside memory"; return false; }
+        if (pop && (list & 0x8000)) {
+            const uint32_t v = mem32(addr, &ok);
+            if (!ok) { stop.reason = "thumb pop pc outside memory"; return false; }
+            c.r[13] = addr + 4;
+            thumb_set_pc(c, v);
+        }
+        return true;
+    }
+    if ((hw & 0xFFF0) == 0xF10D || (hw & 0xFFF0) == 0xF1AD) {   // add/sub sp, sp, #imm
+        const uint32_t imm = (((instr >> 26) & 1) << 11) | (((instr >> 12) & 7) << 8) | (instr & 0xFF);
+        if ((hw & 0xFFF0) == 0xF1AD) c.r[13] -= imm; else c.r[13] += imm;
+        return true;
+    }
+    if ((hw & 0xFFF0) == 0xF1B0 || (hw & 0xFFF0) == 0xF010) {   // cmp/tst immediate
+        const uint32_t rn = hw & 0xF;
+        const uint32_t imm = (((instr >> 26) & 1) << 11) | (((instr >> 12) & 7) << 8) | (instr & 0xFF);
+        if ((hw & 0xFFF0) == 0xF1B0) subf(c.r[rn], imm, 0);
+        else set_nz(c, c.r[rn] & imm);
+        return true;
+    }
+    return unhandled("thumb32");
+}
+
 // Loads the bundled Swift runtime (or any other armv7 dylib) into the same low arena. Its exports are recorded so the
 // app's Swift imports bind to real runtime code instead of trampolines.
 bool load_side_image(const char* path, uint32_t hint, std::vector<uint8_t>& store, Image& img) {
@@ -769,6 +1158,16 @@ bool load_side_image(const char* path, uint32_t hint, std::vector<uint8_t>& stor
     g_code_ranges.push_back({img.base_addr, img.base_addr + span});
     for (const auto& kv : img.defined) g_extern.emplace(kv.first, img.base_addr + (kv.second - img.min_vm));
     std::printf("[armv7] runtime image %s at 0x%08x, %zu exports\n", path, img.base_addr, img.defined.size());
+
+    // The runtime has its own fixups (including its own stubs); resolve them the same way so a stub reachable from the
+    // app's call path reports the symbol it wants instead of jumping into zeros.
+    const uint32_t side_slide = img.base_addr - img.min_vm;
+    size_t side_rebases = 0, side_binds = 0, side_missing = 0;
+    if (!apply_rebases(img, store.data(), ro, rs, side_slide, &side_rebases)) return false;
+    if (!apply_binds(img, store.data(), bo, bs, false, &side_binds, &side_missing)) return false;
+    if (!apply_binds(img, store.data(), lo, ls, true, &side_binds, &side_missing)) return false;
+    std::printf("[armv7] runtime image: %zu rebases, %zu binds, %zu unresolved\n", side_rebases, side_binds,
+                side_missing);
     return true;
 }
 
@@ -837,7 +1236,8 @@ int run_image(uint8_t* data, size_t size, const char* path) {
     }
 
     Cpu cpu;
-    cpu.r[15] = img.entry;
+    cpu.thumb = (img.entry & 1) != 0;
+    cpu.r[15] = img.entry & ~1u;
     cpu.r[14] = 0xFFFFFFFEu;
     cpu.r[13] = kStackHint + kStackSize - 64;
     cpu.r[0] = 1;  // argc; no argv yet
@@ -868,11 +1268,13 @@ int run_image(uint8_t* data, size_t size, const char* path) {
         const uint32_t saved_lr = cpu.r[14], saved_pc = cpu.r[15];
         cpu.r[0] = ctx;
         cpu.r[14] = ret;
-        cpu.r[15] = fn & ~3u;
+        cpu.thumb = (fn & 1) != 0;
+        cpu.r[15] = fn & ~1u;
         while (cpu.r[15] != ret) {
             if (steps >= budget) { stop.reason = "instruction budget inside initializer"; return false; }
             if (const char* n = stub_name(cpu.r[15])) { stop.hit = true; stop.reason = n; return false; }
-            if (!step(cpu, stop)) return false;
+            const bool ran = cpu.thumb ? step_thumb(cpu, stop) : step(cpu, stop);
+            if (!ran) return false;
             ++steps;
         }
         cpu.r[14] = saved_lr;
@@ -907,10 +1309,12 @@ int run_image(uint8_t* data, size_t size, const char* path) {
 
     while (true) {
         const uint32_t pc = cpu.r[15];
-        if (static_cast<int>(steps) < trace)
-            std::printf("[armv7] %08llx  %08x  r0=%08x r1=%08x sp=%08x lr=%08x\n",
-                        static_cast<unsigned long long>(pc), [&] { bool ok = true; return mem32(pc, &ok); }(),
-                        cpu.r[0], cpu.r[1], cpu.r[13], cpu.r[14]);
+        if (static_cast<int>(steps) < trace) {
+            bool tok = true;
+            const uint32_t word = cpu.thumb ? mem16(pc, &tok) : mem32(pc, &tok);
+            std::printf("[armv7] %c%08llx  %08x  r0=%08x r1=%08x r12=%08x sp=%08x lr=%08x\n", cpu.thumb ? 'T' : 'A',
+                        static_cast<unsigned long long>(pc), word, cpu.r[0], cpu.r[1], cpu.r[12], cpu.r[13], cpu.r[14]);
+        }
 
         if (g_swift_once && ((pc | 1u) == (g_swift_once | 1u))) {
             if (!handle_swift_once()) break;
@@ -938,7 +1342,8 @@ int run_image(uint8_t* data, size_t size, const char* path) {
         }
 
         if (steps >= budget) { stop.reason = "instruction budget exhausted"; break; }
-        if (!step(cpu, stop)) break;
+        const bool ran = cpu.thumb ? step_thumb(cpu, stop) : step(cpu, stop);
+        if (!ran) break;
         ++steps;
     }
 
