@@ -33,7 +33,7 @@ SPLASH_FLAGS=""
 [ -n "${KEEP_SPLASH:-}" ] && SPLASH_FLAGS="-DXNUROID_KEEP_SPLASH"
 "$CXX" -std=c++17 -O1 -g -fno-omit-frame-pointer -fPIC -fvisibility=hidden -shared -DLOADER_LIBRARY $SPLASH_FLAGS -I"$GLUE" \
     -Isrc/loader -Isrc/objc -Isrc/gfx -Isrc/platform -Isrc/app \
-    src/loader/android_loader.cpp src/loader/apple_string.cpp src/loader/trampolines.s src/gfx/gles_backend.cpp src/gfx/msl_glsl.cpp src/platform/audio_unit.cpp \
+    src/loader/android_loader.cpp src/loader/armv7.cpp src/loader/apple_string.cpp src/loader/trampolines.s src/gfx/gles_backend.cpp src/gfx/msl_glsl.cpp src/platform/audio_unit.cpp \
     src/platform/haptics.cpp src/loader/darwin_pthread.cpp src/platform/android_app.cpp \
     src/app/app_runtime.cpp src/app/app_foundation.cpp src/app/app_foundation2.cpp src/app/app_plist.cpp src/app/app_uikit.cpp src/app/app_nib.cpp src/app/app_gl.cpp src/app/app_audio.cpp src/app/app_cg.cpp src/app/app_misc.cpp src/app/app_patches.cpp src/app/app_darwin.cpp src/app/app_crypto.cpp src/app/app_av.cpp src/app/app_main.cpp src/app/app_msgsend.s \
     build/native_app_glue.o build/pvrtc_apk.o build/sqlite3_apk.o \

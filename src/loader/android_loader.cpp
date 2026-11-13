@@ -23,12 +23,15 @@
 #include <dirent.h>
 #include <ucontext.h>
 #include <sys/ioctl.h>
+#include <sched.h>
+#include <cmath>
 
 #include "shim_types.hpp"
 #include "il2cpp_syms.hpp"
 #include "il2cpp_query.hpp"
 #include "chained_fixups.hpp"
 #include "guest_fde.hpp"
+#include "armv7.hpp"
 #include "objc_runtime.hpp"
 #include "gles_backend.hpp"
 #include "../app/app.hpp"
@@ -1074,6 +1077,39 @@ extern "C" bool native_OSAtomicCompareAndSwapPtrBarrier(void* old_val, void* new
 extern "C" void native_OSMemoryBarrier() {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
+
+// os_* family. Every modern iOS binary (and anything Swift) calls these on its logging, retain/release and lock paths.
+// A chained-fixups image has no lazy stream to mark them as call targets, so without a shim the import falls into the
+// data path and becomes an NSString constant: the first call then jumps into string bytes.
+extern "C" void native_os_log_impl(void*, void*, unsigned char, const char*, const unsigned char*, unsigned) {}
+extern "C" void native_os_log_impl_v(void*, void*, unsigned char, const char*, ...) {}
+extern "C" void native_os_log(void*, void*, unsigned char, const char*, ...) {}
+extern "C" unsigned char native_os_log_type_enabled(void*, unsigned char) { return 0; }
+extern "C" void* native_os_log_create(const char*, const char*) {
+    static int dummy;
+    return &dummy;
+}
+extern "C" void* native_os_retain(void* p) { return p; }
+extern "C" void native_os_release(void*) {}
+extern "C" void* native_voucher_adopt(void*) { return nullptr; }
+extern "C" double native_exp10(double x) { return std::pow(10.0, x); }
+
+// os_unfair_lock is a 32-bit word: 0 free, 1 held, 2 held with waiters. Swift's runtime locks metadata caches with it.
+extern "C" void native_os_unfair_lock_lock(uint32_t* lock) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(lock, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    for (;;) {
+        if (__atomic_exchange_n(lock, 2, __ATOMIC_ACQUIRE) == 0) return;
+        while (__atomic_load_n(lock, __ATOMIC_RELAXED) == 2) sched_yield();
+    }
+}
+extern "C" int native_os_unfair_lock_trylock(uint32_t* lock) {
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(lock, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) ? 1 : 0;
+}
+extern "C" void native_os_unfair_lock_unlock(uint32_t* lock) { __atomic_exchange_n(lock, 0, __ATOMIC_RELEASE); }
+extern "C" void native_os_unfair_lock_assert_owner(uint32_t*) {}
+extern "C" void native_os_unfair_lock_assert_not_owner(uint32_t*) {}
 
 // Memory allocator shims. Darwin's malloc_size() answers 0 for memory malloc did not hand out, and Unity relies on
 // that (its malloc allocator's Contains() is `malloc_size(p) != 0`, probed with other allocators' pointers), so only
@@ -2268,6 +2304,17 @@ static bool is_function_import(const std::string& name) {
     if (name == "_objc_opt_self" || name == "_NSDecimalRound" || name.rfind("_CTFontManager", 0) == 0) return true;
     if (name.rfind("_objc_retain_x", 0) == 0 || name.rfind("_objc_release_x", 0) == 0) return true;
     if (name.rfind("_swift_", 0) == 0) return true;
+    // Swift's C entry points live in libswiftCore under __swift_stdlib_*; the data-side globals are __swiftEmpty*,
+    // __swiftImmortalRefCount and __swift_stdlib_operatingSystemVersion, so only the _stdlib_ functions become calls.
+    if (name == "__swift_stdlib_operatingSystemVersion") return false;   // a version struct, not a call
+    if (name.rfind("__swift_stdlib_", 0) == 0) return true;
+    if (name == "___exp10" || name == "___chkstk_darwin" || name == "____chkstk_darwin") return true;
+    // Darwin C entry points whose names look like framework globals. Without these, the import is synthesized into an
+    // NSString and the guest's first call jumps into string bytes instead of a stub.
+    static const char* const kFunctionPrefixes[] = {"_os_", "__os_", "_voucher_", "__voucher_", "_dispatch_",
+                                                    "_pthread_", "_mach_", "_xpc_", "_dyld_", nullptr};
+    for (const char* const* p = kFunctionPrefixes; *p; ++p)
+        if (name.rfind(*p, 0) == 0) return true;
     return false;
 }
 
@@ -2857,7 +2904,7 @@ static void register_darwin_framework_stubs() {
     reg("_NSSearchPathForDirectoriesInDomains", reinterpret_cast<void*>(&native_ns_search_paths));
     reg("_NSGetUncaughtExceptionHandler", reinterpret_cast<void*>(&native_ns_uncaught_handler_get));
     reg("_NSSetUncaughtExceptionHandler", reinterpret_cast<void*>(&native_ns_uncaught_handler_set));
-    reg("___chkstk_darwin", reinterpret_cast<void*>(&native_chkstk_darwin));
+
     // AudioUnit output
     reg("_AudioComponentFindNext", reinterpret_cast<void*>(&native_au_find_next));
     reg("_AudioComponentInstanceNew", reinterpret_cast<void*>(&native_au_instance_new));
@@ -3010,6 +3057,26 @@ static void init_custom_shims() {
             // @available(iOS N, *) lowers to this libSystem call; without it the first availability check aborts.
             reg("__availability_version_check", reinterpret_cast<void*>(&native_availability_version_check));
         }
+        // Shared by both modes. These used to live in the engine-only block above, so an app-mode image bound
+        // __availability_version_check and the whole os_* family as data constants: the first call jumped into an
+        // NSString and the first stack probe jumped through a string pointer.
+        reg("___chkstk_darwin", reinterpret_cast<void*>(&native_chkstk_darwin));
+        reg("____chkstk_darwin", reinterpret_cast<void*>(&native_chkstk_darwin));
+        reg("__availability_version_check", reinterpret_cast<void*>(&native_availability_version_check));
+        reg("__os_log_impl", reinterpret_cast<void*>(&native_os_log_impl));
+        reg("__os_log_impl_v", reinterpret_cast<void*>(&native_os_log_impl_v));
+        reg("__os_log", reinterpret_cast<void*>(&native_os_log));
+        reg("_os_log_type_enabled", reinterpret_cast<void*>(&native_os_log_type_enabled));
+        reg("_os_log_create", reinterpret_cast<void*>(&native_os_log_create));
+        reg("_os_retain", reinterpret_cast<void*>(&native_os_retain));
+        reg("_os_release", reinterpret_cast<void*>(&native_os_release));
+        reg("_voucher_adopt", reinterpret_cast<void*>(&native_voucher_adopt));
+        reg("_os_unfair_lock_lock", reinterpret_cast<void*>(&native_os_unfair_lock_lock));
+        reg("_os_unfair_lock_trylock", reinterpret_cast<void*>(&native_os_unfair_lock_trylock));
+        reg("_os_unfair_lock_unlock", reinterpret_cast<void*>(&native_os_unfair_lock_unlock));
+        reg("_os_unfair_lock_assert_owner", reinterpret_cast<void*>(&native_os_unfair_lock_assert_owner));
+        reg("_os_unfair_lock_assert_not_owner", reinterpret_cast<void*>(&native_os_unfair_lock_assert_not_owner));
+        reg("___exp10", reinterpret_cast<void*>(&native_exp10));
         reg("___tolower", reinterpret_cast<void*>(&native_tolower));
         reg("___toupper", reinterpret_cast<void*>(&native_toupper));
         reg("___maskrune", reinterpret_cast<void*>(&native_maskrune));
@@ -3301,6 +3368,11 @@ static void* resolve_symbol(const std::string& name) {
         if (!is_fn)
             if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
     }
+    // Framework data a name-only import cannot distinguish from a function call: make the NSString constant before
+    // recording, so the preflight below reports only what is genuinely unbound.
+    if (!is_fn && g_app_mode) {
+        if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
+    }
     if (g_unresolved_set.insert(name).second) {
         fprintf(stderr, "[UNRESOLVED IMPORT] %s %s\n", is_fn ? "FUNCTION" : "DATA    ", name.c_str());
         g_unresolved_imports.push_back(name);
@@ -3314,9 +3386,6 @@ static void* resolve_symbol(const std::string& name) {
                                                           : reinterpret_cast<void*>(fake_make(7, name.substr(18)));
         g_resolved_cache[name] = obj;
         return obj;
-    }
-    if (!is_fn && g_app_mode) {
-        if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
     }
     if (!is_fn) {
         // DATA import: PROT_NONE poison slot, so the first touch names the symbol.
@@ -3716,15 +3785,20 @@ extern "C" int loader_main(int argc, char** argv) {
             bool is64 = magic == 0xcafebabf;
             uint32_t narch = be32(file_data + 4);
             if (8 + static_cast<uint64_t>(narch) * (is64 ? 32 : 20) > file_size) { fprintf(stderr, "[FATAL] truncated fat header\n"); return 1; }
-            uint64_t slice_off = 0, slice_size = 0;
+            uint64_t slice_off = 0, slice_size = 0, arm32_off = 0, arm32_size = 0;
             for (uint32_t i = 0; i < narch; ++i) {
                 const uint8_t* a = file_data + 8 + i * (is64 ? 32 : 20);
                 uint32_t cputype = be32(a);
                 uint64_t off = is64 ? (static_cast<uint64_t>(be32(a + 8)) << 32 | be32(a + 12)) : be32(a + 8);
                 uint64_t size = is64 ? (static_cast<uint64_t>(be32(a + 16)) << 32 | be32(a + 20)) : be32(a + 12);
                 if (cputype == 0x0100000c) { slice_off = off; slice_size = size; break; }   // CPU_TYPE_ARM64
+                if (cputype == 12 && !arm32_off && off < file_size && size <= file_size - off) { arm32_off = off; arm32_size = size; }
             }
-            if (!slice_off) { fprintf(stderr, "[FATAL] fat binary has no arm64 slice\n"); return 1; }
+            if (!slice_off) {
+                if (arm32_off) return armv7::run_image(file_data + arm32_off, arm32_size, bin_path);
+                fprintf(stderr, "[FATAL] fat binary has no arm64 or armv7 slice\n");
+                return 1;
+            }
             if (slice_off > file_size || slice_size > file_size - slice_off) { fprintf(stderr, "[FATAL] arm64 slice lies outside the file\n"); return 1; }
             printf("[*] Fat binary: using arm64 slice at offset 0x%llx (%llu bytes)\n",
                    static_cast<unsigned long long>(slice_off), static_cast<unsigned long long>(slice_size));
@@ -3735,9 +3809,15 @@ extern "C" int loader_main(int argc, char** argv) {
 
     // 4. Parse Mach-O 64 header
     if (file_size < 32 || *reinterpret_cast<uint32_t*>(file_data) != 0xfeedfacf || *reinterpret_cast<uint32_t*>(file_data + 4) != 0x0100000c) {
-        // 0xfeedface is a 32-bit (armv7) image: the guest code runs natively, so only arm64 can work
-        fprintf(stderr, "[FATAL] %s is not a 64-bit arm64 Mach-O (magic 0x%08x, cputype 0x%08x)\n", bin_path,
-                file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data) : 0, file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data + 4) : 0);
+        const uint32_t m = file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data) : 0;
+        const uint32_t c = file_size >= 8 ? *reinterpret_cast<uint32_t*>(file_data + 4) : 0;
+        // 0xfeedface is a 32-bit (armv7) image: only an armeabi-v7a build of this loader can host it, because a
+        // 64-bit process cannot enter AArch32 at EL0.
+        if (m == 0xfeedface) {
+            return armv7::run_image(file_data, file_size, bin_path);
+        } else {
+            fprintf(stderr, "[FATAL] %s is not a 64-bit arm64 Mach-O (magic 0x%08x, cputype 0x%08x)\n", bin_path, m, c);
+        }
         return 1;
     }
     uint32_t ncmds = *reinterpret_cast<uint32_t*>(file_data + 16);
