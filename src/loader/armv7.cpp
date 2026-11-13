@@ -37,6 +37,8 @@ struct Image {
     uint32_t entry = 0;
     bool entry_thumb = false;
     std::vector<Segment> segments;
+    // Symbols defined in this image. A bind to one of these is not an import: it resolves to guest code or data.
+    std::unordered_map<std::string, uint32_t> defined;
 };
 
 struct Stub {
@@ -222,8 +224,15 @@ bool apply_binds(const Image& img, const uint8_t* data, uint32_t off, uint32_t s
         auto bind_one = [&](uint32_t at) -> bool {
             if (seg >= img.segments.size()) { std::fprintf(stderr, "[armv7] bind segment %u out of range\n", seg); return false; }
             if (symbol.empty()) return true;
-            uint32_t stub = add_stub(symbol);
-            if (!stub) { ++*missing; return true; }
+            uint32_t target = 0;
+            auto def = img.defined.find(symbol);
+            if (def != img.defined.end()) {
+                target = img.base_addr + (def->second - img.min_vm);   // self-bind: guest code or data
+            } else {
+                target = add_stub(symbol);
+                if (!target) { ++*missing; return true; }
+            }
+            const uint32_t stub = target;
             uint32_t loc = img.base_addr + (img.segments[seg].vmaddr - img.min_vm) + at;
             bool ok = true;
             store32(loc, stub + static_cast<uint32_t>(addend), &ok);
@@ -617,6 +626,8 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
     rebase_off = rebase_size = bind_off = bind_size = lazy_off = lazy_size = 0;
     uint64_t entryoff = 0;
     bool have_main = false;
+    uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
+    bool have_symtab = false;
     for (uint32_t i = 0; i < ncmds && off + 8 <= size; ++i) {
         const uint32_t cmd = rd32(d + off), cmdsize = rd32(d + off + 4);
         if (cmdsize < 8 || off + cmdsize > size) { std::fprintf(stderr, "[armv7] malformed load command\n"); return false; }
@@ -638,6 +649,12 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
             bind_size = rd32(d + off + 20);
             lazy_off = rd32(d + off + 32);
             lazy_size = rd32(d + off + 36);
+        } else if (cmd == 0x2) {  // LC_SYMTAB
+            symoff = rd32(d + off + 8);
+            nsyms = rd32(d + off + 12);
+            stroff = rd32(d + off + 16);
+            strsize = rd32(d + off + 20);
+            have_symtab = true;
         } else if (cmd == 0x28 || cmd == 0x80000028) {
             entryoff = rd32(d + off + 8) | (static_cast<uint64_t>(rd32(d + off + 12)) << 32);
             have_main = true;
@@ -648,6 +665,21 @@ bool parse(const uint8_t* d, size_t size, const char* path, Image& img, uint32_t
             }
         }
         off += cmdsize;
+    }
+    if (have_symtab && symoff + static_cast<uint64_t>(nsyms) * 12 <= size && stroff + strsize <= size) {
+        for (uint32_t i = 0; i < nsyms; ++i) {
+            const uint8_t* sym = d + symoff + i * 12;
+            const uint32_t n_strx = rd32(sym);
+            const uint8_t n_type = sym[4];
+            const uint32_t n_value = rd32(sym + 8);
+            if (n_strx >= strsize) continue;
+            const uint8_t kind = n_type & 0x0e;
+            if (kind != 0x0e && kind != 0x02) continue;   // N_SECT or N_ABS
+            if (!n_value) continue;
+            const char* name = reinterpret_cast<const char*>(d + stroff + n_strx);
+            if (!*name) continue;
+            img.defined.emplace(name, n_value);   // first definition wins
+        }
     }
     if (img.segments.empty()) { std::fprintf(stderr, "[armv7] no segments\n"); return false; }
     img.min_vm = text_vm;
@@ -722,22 +754,85 @@ int run_image(uint8_t* data, size_t size, const char* path) {
     const char* steps_env = std::getenv("LOADER_ARMV7_STEPS");
     const uint64_t budget = steps_env ? std::strtoull(steps_env, nullptr, 0) : 2000000ull;
 
-    Stop stop;
+        Stop stop;
     uint64_t steps = 0;
-    for (; steps < budget; ++steps) {
+    auto describe = [](uint32_t v) {
+        const char* n = stub_name(v);
+        return n ? std::string(n) : std::string();
+    };
+
+    // Runs a guest function to its return address. Used by the Swift runtime shim below.
+    auto call_guest = [&](uint32_t fn, uint32_t ctx) -> bool {
+        const uint32_t ret = 0xFFFFFFF0u;
+        if (fn < img.base_addr || fn >= img.base_addr + map_span) {
+            stop.reason = "initializer address outside the image";
+            return false;
+        }
+        const uint32_t saved_lr = cpu.r[14], saved_pc = cpu.r[15];
+        cpu.r[0] = ctx;
+        cpu.r[14] = ret;
+        cpu.r[15] = fn & ~3u;
+        while (cpu.r[15] != ret) {
+            if (steps >= budget) { stop.reason = "instruction budget inside initializer"; return false; }
+            if (const char* n = stub_name(cpu.r[15])) { stop.hit = true; stop.reason = n; return false; }
+            if (!step(cpu, stop)) return false;
+            ++steps;
+        }
+        cpu.r[14] = saved_lr;
+        cpu.r[15] = saved_pc;
+        return true;
+    };
+
+    while (true) {
         const uint32_t pc = cpu.r[15];
         if (static_cast<int>(steps) < trace)
             std::printf("[armv7] %08llx  %08x  r0=%08x r1=%08x sp=%08x lr=%08x\n",
                         static_cast<unsigned long long>(pc), [&] { bool ok = true; return mem32(pc, &ok); }(),
                         cpu.r[0], cpu.r[1], cpu.r[13], cpu.r[14]);
-        if (!step(cpu, stop)) break;
-    }
-    if (!stop.hit && stop.reason.empty() && steps >= budget) stop.reason = "instruction budget exhausted";
 
-    auto describe = [](uint32_t v) {
-        const char* n = stub_name(v);
-        return n ? std::string(n) : std::string();
-    };
+        if (const char* name = stub_name(pc)) {
+            if (!std::strcmp(name, "_swift_once")) {
+                const uint32_t token = cpu.r[0], fn = cpu.r[1], ctx = cpu.r[2];
+                bool ok = true;
+                const uint32_t before = mem32(token, &ok);
+                if (ok && before == 0) {
+                    store32(token, 1, &ok);
+                    std::printf("[armv7] swift_once -> running initializer 0x%08x\n", fn);
+                    const uint64_t at = steps;
+                    if (!ok || !call_guest(fn, ctx)) break;
+                    std::printf("[armv7] swift_once -> initializer returned after %llu instructions\n",
+                                static_cast<unsigned long long>(steps - at));
+                }
+                cpu.r[0] = 0;
+                const uint32_t ret = cpu.r[14];
+                if (ret == 0 || ret == 0xFFFFFFFEu || ret == 0xFFFFFFF0u || stub_name(ret)) {
+                    stop.reason = "_swift_once has no usable return address";
+                    break;
+                }
+                cpu.r[15] = ret;
+                ++steps;
+                continue;
+            }
+            if (!std::strcmp(name, "_swift_retain") || !std::strcmp(name, "_swift_release")) {
+                const uint32_t ret = cpu.r[14];
+                if (ret == 0 || ret == 0xFFFFFFFEu || ret == 0xFFFFFFF0u || stub_name(ret)) {
+                    stop.reason = std::string(name) + " has no usable return address";
+                    break;
+                }
+                cpu.r[15] = ret;
+                ++steps;
+                continue;
+            }
+            stop.hit = true;
+            stop.reason = name;
+            break;
+        }
+
+        if (steps >= budget) { stop.reason = "instruction budget exhausted"; break; }
+        if (!step(cpu, stop)) break;
+        ++steps;
+    }
+
     if (stop.hit) {
         std::printf("[armv7] sign of life: ran %llu guest instructions, then called %s\n",
                     static_cast<unsigned long long>(steps), stop.reason.c_str());
@@ -745,8 +840,7 @@ int run_image(uint8_t* data, size_t size, const char* path) {
             const std::string named = describe(cpu.r[i]);
             std::printf("[armv7]   r%d = 0x%08x%s\n", i, cpu.r[i], named.empty() ? "" : ("  (" + named + ")").c_str());
         }
-    }
-    else
+    } else
         std::printf("[armv7] stopped after %llu instructions: %s (pc=0x%08x)\n",
                     static_cast<unsigned long long>(steps), stop.reason.c_str(), cpu.r[15]);
     return stop.hit ? 0 : 1;
