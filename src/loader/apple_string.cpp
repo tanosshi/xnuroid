@@ -20,6 +20,14 @@
 
 namespace apple_abi {
 
+// Guest memory is released by the guest allocator: a std::string buffer can come from the guest's own inlined
+// growth (guest operator new -> the _malloc shim -> the guest arena), and the guest frees the buffers handed to it
+// here the same way. Mixing host malloc/free in aborts inside bionic's allocator.
+extern "C" void* native_guest_malloc(size_t n);
+extern "C" void native_guest_free(void* p);
+static inline void* guest_alloc(size_t n) { return native_guest_malloc(n); }
+static inline void guest_free(void* p) { if (p) native_guest_free(p); }
+
 struct String {
     union {
         struct {
@@ -46,7 +54,7 @@ struct String {
     void init_empty() { std::memset(raw, 0, 24); }
 
     void free_buffer() {
-        if (is_long() && l.data) { free(l.data); l.data = nullptr; }
+        if (is_long() && l.data) { guest_free(l.data); l.data = nullptr; }
     }
 
     void set_short(const char* str, size_t n) {
@@ -71,7 +79,7 @@ struct String {
             size_t p = 32;
             while (p < n + 1) p <<= 1;
             size_t new_cap = p - 1;
-            char* buf = static_cast<char*>(malloc(new_cap + 1));
+            char* buf = static_cast<char*>(guest_alloc(new_cap + 1));
             if (str && n > 0) std::memcpy(buf, str, n);
             buf[n] = 0;
             free_buffer();
@@ -95,7 +103,7 @@ struct String {
             size_t p = 32;
             while (p < ns + 1) p <<= 1;
             size_t new_cap = p - 1;
-            char* buf = static_cast<char*>(malloc(new_cap + 1));
+            char* buf = static_cast<char*>(guest_alloc(new_cap + 1));
             if (cur > 0) std::memcpy(buf, c_str(), cur);
             std::memcpy(buf + cur, str, n);
             buf[ns] = 0;
@@ -125,7 +133,7 @@ struct String {
         size_t cur = size(), p = 32;
         while (p < n + 1) p <<= 1;
         size_t new_cap = p - 1;
-        char* buf = static_cast<char*>(malloc(new_cap + 1));
+        char* buf = static_cast<char*>(guest_alloc(new_cap + 1));
         if (cur > 0) std::memcpy(buf, c_str(), cur);
         buf[cur] = 0;
         free_buffer();
@@ -149,6 +157,8 @@ static const String* CS(const void* p) { return reinterpret_cast<const String*>(
 using apple_abi::String;
 using apple_abi::S;
 using apple_abi::CS;
+using apple_abi::guest_alloc;
+using apple_abi::guest_free;
 
 extern "C" {
 
@@ -206,7 +216,7 @@ void* __ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_by
     size_t p = 32;
     while (p < std::max({old_cap + delta, 2 * old_cap, n_copy + n_add + tail}) + 1) p <<= 1;
     const size_t new_cap = p - 1;
-    char* buf = static_cast<char*>(malloc(new_cap + 1));
+    char* buf = static_cast<char*>(guest_alloc(new_cap + 1));
     const char* old = str->c_str();
     if (n_copy) std::memcpy(buf, old, n_copy);
     if (tail) std::memcpy(buf + n_copy + n_add, old + n_copy + n_del, tail);
@@ -277,9 +287,9 @@ void __ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw(
     if (n > cap) {
         size_t alloc = 8;
         while (alloc < n + 1) alloc <<= 1;
-        auto* buf = static_cast<wchar_t*>(malloc(alloc * sizeof(wchar_t)));
+        auto* buf = static_cast<wchar_t*>(guest_alloc(alloc * sizeof(wchar_t)));
         std::memcpy(buf, d, sz * sizeof(wchar_t));
-        if (is_long) free(d);
+        if (is_long) guest_free(d);
         d = buf;
         is_long = true;
         *reinterpret_cast<wchar_t**>(raw) = d;

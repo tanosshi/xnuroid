@@ -40,3 +40,6 @@ xnuroid_loader
 
 # Games unpacked by the helper GUI
 games/
+
+# Build-specific offset notes (kept locally, not published)
+docs/symbols_map.md

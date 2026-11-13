@@ -25,6 +25,9 @@
 #include <sys/ioctl.h>
 
 #include "shim_types.hpp"
+#include "il2cpp_syms.hpp"
+#include "il2cpp_query.hpp"
+#include "chained_fixups.hpp"
 #include "guest_fde.hpp"
 #include "objc_runtime.hpp"
 #include "gles_backend.hpp"
@@ -238,6 +241,13 @@ static int describe_addr(int fd, uint64_t a, bool is_return_addr = false) {
     if (in_image(a)) {
         wr_str(fd, "[image] image_base+");
         wr_hex(fd, a - reinterpret_cast<uint64_t>(g_loaded_image_base));
+        uint64_t sym_off = 0;
+        if (const char* sym = il2cpp_sym_lookup(a, &sym_off)) {
+            wr_str(fd, " il2cpp:");
+            wr_str(fd, sym);
+            wr_str(fd, "+");
+            wr_hex(fd, sym_off);
+        }
         return 1;
     }
     if (in_tramp_pool(a)) {
@@ -773,9 +783,20 @@ int native_thread_resume(uint32_t port) {
 }
 // flavor 6 = ARM_THREAD_STATE64: x[29], fp, lr, sp, pc (8 bytes each), cpsr, pad (4 each) = 68 words
 int native_thread_get_state(uint32_t port, int flavor, uint32_t* state, uint32_t* count) {
+    if (flavor != 6 || !state || !count || *count < 68) return 5;
     MachThread* m = mach_find(port);
-    if (!m || flavor != 6 || !state || !count || *count < 68) return 5;
-    if (!m->suspended && m != t_mach_self) return 5;
+    if (!m) {
+        // A thread the guest never handed us (or asked about by another port) is still worth an answer: callers use
+        // this to walk stacks, and KERN_FAILURE there makes them abort. Report the caller's own state instead.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[MACH] thread_get_state(port=%u) for an unregistered port: reporting the caller's state\n", port);
+        }
+        m = t_mach_self ? t_mach_self : mach_register_current();
+    }
+    // Registers are whatever the last suspend saved: a thread that is running now still has a usable last frame, and
+    // refusing here only breaks the caller.
     uint64_t* w = reinterpret_cast<uint64_t*>(state);
     if (m == t_mach_self) {   // querying the caller itself: approximate with current sp
         std::memset(state, 0, 68 * 4);
@@ -810,6 +831,20 @@ extern "C" int native_pthread_create_logged(pthread_t* t, const pthread_attr_t* 
     if (log || rc) fprintf(stderr, "[THREADS] pthread_create #%d fn=%p -> rc=%d%s\n", st->id, reinterpret_cast<void*>(fn), rc, rc ? " (FAILED)" : "");
     if (rc) free(st);
     return rc;
+}
+
+// Darwin availability checks (@available(iOS N, *)): entries are {platform, version as 0xMMMMmmpp}, platform 2 is iOS.
+// Everything at or below the version the loader reports is available; LOADER_IOS_VERSION overrides that version.
+struct BuildVersion { uint32_t platform, version; };
+static bool native_availability_version_check(uint32_t count, const BuildVersion* v) {
+    static const uint32_t current = [] {
+        unsigned major = 15, minor = 0, patch = 0;
+        if (const char* s = getenv("LOADER_IOS_VERSION")) sscanf(s, "%u.%u.%u", &major, &minor, &patch);
+        return (major << 16) | (minor << 8) | patch;
+    }();
+    for (uint32_t i = 0; i < count; ++i)
+        if (v[i].platform == 2 && v[i].version > current) return false;
+    return true;
 }
 
 // Guest dlopen/dlsym: Apple frameworks resolve to a fake handle; MTLCreateSystemDefaultDevice returns a fake device.
@@ -873,6 +908,7 @@ extern "C" ScD native_sincos_stret(double x) { return {sin(x), cos(x)}; }
 extern "C" ScF native_sincosf_stret(float x) { return {sinf(x), cosf(x)}; }
 extern "C" float native_exp10f(float x) { return powf(10.0f, x); }
 extern "C" int native_atexit(void (*fn)(void)) { (void)fn; return 0; }
+extern "C" void* native_nil() { return nullptr; }
 extern "C" uint64_t native_clock_gettime_nsec_np(int darwin_clock) {
     clockid_t id = CLOCK_MONOTONIC;
     switch (darwin_clock) {  // Darwin clockid_t -> Linux
@@ -1040,34 +1076,159 @@ extern "C" void native_OSMemoryBarrier() {
 }
 
 // Memory allocator shims. Darwin's malloc_size() answers 0 for memory malloc did not hand out, and Unity relies on
-// that (its malloc allocator's Contains() is `malloc_size(p) != 0`, probed with other allocators' pointers). Scudo's
-// malloc_usable_size() aborts on such pointers, so the blocks the guest gets from its malloc family are tracked.
-namespace guest_heap {
-constexpr size_t kShards = 64;
-struct Shard { std::mutex mu; std::unordered_set<uintptr_t> live; };
-inline Shard g_shards[kShards];
-inline Shard& shard(const void* p) { return g_shards[(reinterpret_cast<uintptr_t>(p) >> 4) % kShards]; }
-inline void add(void* p) { if (p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); s.live.insert(reinterpret_cast<uintptr_t>(p)); } }
-inline void remove(void* p) { if (p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); s.live.erase(reinterpret_cast<uintptr_t>(p)); } }
-inline bool owns(const void* p) { Shard& s = shard(p); std::lock_guard<std::mutex> l(s.mu); return s.live.count(reinterpret_cast<uintptr_t>(p)) != 0; }
-}  // namespace guest_heap
-extern "C" void* native_guest_malloc(size_t n) { void* p = malloc(n); guest_heap::add(p); return p; }
-extern "C" void* native_guest_calloc(size_t n, size_t m) { void* p = calloc(n, m); guest_heap::add(p); return p; }
-extern "C" void* native_guest_realloc(void* old, size_t n) {
-    if (old) guest_heap::remove(old);
-    void* p = realloc(old, n);
-    guest_heap::add(p ? p : (n ? old : nullptr));   // failed realloc keeps the old block
+// that (its malloc allocator's Contains() is `malloc_size(p) != 0`, probed with other allocators' pointers), so only
+// blocks this file handed out count.
+//
+// Unity's memory manager keeps one radix bitmap per 4 GB of address space with five slots (0x73a270, see
+// docs/symbols_map.md). The sixth region takes the "Using memoryadresses from more than 16GB of memory" path, which
+// reads slot -1 and dereferences whatever sits there. Darwin keeps a process inside a narrow range; bionic's Scudo
+// heap and mmap scatter over the 48-bit space, so guest malloc and guest mmap are served from one 16 GB,
+// 4 GB-aligned window: at most four regions, a set that cannot grow while the process runs.
+namespace guest_arena {
+constexpr uintptr_t kWindow = 16ull << 30;
+constexpr uintptr_t kRegion = 4ull << 30;
+constexpr size_t kGranule = 16;
+
+std::once_flag g_once;
+std::mutex g_mu;
+uintptr_t g_lo = 0, g_hi = 0;              // the window
+uintptr_t g_up = 0, g_down = 0;            // malloc rises from lo, guest mmap falls from hi
+std::unordered_map<size_t, void*> g_free;  // total block size -> free list
+bool g_failed = false;
+
+inline uintptr_t round_up(uintptr_t v, uintptr_t a) { return (v + a - 1) & ~(a - 1); }
+inline bool inside(const void* p) {
+    return reinterpret_cast<uintptr_t>(p) >= g_lo && reinterpret_cast<uintptr_t>(p) < g_hi;
+}
+
+void init() {
+    size_t span = kWindow + kRegion;   // slack, so the window itself can be 4 GB aligned
+    void* raw = mmap(nullptr, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        g_failed = true;
+        wr_str(2, "[ARENA] reservation failed, guest keeps host malloc\n");
+        return;
+    }
+    uintptr_t lo = round_up(reinterpret_cast<uintptr_t>(raw), kRegion);
+    g_lo = lo;
+    g_hi = lo + kWindow;
+    g_up = lo + kGranule;
+    g_down = g_hi;
+    wr_str(2, "[ARENA] guest window lo="); wr_hex(2, g_lo);
+    wr_str(2, " hi="); wr_hex(2, g_hi);
+    wr_str(2, " regions="); wr_hex(2, kWindow / kRegion);
+    wr_str(2, "\n");
+}
+
+inline bool enabled() { std::call_once(g_once, init); return !g_failed; }
+
+// block: [0]=total size, [8]=block address; payload = block+16 unless the caller asked for wider alignment.
+void* alloc(size_t n, size_t align) {
+    if (!enabled()) return nullptr;
+    if (align < kGranule) align = kGranule;
+    size_t total = round_up(kGranule + n + (align > kGranule ? align : 0), kGranule);
+    if (total < 2 * kGranule) total = 2 * kGranule;
+    std::lock_guard<std::mutex> l(g_mu);
+    void* block = nullptr;
+    if (align <= kGranule) {
+        auto it = g_free.find(total);
+        if (it != g_free.end()) {
+            block = it->second;
+            void* next = *static_cast<void**>(block);
+            if (next) it->second = next;
+            else g_free.erase(it);
+        }
+    }
+    if (!block) {
+        if (g_up + total > g_down) { wr_str(2, "[ARENA] out of guest window\n"); return nullptr; }
+        block = reinterpret_cast<void*>(g_up);
+        g_up += total;
+    }
+    *static_cast<uint64_t*>(block) = total;
+    uintptr_t p = round_up(reinterpret_cast<uintptr_t>(block) + kGranule, align);
+    *reinterpret_cast<void**>(p - sizeof(void*)) = block;
+    return reinterpret_cast<void*>(p);
+}
+
+void release(void* p) {
+    if (!p || !enabled()) return;
+    if (!inside(p)) { ::free(p); return; }   // memory from the host, e.g. a shim's strdup
+    uintptr_t block = reinterpret_cast<uintptr_t>(*reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(p) - sizeof(void*)));
+    if (!inside(reinterpret_cast<void*>(block)) || block >= reinterpret_cast<uintptr_t>(p)) return;
+    size_t total = *reinterpret_cast<uint64_t*>(block);
+    if (total < 2 * kGranule || (total & (kGranule - 1)) || block + total > g_hi) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    *reinterpret_cast<void**>(block) = g_free[total];
+    g_free[total] = reinterpret_cast<void*>(block);
+}
+
+size_t usable(const void* p) {
+    if (!p || !inside(p)) return 0;
+    uintptr_t block = reinterpret_cast<uintptr_t>(*reinterpret_cast<void* const*>(reinterpret_cast<uintptr_t>(p) - sizeof(void*)));
+    if (!inside(reinterpret_cast<void*>(block)) || block >= reinterpret_cast<uintptr_t>(p)) return 0;
+    size_t total = *reinterpret_cast<const uint64_t*>(block);
+    if (total < 2 * kGranule || block + total > g_hi) return 0;
+    return block + total - reinterpret_cast<uintptr_t>(p);
+}
+
+void* resize(void* p, size_t n) {
+    if (!p) return alloc(n, kGranule);
+    if (!enabled()) return nullptr;
+    if (!inside(p)) return ::realloc(p, n);
+    size_t cap = usable(p);
+    if (cap && n <= cap) return p;
+    void* q = alloc(n, kGranule);
+    if (!q) return nullptr;
+    std::memcpy(q, p, cap < n ? cap : n);
+    release(p);
+    return q;
+}
+
+// Every guest mapping lands in the same window, in the half malloc is not using.
+void* map(size_t length, int prot, int flags, int fd, off_t offset) {
+    if (!enabled() || (flags & MAP_FIXED)) return mmap(nullptr, length, prot, flags, fd, offset);
+    size_t pages = static_cast<size_t>(round_up(length, 4096));
+    std::lock_guard<std::mutex> l(g_mu);
+    uintptr_t lo = (g_down - pages) & ~static_cast<uintptr_t>(4095);
+    if (lo < g_up) { wr_str(2, "[ARENA] guest mmap out of window\n"); return MAP_FAILED; }
+    void* r = mmap(reinterpret_cast<void*>(lo), length, prot, flags | MAP_FIXED, fd, offset);
+    if (r == MAP_FAILED) return MAP_FAILED;
+    g_down = lo;
+    return r;
+}
+}  // namespace guest_arena
+extern "C" void* native_guest_malloc(size_t n) {
+    if (!guest_arena::enabled()) return malloc(n);
+    return guest_arena::alloc(n, 16);
+}
+extern "C" void* native_guest_calloc(size_t n, size_t m) {
+    if (!guest_arena::enabled()) return calloc(n, m);
+    if (n && m > SIZE_MAX / n) return nullptr;
+    void* p = guest_arena::alloc(n * m, 16);
+    if (p) std::memset(p, 0, n * m);
     return p;
 }
-extern "C" void native_guest_free(void* p) { guest_heap::remove(p); free(p); }
+extern "C" void* native_guest_realloc(void* old, size_t n) {
+    if (!guest_arena::enabled()) return realloc(old, n);
+    return guest_arena::resize(old, n);
+}
+extern "C" void native_guest_free(void* p) {
+    if (!p) return;
+    if (!guest_arena::enabled()) { free(p); return; }
+    guest_arena::release(p);
+}
 extern "C" int native_guest_posix_memalign(void** out, size_t align, size_t n) {
-    int rc = posix_memalign(out, align, n);
-    if (rc == 0) guest_heap::add(*out);
-    return rc;
+    if (!out) return EINVAL;
+    if (align < sizeof(void*) || (align & (align - 1))) return EINVAL;
+    if (!guest_arena::enabled()) return posix_memalign(out, align, n);
+    void* p = guest_arena::alloc(n, align);
+    if (!p) return ENOMEM;
+    *out = p;
+    return 0;
 }
 extern "C" size_t native_malloc_size(const void* ptr) {
-    if (!ptr || !guest_heap::owns(ptr)) return 0;
-    return malloc_usable_size(const_cast<void*>(ptr));
+    if (!ptr || !guest_arena::enabled() || !guest_arena::inside(ptr)) return 0;
+    return guest_arena::usable(ptr);
 }
 
 // Darwin mach / vm / threading primitives
@@ -1815,7 +1976,10 @@ extern "C" void* native_mmap_impl(void* addr, size_t length, int prot, int flags
     int real_fd  = (linux_flags & MAP_ANONYMOUS) ? -1 : fd;
     off_t real_off = (linux_flags & MAP_ANONYMOUS) ? 0 : offset;
 
-    void* res = mmap(addr, length, linux_prot, linux_flags, real_fd, real_off);
+    // Darwin's hints mean nothing here: guest mappings live in the arena window, so Unity's per-region bitmaps stay
+    // inside their five slots (guest_arena, see the allocator shims).
+    (void)addr;
+    void* res = guest_arena::map(length, linux_prot, linux_flags, real_fd, real_off);
     wr_str(2, "[SHIM] mmap addr="); wr_hex(2, rec[0]);
     wr_str(2, " len="); wr_hex(2, rec[1]);
     wr_str(2, " prot="); wr_hex(2, static_cast<uint64_t>(static_cast<uint32_t>(prot)));
@@ -2007,11 +2171,18 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
 #include "screen_metrics.hpp"
 #include "fake_foundation.hpp"
 #include "mtl_gles.hpp"
+static void start_pc_profile(unsigned interval_ms, unsigned samples);   // defined with the watchdog, used by the app run loop
 #include "fake_uikit.hpp"
 
 static void shim_objc_msgSend(CallFrame& frame, void*) {
+    ++g_guest_msgs;
     void* receiver = reinterpret_cast<void*>(frame.x[0]);
     const char* sel = reinterpret_cast<const char*>(frame.x[1]);
+    static const bool count_selectors = getenv("LOADER_SELECTOR_COUNTS") != nullptr;
+    if (count_selectors && sel) {
+        std::lock_guard<std::mutex> l(g_sel_mu);
+        ++g_sel_counts[sel];
+    }
     static std::unordered_set<std::string> seen_selectors;
     static int call_seq = 0;
     static std::mutex log_mu;
@@ -2831,6 +3002,8 @@ static void init_custom_shims() {
             reg("_pthread_create", reinterpret_cast<void*>(&native_pthread_create_logged));
             register_darwin_framework_stubs();
             if (!getenv("LOADER_NO_OBJC_RT")) register_objc_runtime_natives();
+            // @available(iOS N, *) lowers to this libSystem call; without it the first availability check aborts.
+            reg("__availability_version_check", reinterpret_cast<void*>(&native_availability_version_check));
         }
         reg("___tolower", reinterpret_cast<void*>(&native_tolower));
         reg("___toupper", reinterpret_cast<void*>(&native_toupper));
@@ -3115,6 +3288,14 @@ static void* resolve_symbol(const std::string& name) {
     }
 
     bool is_fn = is_function_import(name);
+    // Engine mode: the app runtime's Foundation/UIKit tables are still the best answer for names no shim covers.
+    // Without this, an import it implements becomes a poison slot (NSString * globals Unity reads directly) or a
+    // terminating stub, instead of the value the same symbol has in app mode.
+    if (!g_app_mode && getenv("LOADER_ENGINE")) {
+        if (void* p = app::resolve_symbol(name)) { g_resolved_cache[name] = p; return p; }
+        if (!is_fn)
+            if (void* p = app::data_constant(name)) { g_resolved_cache[name] = p; return p; }
+    }
     if (g_unresolved_set.insert(name).second) {
         fprintf(stderr, "[UNRESOLVED IMPORT] %s %s\n", is_fn ? "FUNCTION" : "DATA    ", name.c_str());
         g_unresolved_imports.push_back(name);
@@ -3145,6 +3326,13 @@ static void* resolve_symbol(const std::string& name) {
         g_resolved_cache[name] = reinterpret_cast<void*>(&native_null);
         return reinterpret_cast<void*>(&native_null);
     }
+    // Engine mode mirrors that for functions: an optional subsystem we do not implement (CloudKit, Game Center,
+    // analytics) answers nil, so the game degrades instead of aborting at its first call. Data imports stay poison,
+    // and LOADER_ENGINE_STRICT_UNRESOLVED=1 brings back the terminating stub for diagnosis.
+    if (getenv("LOADER_ENGINE") && is_fn && !getenv("LOADER_ENGINE_STRICT_UNRESOLVED")) {
+        g_resolved_cache[name] = reinterpret_cast<void*>(&native_nil);
+        return reinterpret_cast<void*>(&native_nil);
+    }
     void* stub = allocate_trampoline(shim_unresolved, strdup(name.c_str()));
     g_resolved_cache[name] = stub;
     return stub;
@@ -3160,8 +3348,14 @@ static void il2cpp_log_callback(const char* log) {
 #include <sys/syscall.h>
 #include <thread>
 static volatile int g_wd_done = 0;
+static volatile int g_pc_profile_mode = 0;
 static void thread_dump_handler(int, siginfo_t*, void* ctx) {
     ucontext_t* uc = reinterpret_cast<ucontext_t*>(ctx);
+    if (g_pc_profile_mode) {
+        il2cpp_profile_hit(uc->uc_mcontext.pc);
+        g_wd_done = 1;
+        return;
+    }
     uint64_t pc = uc->uc_mcontext.pc, sp = uc->uc_mcontext.sp, fp = uc->uc_mcontext.regs[29], lr = uc->uc_mcontext.regs[30];
     char comm[32] = {0};
     int cf = open("/proc/thread-self/comm", O_RDONLY);
@@ -3184,6 +3378,46 @@ static void thread_dump_handler(int, siginfo_t*, void* ctx) {
     }
     g_wd_done = 1;
 }
+// LOADER_PC_PROFILE=<ms>: sample the main thread's PC on that interval and print the hottest managed methods.
+// Needs LOADER_IL2CPP_SYMS; sampling uses the same SIGUSR2 mechanism as the watchdog, in record-only mode.
+static void start_pc_profile(unsigned interval_ms, unsigned samples) {
+    struct sigaction sa{};
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = thread_dump_handler;
+    sigaction(SIGUSR2, &sa, nullptr);
+    std::thread([interval_ms, samples] {
+        const pid_t pid = getpid();
+        const unsigned total = getenv("LOADER_PC_SAMPLES") ? static_cast<unsigned>(atoi(getenv("LOADER_PC_SAMPLES"))) : samples;
+        fprintf(stderr, "[PROFILE] sampling main thread about every %u ms (0.5x-1.5x jitter), %u samples\n", interval_ms, total);
+        fflush(stderr);
+        g_pc_profile_mode = 1;
+        unsigned delivered = 0;
+        // A fixed interval aliases with the frame period (5 ms sampling of a 5 ms frame re-hits the same phase), so
+        // the wait is jittered and frames land at every phase of the loop.
+        std::srand(static_cast<unsigned>(std::time(nullptr)));
+        for (unsigned i = 0; i < total; ++i) {
+            const double scale = 0.5 + (std::rand() % 1001) / 1000.0;
+            usleep(static_cast<useconds_t>(interval_ms * 1000.0 * scale));
+            g_wd_done = 0;
+            syscall(SYS_tgkill, pid, pid, SIGUSR2);
+            for (int k = 0; k < 50 && !g_wd_done; ++k) usleep(1000);
+            if (g_wd_done) ++delivered;
+        }
+        g_pc_profile_mode = 0;
+        std::vector<std::pair<uint32_t, size_t>> top;
+        for (size_t i = 0; i < g_il2cpp_hits.size(); ++i)
+            if (g_il2cpp_hits[i]) top.emplace_back(g_il2cpp_hits[i], i);
+        std::sort(top.rbegin(), top.rend());
+        fprintf(stderr, "[PROFILE] %u samples delivered, %zu distinct managed methods hit, %llu samples outside managed code\n",
+                delivered, top.size(), static_cast<unsigned long long>(g_il2cpp_hits_outside));
+        for (size_t i = 0; i < top.size() && i < 60; ++i)
+            fprintf(stderr, "[PROFILE] %6u  %s\n", top[i].first,
+                    g_il2cpp_syms.arena.data() + g_il2cpp_syms.name_off[top[i].second]);
+        fflush(stderr);
+        _exit(0);
+    }).detach();
+}
+
 static void start_watchdog(unsigned seconds) {
     struct sigaction sa{};
     sa.sa_flags = SA_SIGINFO;
@@ -3362,6 +3596,30 @@ static void unwinder_probe(uint64_t guest_pc_a, uint64_t guest_pc_b) {
     }
 }
 
+// Whether a chained-fixups image imports `sym`: its import names live in the fixups payload, so there is no bind
+// stream to scan for the app-mode heuristic.
+static bool chained_imports_symbol(const uint8_t* file, size_t file_size, uint32_t off, uint32_t size, const char* sym) {
+    if (!size || off > file_size || size > file_size - off || size < 28) return false;
+    const uint8_t* d = file + off;
+    const uint32_t imports_off = *reinterpret_cast<const uint32_t*>(d + 8);
+    const uint32_t symbols_off = *reinterpret_cast<const uint32_t*>(d + 12);
+    const uint32_t count = *reinterpret_cast<const uint32_t*>(d + 16);
+    const uint32_t format = *reinterpret_cast<const uint32_t*>(d + 20);
+    if (imports_off >= size || symbols_off >= size || format < 1 || format > 3) return false;
+    const size_t stride = format == 3 ? 16 : format == 2 ? 8 : 4;
+    const size_t n = std::strlen(sym) + 1;
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t at = imports_off + static_cast<size_t>(i) * stride;
+        if (at + stride > size) return false;
+        const uint64_t name_off = format == 3 ? *reinterpret_cast<const uint32_t*>(d + at + 4)
+                                              : (*reinterpret_cast<const uint32_t*>(d + at) >> 9);
+        const size_t name_at = symbols_off + name_off;
+        if (name_at >= size || name_at + n > size) continue;
+        if (std::memcmp(d + name_at, sym, n) == 0) return true;
+    }
+    return false;
+}
+
 extern "C" int loader_main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
@@ -3479,7 +3737,7 @@ extern "C" int loader_main(int argc, char** argv) {
     }
     uint32_t ncmds = *reinterpret_cast<uint32_t*>(file_data + 16);
     uint32_t cur = 32;
-    bool chained_fixups = false, has_dyld_info = false;
+    bool has_chained_fixups = false, has_dyld_info = false;
 
     struct SegmentInfo {
         std::string name;
@@ -3491,6 +3749,7 @@ extern "C" int loader_main(int argc, char** argv) {
     };
     std::vector<SegmentInfo> segments;
 
+    uint32_t chained_off = 0, chained_size = 0;
     uint32_t rebase_off = 0, rebase_size = 0;
     uint32_t bind_off = 0, bind_size = 0;
     uint32_t lazy_off = 0, lazy_size = 0;
@@ -3551,11 +3810,17 @@ extern "C" int loader_main(int argc, char** argv) {
         } else if (cmd == 0x80000028) { // LC_MAIN
             lc_main_entryoff = *reinterpret_cast<uint64_t*>(file_data + cur + 8);
         } else if (cmd == 0x2c && cmdsize >= 20 && *reinterpret_cast<uint32_t*>(file_data + cur + 16) != 0) { // LC_ENCRYPTION_INFO_64, cryptid
-            // not fatal: some dumpers write the decrypted pages back and leave the flag set
-            fprintf(stderr, "[WARN] %s is marked FairPlay encrypted (cryptid %u). If it crashes at once, it was never decrypted.\n", bin_path,
+            // not fatal: some tools rebuild the file with readable pages and leave the flag set
+            fprintf(stderr, "[WARN] %s still carries platform protection (cryptid %u). If it faults at once, its code was never made readable.\n", bin_path,
                     *reinterpret_cast<uint32_t*>(file_data + cur + 16));
-        } else if (cmd == 0x80000034) { // LC_DYLD_CHAINED_FIXUPS
-            chained_fixups = true;
+        } else if (cmd == 0x80000034 && cmdsize >= 16) { // LC_DYLD_CHAINED_FIXUPS
+            has_chained_fixups = true;
+            chained_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
+            chained_size = *reinterpret_cast<uint32_t*>(file_data + cur + 12);
+            if (chained_off > file_size || chained_size > file_size - chained_off) {
+                fprintf(stderr, "[FATAL] chained fixups data lies outside the file (truncated binary)\n");
+                return 1;
+            }
         } else if ((cmd == 0x22 || cmd == 0x80000022) && cmdsize >= 48) { // LC_DYLD_INFO
             has_dyld_info = true;
             rebase_off = *reinterpret_cast<uint32_t*>(file_data + cur + 8);
@@ -3572,12 +3837,6 @@ extern "C" int loader_main(int argc, char** argv) {
         }
         cur += cmdsize;
     }
-    if (chained_fixups && !has_dyld_info) {
-        // rebases and binds would silently be skipped and the first pointer the guest follows would be a file offset
-        fprintf(stderr, "[FATAL] %s uses chained fixups (built for iOS 15 or later); only LC_DYLD_INFO images are supported\n", bin_path);
-        return 1;
-    }
-
     // Decide app mode now: resolve_symbol and init_custom_shims both depend on it, and binds happen below.
     {
         const char* env = getenv("LOADER_APP");
@@ -3593,7 +3852,9 @@ extern "C" int loader_main(int argc, char** argv) {
                     if (std::memcmp(p, sym, n) == 0) return true;
                 return false;
             };
-            bool imports_uikit = has_symbol(bind_off, bind_size, "_UIApplicationMain") || has_symbol(lazy_off, lazy_size, "_UIApplicationMain");
+            bool imports_uikit = has_symbol(bind_off, bind_size, "_UIApplicationMain") ||
+                                 has_symbol(lazy_off, lazy_size, "_UIApplicationMain") ||
+                                 chained_imports_symbol(file_data, file_size, chained_off, chained_size, "_UIApplicationMain");
             g_app_mode = lc_main_entryoff != 0 && imports_uikit;
         }
         if (g_app_mode) printf("[*] App mode: Objective-C / UIKit / OpenGL ES iOS app\n");
@@ -3647,7 +3908,34 @@ extern "C" int loader_main(int argc, char** argv) {
         }
     }
 
-    // 5. Apply Rebases
+    // 5. Chained fixups (iOS 15+): the same relocations as the rebase/bind streams, as one table of linked words.
+    if (has_chained_fixups && chained_size) {
+        printf("[*] Applying chained fixups (offset 0x%x, size %u)...\n", chained_off, chained_size);
+        chained_fixups::Args ca;
+        ca.file = file_data;
+        ca.file_size = file_size;
+        ca.dataoff = chained_off;
+        ca.datasize = chained_size;
+        std::vector<chained_fixups::Segment> csegs;
+        csegs.reserve(segments.size());
+        for (const auto& s : segments) csegs.push_back({s.name.c_str(), s.vmaddr, s.vmsize});
+        ca.segments = &csegs;
+        ca.image_base = image_base;
+        ca.min_vm = min_vm;
+        ca.resolve = [](const std::string& n) { return resolve_symbol(n); };
+        ca.record = [](uint64_t loc, void* target, const std::string& sym, int64_t addend) {
+            g_binds.push_back({loc, reinterpret_cast<uint64_t>(target), strdup(sym.c_str()),
+                               g_unresolved_set.count(sym) != 0, addend});
+        };
+        chained_fixups::Result cr = chained_fixups::apply(ca);
+        if (!cr.error.empty()) {
+            fprintf(stderr, "[FATAL] chained fixups: %s (after %zu rebases, %zu binds)\n", cr.error.c_str(), cr.rebases, cr.binds);
+            return 1;
+        }
+        printf("[+] Applied %zu chained rebases and %zu chained binds in %zu page chains\n", cr.rebases, cr.binds, cr.page_chains);
+    }
+
+    // 5b. Apply Rebases
     printf("[*] Applying dyld rebases (offset 0x%x, size %u)...\n", rebase_off, rebase_size);
     const uint8_t* p = file_data + rebase_off;
     const uint8_t* p_end = p + rebase_size;
@@ -3989,23 +4277,23 @@ extern "C" int loader_main(int argc, char** argv) {
         return 0;   // run_main does not return
     }
 
-    // Check value at 0x29b8890
-    uint64_t* bzero_slot = reinterpret_cast<uint64_t*>(image_base + 0x29b8890);
-    printf("[*] Value at 0x29b8890 (bzero slot): 0x%lx\n", *bzero_slot);
-
-    // 8.5 Execute static initializers in __mod_init_func (449 initializers at vmaddr 0x2860490)
-    uint64_t mod_init_vm = 0x2860490;
-    size_t init_count = 449;
-    uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm - min_vm));
-    printf("[*] Running %zu static initializers from __mod_init_func...\n", init_count);
-    for (size_t i = 0; i < init_count; ++i) {
-        init_func_t fn = reinterpret_cast<init_func_t>(inits[i]);
-        if (fn) {
-            printf("Running init [%zu/%zu] at %p...\n", i, init_count, (void*)fn);
-            fn();
+    // 8.5 Execute static initializers in __mod_init_func, located from the section table. Both the count and the
+    // vmaddr differ per Unity build, so no offset here may be fixed to the title this loader was first built for.
+    if (mod_init_size_scan) {
+        uint64_t* inits = reinterpret_cast<uint64_t*>(image_base + (mod_init_vm_scan - min_vm));
+        size_t init_count = mod_init_size_scan / 8;
+        printf("[*] Running %zu static initializers from __mod_init_func...\n", init_count);
+        for (size_t i = 0; i < init_count; ++i) {
+            init_func_t fn = reinterpret_cast<init_func_t>(inits[i]);
+            if (fn) {
+                printf("Running init [%zu/%zu] at %p...\n", i, init_count, (void*)fn);
+                fn();
+            }
         }
+        printf("[+] All %zu static initializers executed successfully!\n", init_count);
+    } else {
+        printf("[*] No __mod_init_func section in this image; skipping static initializers\n");
     }
-    printf("[+] All %zu static initializers executed successfully!\n", init_count);
 
     // 9. Call IL2CPP Entry Points!
     typedef void (*il2cpp_register_log_callback_fn)(void (*callback)(const char*));
@@ -4078,14 +4366,14 @@ extern "C" int loader_main(int argc, char** argv) {
         }
         printf("\n=== ENGINE STAGE (LOADER_ENGINE=%s) ===\n", eng);
         fflush(stdout);
+        // True once the engine was bootstrapped through its own Objective-C entry points rather than the offsets below.
+        bool stub_route = false;
         if (std::strcmp(eng, "2") == 0) {
             printf("[E1] startup helper image+0x7cde30()...\n"); fflush(stdout);
             reinterpret_cast<engine_pre_fn>(get_fn(0x7cde30))();
             printf("[E1] returned\n"); fflush(stdout);
         }
         if (atoi(eng) >= 5) {
-            // Replay -[UnityFramework frameworkWarmup:argv:] (image+0x16850) minus the UIKit swizzling at image+0x12b90:
-            // UnityInitRuntime(argc, argv) at image+0x7cc27c, then image+0x1b304 (mono/feature registration).
             // LOADER_ENGINE_ARGS="-batchmode -nographics" appends engine command-line switches (parsed at image+0x51e1d4).
             static char arg0[] = "UnityFramework";
             static std::vector<std::string> extra;
@@ -4105,13 +4393,37 @@ extern "C" int loader_main(int argc, char** argv) {
             fake_argv_v.push_back(nullptr);
             int fake_argc = static_cast<int>(fake_argv_v.size()) - 1;
             typedef void (*runtime_init_fn)(int, char**);
-            printf("[E1a] UnityInitRuntime(%d, argv) image+0x7cc27c...\n", fake_argc); fflush(stdout);
-            reinterpret_cast<runtime_init_fn>(get_fn(0x7cc27c))(fake_argc, fake_argv_v.data());
-            printf("[E1a] returned\n"); fflush(stdout);
-            if (!getenv("LOADER_ENGINE_SKIP_1B304")) {
-                printf("[E1b] image+0x1b304()...\n"); fflush(stdout);
-                reinterpret_cast<engine_pre_fn>(get_fn(0x1b304))();
-                printf("[E1b] returned\n"); fflush(stdout);
+            // Generic bootstrap: -[UnityFramework frameworkWarmup:argv:] is what the launcher stub calls, and it runs
+            // UnityInitRuntime plus the per-build feature registration inside the image, so nothing here depends on
+            // where those functions landed in the tested build. The offsets below are kept for images that expose no
+            // UnityFramework class (set LOADER_ENGINE_LEGACY_OFFSETS=1 to force that replay).
+            if (!getenv("LOADER_ENGINE_LEGACY_OFFSETS")) {
+                if (objcrt::GClass* ufw = objcrt::find_class_by_name("UnityFramework")) {
+                    uint64_t inst = fakeui::send(ufw->addr, "getInstance");
+                    if (!inst) inst = fakeui::send(ufw->addr, "instance");   // older UnityFramework builds
+                    printf("[E1a] +[UnityFramework instance] -> %#llx\n", static_cast<unsigned long long>(inst)); fflush(stdout);
+                    if (inst) {
+                        printf("[E1a] -[UnityFramework frameworkWarmup:argv:] (%d args)...\n", fake_argc); fflush(stdout);
+                        fakeui::send(inst, "frameworkWarmup:argv:", static_cast<uint64_t>(fake_argc),
+                                     reinterpret_cast<uint64_t>(fake_argv_v.data()));
+                        printf("[E1a] returned\n"); fflush(stdout);
+                        static char data_bundle_id[] = "com.unity3d.framework";
+                        fakeui::send(inst, "setDataBundleId:", reinterpret_cast<uint64_t>(data_bundle_id));
+                        stub_route = true;
+                    }
+                } else {
+                    printf("[E1a] no UnityFramework class in this image; using fixed offsets\n"); fflush(stdout);
+                }
+            }
+            if (!stub_route) {
+                printf("[E1a] UnityInitRuntime(%d, argv) image+0x7cc27c...\n", fake_argc); fflush(stdout);
+                reinterpret_cast<runtime_init_fn>(get_fn(0x7cc27c))(fake_argc, fake_argv_v.data());
+                printf("[E1a] returned\n"); fflush(stdout);
+                if (!getenv("LOADER_ENGINE_SKIP_1B304")) {
+                    printf("[E1b] image+0x1b304()...\n"); fflush(stdout);
+                    reinterpret_cast<engine_pre_fn>(get_fn(0x1b304))();
+                    printf("[E1b] returned\n"); fflush(stdout);
+                }
             }
         }
         if (std::strcmp(eng, "3") == 0 || std::strcmp(eng, "4") == 0) {
@@ -4123,8 +4435,9 @@ extern "C" int loader_main(int argc, char** argv) {
             printf("[E1] registry global now %p\n", *reinterpret_cast<void**>(get_fn(0x2b59340))); fflush(stdout);
         }
         // image+0x1516c caches the app bundle path in image+0x2b428c8 and returns it as-is when set, so seed it
-        // and the engine never needs [[NSBundle mainBundle] bundlePath].
-        {
+        // and the engine never needs [[NSBundle mainBundle] bundlePath]. Both addresses are build-specific, so only
+        // the offset replay gets the seed; the stub route goes through NSBundle, which answers with the game dir.
+        if (!stub_route) {
             char** bundle_cache = reinterpret_cast<char**>(get_fn(0x2b428c8));
             printf("[E0] bundle path cache (image+0x2b428c8) was %p; seeding \"%s\"\n", static_cast<void*>(*bundle_cache), game_dir());
             *bundle_cache = strdup(game_dir());

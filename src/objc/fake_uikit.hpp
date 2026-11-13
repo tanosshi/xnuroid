@@ -254,18 +254,29 @@ inline uint64_t controller_view(uint64_t vc, FakeObjcObj* st) {
     return getp(st, "view");
 }
 
+// The layer's pixel size. A layer attached to a view that was never given a frame, or one whose drawableSize was
+// never set, still has to report real pixels: guests (Unity's Metal backend among them) size their viewport from
+// drawableSize, and a zero answer makes every render pass rasterise nothing.
+inline void layer_drawable_pixels(FakeObjcObj* ls, double& w, double& h) {
+    w = getd(ls, "drawableSize.w", 0);
+    h = getd(ls, "drawableSize.h", 0);
+    if (w > 0 && h > 0) return;
+    uint64_t view = getp(ls, "#view");
+    FakeObjcObj* vs = view ? ui_state(view) : nullptr;
+    double sc = getd(ls, "contentsScale", 1.0);
+    if (sc <= 0) sc = kScreenScale;
+    w = (vs && vs->rect[2] > 0 ? vs->rect[2] : kScreenW) * sc;
+    h = (vs && vs->rect[3] > 0 ? vs->rect[3] : screen::g_height) * sc;
+    if (w <= 0) w = kScreenW * kScreenScale;
+    if (h <= 0) h = screen::g_height * kScreenScale;
+}
+
 // CAMetalLayer.nextDrawable: three drawables per layer, re-created when drawableSize or pixelFormat change.
 inline uint64_t next_drawable(uint64_t layer, FakeObjcObj* ls) {
     static std::mutex mu;
     std::lock_guard<std::mutex> l(mu);
-    double w = getd(ls, "drawableSize.w", 0), h = getd(ls, "drawableSize.h", 0);
-    if (w <= 0 || h <= 0) {
-        uint64_t view = getp(ls, "#view");
-        FakeObjcObj* vs = view ? ui_state(view) : nullptr;
-        double sc = getd(ls, "contentsScale", 1.0);
-        w = (vs ? vs->rect[2] : kScreenW) * sc;
-        h = (vs ? vs->rect[3] : screen::g_height) * sc;
-    }
+    double w = 0, h = 0;
+    layer_drawable_pixels(ls, w, h);
     uint64_t pf = ls->props.count("pixelFormat") ? ls->props["pixelFormat"] : 80;   // MTLPixelFormatBGRA8Unorm
     const int count = g_drawable_count.load();
     uint64_t key = (static_cast<uint64_t>(w) << 32) ^ (static_cast<uint64_t>(h) << 8) ^ pf ^ (static_cast<uint64_t>(count) << 56);
@@ -489,8 +500,19 @@ inline bool view_message(CallFrame& frame, uint64_t self, FakeObjcObj* st, const
         frame.ret_x0 = self;
         return true;
     }
-    if (sel == "frame") { objc_ret_rect(st->rect[0], st->rect[1], st->rect[2], st->rect[3]); frame.ret_x0 = 0; return true; }
-    if (sel == "bounds") { objc_ret_rect(0, 0, st->rect[2], st->rect[3]); frame.ret_x0 = 0; return true; }
+    // A view whose frame was never set (CGRectZero, autoresized later) still reports the screen: Unity sizes its
+    // render surface and viewport from these bounds, and a 0x0 answer makes every pass rasterise nothing.
+    if (sel == "frame") {
+        objc_ret_rect(st->rect[0], st->rect[1], st->rect[2] > 0 ? st->rect[2] : kScreenW,
+                      st->rect[3] > 0 ? st->rect[3] : screen::g_height);
+        frame.ret_x0 = 0;
+        return true;
+    }
+    if (sel == "bounds") {
+        objc_ret_rect(0, 0, st->rect[2] > 0 ? st->rect[2] : kScreenW, st->rect[3] > 0 ? st->rect[3] : screen::g_height);
+        frame.ret_x0 = 0;
+        return true;
+    }
     if (sel == "center") { objc_ret_rect(st->rect[0] + st->rect[2] / 2, st->rect[1] + st->rect[3] / 2, 0, 0); return true; }
     if (sel == "setFrame:") { view_set_frame(self, st, in[0], in[1], in[2], in[3]); return true; }
     if (sel == "setBounds:") { view_set_frame(self, st, st->rect[0], st->rect[1], in[2], in[3]); return true; }
@@ -587,7 +609,12 @@ inline bool controller_message(CallFrame& frame, uint64_t self, FakeObjcObj* st,
 
 inline bool layer_message(CallFrame& frame, uint64_t self, FakeObjcObj* st, const std::string& sel, const double* in) {
     if (sel == "nextDrawable") { frame.ret_x0 = next_drawable(self, st); return true; }
-    if (sel == "drawableSize") { objc_ret_rect(getd(st, "drawableSize.w", 0), getd(st, "drawableSize.h", 0), 0, 0); return true; }
+    if (sel == "drawableSize") {
+        double w = 0, h = 0;
+        layer_drawable_pixels(st, w, h);
+        objc_ret_rect(w, h, 0, 0);
+        return true;
+    }
     if (sel == "setDrawableSize:") {
         if (getd(st, "drawableSize.w", 0) != in[0] || getd(st, "drawableSize.h", 0) != in[1]) {
             printf("[UI] CAMetalLayer %#llx drawableSize %.0fx%.0f\n", static_cast<unsigned long long>(self), in[0], in[1]);
@@ -632,6 +659,76 @@ inline bool display_link_message(CallFrame& frame, uint64_t self, FakeObjcObj* s
     return false;
 }
 
+// NSNotificationCenter, engine mode. The center object itself is a fake bag, so without a table the blocks a guest
+// registers here are dropped and an observer that gates a boot step never runs.
+struct NoteObserver {
+    uint64_t token = 0, object = 0, block = 0;
+    std::string name;
+};
+inline std::mutex g_note_mu;
+inline std::vector<NoteObserver> g_note_observers;
+inline uint64_t g_note_seq = 1;
+inline std::atomic<uint64_t> g_last_note_object{0};   // object of the last posted notification (UnityView)
+
+// Delivers to every observer registered for this name (empty name = all) and object (0 = all).
+inline int note_post(const char* name, uint64_t object) {
+    if (object) g_last_note_object = object;
+    std::vector<NoteObserver> hits;
+    {
+        std::lock_guard<std::mutex> l(g_note_mu);
+        for (const NoteObserver& o : g_note_observers)
+            if ((o.name.empty() || o.name == name) && (!o.object || o.object == object)) hits.push_back(o);
+    }
+    if (!hits.empty()) fprintf(stderr, "[NOTE] post %s -> %zu observer(s)\n", name, hits.size());
+    for (const NoteObserver& o : hits) {
+        if (!o.block) continue;
+        auto invoke = *reinterpret_cast<void (**)(void*, void*)>(o.block + 16);
+        if (!invoke) continue;
+        const uint64_t note = fake_make(8, "NSNotification");
+        invoke(reinterpret_cast<void*>(o.block), reinterpret_cast<void*>(note));
+    }
+    return static_cast<int>(hits.size());
+}
+
+inline bool notification_message(CallFrame& frame, FakeObjcObj* st, const std::string& sel) {
+    (void)st;
+    if (sel == "addObserverForName:object:queue:usingBlock:") {
+        NoteObserver o;
+        objc_string_value(frame.x[2], o.name);
+        o.object = frame.x[3];
+        o.block = frame.x[5];
+        o.token = g_note_seq++;
+        {
+            std::lock_guard<std::mutex> l(g_note_mu);
+            g_note_observers.push_back(o);
+        }
+        static std::atomic<int> logged{0};
+        if (logged++ < 12)
+            fprintf(stderr, "[NOTE] observe '%s' object %#llx block %#llx\n", o.name.c_str(),
+                    static_cast<unsigned long long>(o.object), static_cast<unsigned long long>(o.block));
+        frame.ret_x0 = fake_make(8, "NSNotificationObserver");
+        return true;
+    }
+    if (sel == "removeObserver:" || sel == "removeObserver:name:object:") {
+        const uint64_t who = frame.x[2];
+        std::lock_guard<std::mutex> l(g_note_mu);
+        g_note_observers.erase(std::remove_if(g_note_observers.begin(), g_note_observers.end(),
+                                             [&](const NoteObserver& o) { return o.token == who || o.block == who; }),
+                               g_note_observers.end());
+        frame.ret_x0 = 0;
+        return true;
+    }
+    if (sel == "postNotificationName:object:" || sel == "postNotificationName:object:userInfo:") {
+        std::string name;
+        objc_string_value(frame.x[2], name);
+        note_post(name.c_str(), frame.x[3]);
+        frame.ret_x0 = 0;
+        return true;
+    }
+    if (sel == "postNotification:") { frame.ret_x0 = 0; return true; }
+    return false;
+}
+
 inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& sel, const double* in) {
     const std::string& c = st->s;
     if (c == "NSNumber") {
@@ -659,7 +756,11 @@ inline bool misc_message(CallFrame& frame, FakeObjcObj* st, const std::string& s
     }
     if (c == "CAMetalDrawable") {
         if (sel == "texture" || sel == "layer" || sel == "drawableID") { frame.ret_x0 = getp(st, sel); return true; }
-        if (sel == "present" || sel == "presentAtTime:" || sel == "presentAfterMinimumDuration:") { ++g_presents; return true; }
+        if (sel == "present" || sel == "presentAtTime:" || sel == "presentAfterMinimumDuration:") {
+            ++g_presents;
+            mtlgl::g_presented_drawable.store(frame.x[0]);   // older presenting API: saved on the next commit (mtl_gles)
+            return true;
+        }
         if (sel == "addPresentedHandler:") { st->handlers.push_back(frame.x[2]); return true; }
     }
     if (c == "AVAudioSession") {
@@ -1116,9 +1217,220 @@ inline bool transform_message(CallFrame& frame, FakeObjcObj* st, const std::stri
     return false;
 }
 
+// ---- LOADER_UI_AUDIT --------------------------------------------------------------------------------------------
+// LOADER_UI_AUDIT=1 prints one compact block of the host surface's geometry and state: the application, the key
+// window, the root view controller and its view, every UIView that owns a CAMetalLayer with that layer's presentation
+// state, the screen the guest sees, and every value that is zero, negative or inconsistent. Read-only and bounded (8
+// metal views per block, three blocks per run); off unless the variable is set.
+inline bool ui_audit_on() {
+    static const bool on = getenv("LOADER_UI_AUDIT") != nullptr && getenv("LOADER_UI_AUDIT")[0] != '0';
+    return on;
+}
+// ui_state without creating a side-table entry: the audit must not change what it measures.
+inline FakeObjcObj* ui_state_existing(uint64_t o) {
+    if (!o) return nullptr;
+    if (FakeObjcObj* f = fake_lookup(o)) return f->kind == 8 ? f : nullptr;
+    std::lock_guard<std::mutex> l(g_guest_mu);
+    auto it = g_guest_state.find(o);
+    return it == g_guest_state.end() ? nullptr : it->second;
+}
+inline std::string audit_rect(double x, double y, double w, double h) {
+    char b[96];
+    snprintf(b, sizeof b, "(%.0f,%.0f,%.0f,%.0f)", x, y, w, h);
+    return std::string(b);
+}
+// What a guest gets from -[UIView frame]/bounds: a zero dimension is reported as the screen.
+inline std::string audit_view_rect(FakeObjcObj* vs, double* out) {
+    out[0] = vs->rect[0];
+    out[1] = vs->rect[1];
+    out[2] = vs->rect[2] > 0 ? vs->rect[2] : kScreenW;
+    out[3] = vs->rect[3] > 0 ? vs->rect[3] : screen::g_height;
+    std::string s = audit_rect(out[0], out[1], out[2], out[3]);
+    if (vs->rect[2] <= 0 || vs->rect[3] <= 0) {
+        char b[64];
+        snprintf(b, sizeof b, " (stored %.0fx%.0f)", vs->rect[2], vs->rect[3]);
+        s += b;
+    }
+    return s;
+}
+inline std::string audit_chain(uint64_t o) {
+    std::string s;
+    for (const std::string& n : class_chain(o)) {
+        if (!s.empty()) s += " <- ";
+        s += n;
+    }
+    return s.empty() ? std::string("<no class>") : s;
+}
+inline void ui_audit_block(const char* label, int frame) {
+    if (!ui_audit_on()) return;
+    std::vector<std::pair<uint64_t, FakeObjcObj*>> views, metal;
+    {
+        std::lock_guard<std::mutex> l(g_fake_mu);
+        for (const auto& kv : g_fake_objc)
+            if (kv.second->kind == 8 && is_view_class(kv.second->s))
+                views.emplace_back(reinterpret_cast<uint64_t>(kv.first), kv.second);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_guest_mu);
+        for (const auto& kv : g_guest_state)
+            if (kv.second && is_view_class(kv.second->s)) views.emplace_back(kv.first, kv.second);
+    }
+    for (const auto& v : views) {
+        FakeObjcObj* ls = fake_lookup(getp(v.second, "layer"));
+        if (ls && ls->s == "CAMetalLayer") metal.emplace_back(v.first, v.second);
+    }
+    std::vector<std::string> bad;
+    auto flag = [&bad](const std::string& s) { bad.push_back(s); };
+
+    printf("[UIAUDIT] ---- %s at frame %d: %zu UIView(s), %zu with a CAMetalLayer ----\n", label, frame, views.size(), metal.size());
+    printf("[UIAUDIT] UIApplication state=0 (UIApplicationStateActive) delegate=%#llx keyWindow=%#llx\n",
+           static_cast<unsigned long long>(g_app_delegate), static_cast<unsigned long long>(g_key_window));
+    if (views.empty()) flag("no UIView objects exist (the view hierarchy was never built)");
+    if (metal.empty()) flag("no UIView owns a CAMetalLayer (there is no render surface at all)");
+
+    double wf[4] = {0, 0, 0, 0};
+    FakeObjcObj* ks = ui_state_existing(g_key_window);
+    if (!ks) {
+        flag("key window is nil");
+        printf("[UIAUDIT] window nil\n");
+    } else {
+        const double ka = getd(ks, "alpha", 1.0);
+        const uint64_t kh = getp(ks, "hidden");
+        printf("[UIAUDIT] window %#llx frame=%s bounds=%s alpha=%.3g hidden=%llu\n",
+               static_cast<unsigned long long>(g_key_window), audit_view_rect(ks, wf).c_str(),
+               audit_rect(0, 0, wf[2], wf[3]).c_str(), ka, static_cast<unsigned long long>(kh));
+        if (ka <= 0) flag("key window alpha is 0");
+        if (kh) flag("key window is hidden");
+        if (wf[2] <= 0 || wf[3] <= 0) flag("key window has a zero-size frame");
+    }
+
+    const uint64_t root = ks ? getp(ks, "rootViewController") : 0;
+    FakeObjcObj* rcs = root ? ui_state_existing(root) : nullptr;
+    const uint64_t rv = rcs ? getp(rcs, "view") : 0;
+    if (!root) flag("key window has no root view controller");
+    if (root && !rv) flag("root view controller's view is not loaded (view == nil)");
+    printf("[UIAUDIT] rootViewController %#llx class=%s view=%#llx\n", static_cast<unsigned long long>(root),
+           audit_chain(root).c_str(), static_cast<unsigned long long>(rv));
+    FakeObjcObj* rvs = rv ? ui_state_existing(rv) : nullptr;
+    if (rvs) {
+        double rf[4] = {0, 0, 0, 0};
+        const std::string rfs = audit_view_rect(rvs, rf);
+        const uint64_t mask = getp(rvs, "autoresizingMask");
+        printf("[UIAUDIT] rootView %#llx class=%s frame=%s bounds=%s autoresizingMask=%#llx\n",
+               static_cast<unsigned long long>(rv), audit_chain(rv).c_str(), rfs.c_str(),
+               audit_rect(0, 0, rf[2], rf[3]).c_str(), static_cast<unsigned long long>(mask));
+        if (rf[2] <= 0 || rf[3] <= 0) flag("root view's frame is zero-size");
+        if (!mask) flag("root view autoresizingMask is 0 (it cannot follow a window resize)");
+        if (g_key_window && getp(rvs, "superview") != g_key_window)
+            flag("root view is not a subview of the key window (detached from the window hierarchy)");
+        if (getp(rvs, "hidden")) flag("root view is hidden");
+        if (getd(rvs, "alpha", 1.0) <= 0) flag("root view alpha is 0");
+    }
+
+    static const double kIdentity[6] = {1, 0, 0, 1, 0, 0};
+    int shown = 0;
+    for (const auto& m : metal) {
+        if (shown >= 8) {
+            flag("more than 8 CAMetalLayer views (list truncated)");
+            break;
+        }
+        ++shown;
+        FakeObjcObj* vs = m.second;
+        FakeObjcObj* ls = fake_lookup(getp(vs, "layer"));
+        if (!ls) continue;
+        double vr[4] = {0, 0, 0, 0};
+        const std::string vrs = audit_view_rect(vs, vr);
+        const double cen[2] = {vs->rect[0] + vs->rect[2] / 2, vs->rect[1] + vs->rect[3] / 2};
+        double tf[6];
+        for (int i = 0; i < 6; ++i) tf[i] = getd(vs, "transform" + std::to_string(i), kIdentity[i]);
+        const double alpha = getd(vs, "alpha", 1.0);
+        const uint64_t hidden = getp(vs, "hidden");
+        const uint64_t opaque = vs->props.count("opaque") ? getp(vs, "opaque") : 1;   // UIView.alpha 1, opaque YES
+        char b[256];
+        printf("[UIAUDIT] metalView %#llx class=%s frame=%s bounds=%s center=(%.0f,%.0f) transform=(%g,%g,%g,%g,%g,%g) alpha=%.3g hidden=%llu opaque=%llu layerClass=%s\n",
+               static_cast<unsigned long long>(m.first), audit_chain(m.first).c_str(), vrs.c_str(),
+               audit_rect(0, 0, vr[2], vr[3]).c_str(), cen[0], cen[1], tf[0], tf[1], tf[2], tf[3], tf[4], tf[5], alpha,
+               static_cast<unsigned long long>(hidden), static_cast<unsigned long long>(opaque), ls->s.c_str());
+        // The layer's bounds come from the view's stored frame, with no screen fallback (layer_message).
+        const double lw = vs->rect[2], lh = vs->rect[3], sc = getd(ls, "contentsScale", 1.0);
+        double dw = 0, dh = 0;
+        layer_drawable_pixels(ls, dw, dh);
+        const double set_w = getd(ls, "drawableSize.w", 0), set_h = getd(ls, "drawableSize.h", 0);
+        const uint64_t pf = ls->props.count("pixelFormat") ? ls->props["pixelFormat"] : 80;
+        const uint64_t fbo = getp(ls, "framebufferOnly");
+        printf("[UIAUDIT]   layer %#llx class=%s bounds=(0,0,%.0f,%.0f) position=(%.0f,%.0f) anchorPoint=(0.5,0.5) contentsScale=%.3g drawableSize=%.0fx%.0f%s maximumDrawableCount=%d pixelFormat=%llu framebufferOnly=%llu\n",
+               static_cast<unsigned long long>(getp(vs, "layer")), ls->s.c_str(), lw, lh, vs->rect[0] + lw / 2,
+               vs->rect[1] + lh / 2, sc, dw, dh,
+               (set_w > 0 && set_h > 0) ? "" : " (not set by the guest; derived from view*contentsScale)",
+               g_drawable_count.load(), static_cast<unsigned long long>(pf), static_cast<unsigned long long>(fbo));
+        if (lw <= 0 || lh <= 0) {
+            snprintf(b, sizeof b, "layer bounds are %.0fx%.0f (zero-size render surface)", lw, lh);
+            flag(b);
+        }
+        if (sc <= 0) {
+            snprintf(b, sizeof b, "layer contentsScale is %.3g", sc);
+            flag(b);
+        }
+        double dx = dw - lw * sc, dy = dh - lh * sc;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if (dx > 0.5 || dy > 0.5) {
+            snprintf(b, sizeof b, "layer drawableSize %.0fx%.0f != bounds.size*contentsScale %.0fx%.0f", dw, dh, lw * sc, lh * sc);
+            flag(b);
+        }
+        if (hidden) flag("metal view is hidden");
+        if (alpha <= 0) {
+            snprintf(b, sizeof b, "metal view alpha is %.3g", alpha);
+            flag(b);
+        }
+        if (!opaque) flag("metal view opaque is 0 (the layer is composited, not opaque)");
+        if (tf[0] != 1 || tf[1] != 0 || tf[2] != 0 || tf[3] != 1 || tf[4] != 0 || tf[5] != 0)
+            flag("metal view transform is not the identity");
+        if (cen[0] != vs->rect[0] + vr[2] / 2 || cen[1] != vs->rect[1] + vr[3] / 2) {
+            snprintf(b, sizeof b, "metal view center (%.0f,%.0f) is not the center of its reported frame (%.0f,%.0f)",
+                     cen[0], cen[1], vs->rect[0] + vr[2] / 2, vs->rect[1] + vr[3] / 2);
+            flag(b);
+        }
+        const uint64_t sup = getp(vs, "superview");
+        FakeObjcObj* ss = ui_state_existing(sup);
+        if (!sup) flag("metal view has no superview (its layer is outside the window hierarchy)");
+        else if (ss && (ss->rect[2] <= 0 || ss->rect[3] <= 0)) {
+            snprintf(b, sizeof b, "metal view's superview %#llx has a zero stored size %.0fx%.0f",
+                     static_cast<unsigned long long>(sup), ss->rect[2], ss->rect[3]);
+            flag(b);
+        }
+        if (!window_of(m.first)) flag("metal view is not in any window");
+    }
+
+    printf("[UIAUDIT] screen bounds=(0,0,%.0f,%.0f) nativeBounds=(0,0,%.0f,%.0f) nativeScale=%.0f scale=%.0f\n",
+           kScreenW, screen::g_height, kScreenW * kScreenScale, screen::g_height * kScreenScale, kScreenScale, kScreenScale);
+    double gw = kScreenW * kScreenScale, gh = screen::g_height * kScreenScale, gsc = kScreenScale;
+    if (!metal.empty()) {
+        if (FakeObjcObj* ls = fake_lookup(getp(metal[0].second, "layer"))) {
+            layer_drawable_pixels(ls, gw, gh);
+            gsc = getd(ls, "contentsScale", kScreenScale);
+        }
+    }
+    const double sb = screen::g_insets[0].load();
+    printf("[UIAUDIT] guest surface=%.0fx%.0f scale=%.3g orientation=1 (UIInterfaceOrientationPortrait) statusBarFrame=(0,0,%.0f,%.0f)\n",
+           gw, gh, gsc, kScreenW, sb);
+    if (gw <= 0 || gh <= 0) flag("the surface the guest sees is zero-size");
+    if (gsc <= 0) flag("the contentsScale the guest sees is not positive");
+    if (sb <= 0) flag("statusBarFrame height is 0 (top safe-area inset 0: this host has no system bar)");
+
+    if (bad.empty()) {
+        printf("[UIAUDIT] anomalies: none\n");
+    } else {
+        printf("[UIAUDIT] anomalies: %zu\n", bad.size());
+        for (const std::string& s : bad) printf("[UIAUDIT]  ! %s\n", s.c_str());
+    }
+    fflush(stdout);
+}
+
 }  // namespace fakeui
 
 #include "user_defaults.hpp"
+#include "../loader/unity_scenes.hpp"
 
 static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
     using namespace fakeui;
@@ -1159,6 +1471,14 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
         if (sel == "setCurrentMode:" || sel == "setOverscanCompensation:" || sel == "setBrightness:") return true;
         if (sel == "mirroredScreen" || sel == "overscanCompensation") { frame.ret_x0 = 0; return true; }
         if (sel == "bounds") { objc_ret_rect(0, 0, kScreenW, screen::g_height); frame.ret_x0 = 0; return true; }
+        // iOS 8+: the pixel bounds and the scale that turns points into pixels. Unity's newer render surfaces size
+        // their CAMetalLayer from these, and a zero answer leaves a 0x0 drawable that is never presented.
+        if (sel == "nativeBounds") {
+            objc_ret_rect(0, 0, kScreenW * kScreenScale, screen::g_height * kScreenScale);
+            frame.ret_x0 = 0;
+            return true;
+        }
+        if (sel == "scale" || sel == "nativeScale") { objc_ret_double(kScreenScale); return true; }
         return false;
     }
     if (f && f->kind == 6 && f->s == "UIApplication") {
@@ -1187,6 +1507,7 @@ static bool fake_uikit_message(CallFrame& frame, const std::string& sel) {
     if (is_view_class(cls) && (view_message(frame, self, st, sel, in) || transform_message(frame, st, sel))) return true;
     if (cls == "UIViewController" && controller_message(frame, self, st, sel)) return true;
     if ((cls == "CAMetalLayer" || cls == "CALayer") && layer_message(frame, self, st, sel, in)) return true;
+    if (cls == "NSNotificationCenter" && notification_message(frame, st, sel)) return true;
     if (cls == "CADisplayLink" && display_link_message(frame, self, st, sel)) return true;
     if (misc_message(frame, st, sel, in)) return true;
 
@@ -1278,6 +1599,18 @@ static void fakeui_run_loop_once() {
         setd(ls, "targetTimestamp", now + 1 / 60.0);
         send_sel(getp(ls, "target"), reinterpret_cast<const char*>(getp(ls, "action")), link);
     }
+}
+
+// The Unity guest binary sits either in a framework bundle or, in some layouts, directly in the game directory.
+static std::string guest_unity_binary(const char* game_dir) {
+    const std::string base = game_dir ? game_dir : "";
+    const char* const candidates[] = {"/Frameworks/UnityFramework.framework/UnityFramework", "/UnityFramework",
+                                      "/Frameworks/UnityFramework.framework/UnityFramework"};
+    for (const char* candidate : candidates) {
+        const std::string path = base + candidate;
+        if (access(path.c_str(), F_OK) == 0) return path;
+    }
+    return base + "/Frameworks/UnityFramework.framework/UnityFramework";
 }
 
 // LOADER_TOUCH="<frame>:<x>,<y>[,<frames held>];...": taps in screen pixels, delivered to the key window's root view
@@ -1382,17 +1715,226 @@ static void fakeui_run_application(int frames) {
     send(ctrl, "application:didFinishLaunchingWithOptions:", app, 0);
     printf("[APP] applicationDidBecomeActive:\n"); fflush(stdout);
     send(ctrl, "applicationDidBecomeActive:", app);
+    ui_audit_block("startup", 0);   // LOADER_UI_AUDIT: the surface as the app delegate left it
+    note_post("UIApplicationWillEnterForegroundNotification", app);
+    note_post("UIApplicationDidBecomeActiveNotification", app);
+    // IL2CPP naming: LOADER_IL2CPP_SYMS loads a joined address->method table (see tools/il2cpp_symbols.py) so every
+    // thread dump names the managed method it is inside; LOADER_IL2CPP_MODULES writes the raw pointer arrays.
+    if (const char* syms_path = getenv("LOADER_IL2CPP_SYMS")) {
+        if (g_loaded_image_base &&
+            il2cpp_load_syms(syms_path, reinterpret_cast<uint64_t>(g_loaded_image_base), g_loaded_image_size)) {
+            printf("[IL2CPP] loaded %zu method symbols from %s\n", g_il2cpp_syms.addrs.size(), syms_path);
+            fflush(stdout);
+        }
+    }
+    if (const char* dump_path = getenv("LOADER_IL2CPP_MODULES")) {
+        if (g_loaded_image_base) {
+            const int modules = il2cpp_dump_modules(g_loaded_image_base, g_loaded_image_size, dump_path);
+            printf("[IL2CPP] wrote %d code-gen modules to %s\n", modules, dump_path);
+            fflush(stdout);
+        }
+    }
+    if (const char* prof = getenv("LOADER_PC_PROFILE")) start_pc_profile(static_cast<unsigned>(atoi(prof)), 4000);
     printf("[APP] run loop: %d ticks\n", frames); fflush(stdout);
     double worst = 0, t0 = now_s();
     std::vector<ScriptedTap> taps = parse_touch_script();
     for (int f = 0; f < frames; ++f) {
         double a = now_s();
+        // LOADER_REPOST_NOTES: re-deliver Unity's view lifecycle notifications periodically. The engine's display
+        // manager sizes the surface from these, and it may have read a size before every observer was registered.
+        static const bool repost = getenv("LOADER_REPOST_NOTES") != nullptr;
+        if (repost && f > 0 && f % 120 == 0 && g_last_note_object.load()) {
+            const uint64_t obj = g_last_note_object.load();
+            note_post("kUnityViewWillLayoutSubviews", obj);
+            note_post("kUnityViewDidLayoutSubviews", obj);
+            note_post("kUnityViewWillAppear", obj);
+            note_post("kUnityViewDidAppear", obj);
+        }
         deliver_scripted_touches(taps, f);
         deliver_host_touches();
         uint64_t pool = fake_pool_push();
         fakeui_run_loop_once();
         fake_pool_pop(pool);
+        // LOADER_MANAGED_QUERY=<frame>: ask the guest's managed side what its world contains (scene names, root
+        // counts, object/renderer/camera counts) from between ticks, on the thread already attached to the domain.
+        // A scene whose VideoPlayer can never prepare (no video backend on the host) would block the player forever.
+        // Once that is observed, follow the build's scene order into the next scene. LOADER_NO_VIDEO_SKIP=1 disables.
+#ifndef XNUROID_UNITY_SCENES_INCLUDED
+#define XNUROID_UNITY_SCENES_INCLUDED
+#endif
+        // An empty or 0 value leaves skipping on, so a build that keeps the splash by default can be overridden.
+        static const char* const no_video_skip = getenv("LOADER_NO_VIDEO_SKIP");
+        static const bool video_skip_enabled = !(no_video_skip && no_video_skip[0] && no_video_skip[0] != '0');
+        static const int video_skip_frame = getenv("LOADER_VIDEO_SKIP_FRAME") ? atoi(getenv("LOADER_VIDEO_SKIP_FRAME")) : 150;
+        static int video_skips = 0;
+        if (video_skip_enabled && video_skips < 3 && f + 1 >= video_skip_frame && (f % 30) == 0) {
+            const char* game_dir = getenv("LOADER_GAME_DIR");
+            if (game_dir && g_loaded_image_base) {
+                static std::vector<std::string> build_scenes = unity_scene_list(game_dir);
+                if (!build_scenes.empty()) {
+                    const std::string binary =
+                        guest_unity_binary(game_dir);
+                    // Prefer the player's own video-completed callback: the rest of startup then runs exactly as it would
+                    // on a device that could decode the clip. Only fall back to the next build scene when no such
+                    // callback exists.
+                    if (il2cpp_video_complete_callback(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str())) {
+                        ++video_skips;
+                    } else if (il2cpp_skip_stuck_video(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(),
+                                                       game_dir, build_scenes)) {
+                        ++video_skips;
+                    }
+                }
+            }
+        }
+
+        // LOADER_MANAGED_CALL="<frame>:<Type>::<Method>" invokes one parameterless method on a live instance.
+        static const char* managed_call = getenv("LOADER_MANAGED_CALL");
+        static bool managed_call_done = false;
+        if (managed_call && !managed_call_done) {
+            const char* colon = strchr(managed_call, ':');
+            const int call_frame = colon ? atoi(std::string(managed_call, colon).c_str()) : 0;
+            if (colon && f + 1 >= call_frame) {
+                managed_call_done = true;
+                const std::string spec = colon + 1;
+                const size_t sep = spec.find("::");
+                const char* game_dir = getenv("LOADER_GAME_DIR");
+                const std::string binary =
+                    guest_unity_binary(game_dir);
+                if (sep != std::string::npos && g_loaded_image_base)
+                    il2cpp_invoke_first(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(),
+                                        spec.substr(0, sep).c_str(), spec.substr(sep + 2).c_str());
+            }
+        }
+
+        // A startup scene that never leaves itself is unusable even though it renders. After LOADER_STALL_SECONDS
+        // (default 15) with no scene change, continue into the next scene of the build. LOADER_STALL_ADVANCE=0 disables.
+        static const bool stall_advance_enabled = getenv("LOADER_STALL_ADVANCE") == nullptr ||
+                                                  atoi(getenv("LOADER_STALL_ADVANCE")) != 0;
+        static const long stall_frames = static_cast<long>(60) *
+                                         (getenv("LOADER_STALL_SECONDS") ? atol(getenv("LOADER_STALL_SECONDS")) : 15);
+        static std::string stall_scene;
+        static long stall_since = -1;
+        static int stall_moves = 0;
+        if (stall_advance_enabled && stall_moves < 1 && g_loaded_image_base) {
+            const char* game_dir = getenv("LOADER_GAME_DIR");
+            static std::vector<std::string> stall_scenes = game_dir ? unity_scene_list(game_dir) : std::vector<std::string>();
+            if (!stall_scenes.empty() && (f % 30) == 0) {
+                Il2CppApi stall_api = il2cpp_api(reinterpret_cast<uint64_t>(g_loaded_image_base));
+                const std::string here = stall_api.ok ? il2cpp_active_scene(stall_api) : std::string();
+                if (!here.empty() && here != stall_scene) {
+                    stall_scene = here;
+                    stall_since = f;
+                } else if (!here.empty() && stall_since >= 0 && f - stall_since > stall_frames) {
+                    const std::string binary =
+                        guest_unity_binary(game_dir);
+                    if (!il2cpp_advance_stalled_scene(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(),
+                                                      stall_scenes, f - stall_since)
+                             .empty()) {
+                        ++stall_moves;
+                        stall_since = f;
+                    }
+                }
+            }
+        }
+
+        // LOADER_TRACE_HIT="<frame>:<Type>::<Method>[,...]" marks methods so the first hit stops the process there.
+        static const char* trace_hit = getenv("LOADER_TRACE_HIT");
+        static bool trace_hit_done = false;
+        if (trace_hit && !trace_hit_done) {
+            const char* colon = strchr(trace_hit, ':');
+            const int trace_frame = colon ? atoi(std::string(trace_hit, colon).c_str()) : 0;
+            if (colon && f + 1 >= trace_frame) {
+                trace_hit_done = true;
+                const char* game_dir = getenv("LOADER_GAME_DIR");
+                const std::string binary =
+                    guest_unity_binary(game_dir);
+                if (g_loaded_image_base)
+                    il2cpp_trace_hits(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(), colon + 1);
+            }
+        }
+
+        // LOADER_MANAGED_STATIC="<frame>:<Type>::<StaticMethod>" prints one parameterless static string result.
+        static const char* managed_static = getenv("LOADER_MANAGED_STATIC");
+        static bool managed_static_done = false;
+        if (managed_static && !managed_static_done) {
+            const char* colon = strchr(managed_static, ':');
+            const int static_frame = colon ? atoi(std::string(managed_static, colon).c_str()) : 0;
+            if (colon && f + 1 >= static_frame) {
+                managed_static_done = true;
+                const char* game_dir = getenv("LOADER_GAME_DIR");
+                const std::string binary =
+                    guest_unity_binary(game_dir);
+                if (g_loaded_image_base)
+                    il2cpp_static_report(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(), colon + 1);
+            }
+        }
+
+        // LOADER_MANAGED_INSPECT="<frame>:<Namespace.Type>" dumps the fields of one live managed object.
+        static const char* managed_inspect = getenv("LOADER_MANAGED_INSPECT");
+        static bool managed_inspect_done = false;
+        if (managed_inspect && !managed_inspect_done) {
+            const char* colon = strchr(managed_inspect, ':');
+            const int inspect_frame = colon ? atoi(std::string(managed_inspect, colon).c_str()) : 0;
+            if (colon && f + 1 >= inspect_frame) {
+                managed_inspect_done = true;
+                const char* game_dir = getenv("LOADER_GAME_DIR");
+                const std::string binary =
+                    guest_unity_binary(game_dir);
+                if (g_loaded_image_base) {
+                    std::string types = colon + 1;
+                    size_t start = 0;
+                    while (start <= types.size()) {
+                        const size_t comma = types.find(',', start);
+                        const std::string one = types.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                        if (!one.empty())
+                            il2cpp_inspect_type(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(), one.c_str());
+                        if (comma == std::string::npos) break;
+                        start = comma + 1;
+                    }
+                }
+            }
+        }
+
+        // LOADER_MANAGED_CMD="scene:<name>" or "sceneindex:<n>" at LOADER_MANAGED_CMD_FRAME (default 600).
+        static const char* managed_cmd = getenv("LOADER_MANAGED_CMD");
+        static bool managed_cmd_done = false;
+        if (managed_cmd && !managed_cmd_done) {
+            static const int cmd_frame = getenv("LOADER_MANAGED_CMD_FRAME") ? atoi(getenv("LOADER_MANAGED_CMD_FRAME")) : 600;
+            if (f + 1 >= cmd_frame) {
+                managed_cmd_done = true;
+                const char* game_dir = getenv("LOADER_GAME_DIR");
+                const std::string binary =
+                    guest_unity_binary(game_dir);
+                if (g_loaded_image_base)
+                    il2cpp_managed_cmd(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(), managed_cmd);
+            }
+        }
+        static const char* managed_query = getenv("LOADER_MANAGED_QUERY");
+        static std::vector<int> managed_query_frames;
+        static size_t managed_query_next = 0;
+        if (managed_query && managed_query_frames.empty()) {
+            // "<frame>[,<frame>...]" - one report per listed frame, each at its own tick.
+            const char* p = managed_query;
+            while (*p) {
+                const int v = atoi(p);
+                if (v > 0) managed_query_frames.push_back(v);
+                while (*p && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
+            std::sort(managed_query_frames.begin(), managed_query_frames.end());
+            if (managed_query_frames.empty()) managed_query_frames.push_back(300);
+        }
+        if (managed_query && managed_query_next < managed_query_frames.size() &&
+            f + 1 >= managed_query_frames[managed_query_next]) {
+            ++managed_query_next;
+            const char* game_dir = getenv("LOADER_GAME_DIR");
+            const std::string binary =
+                guest_unity_binary(game_dir);
+            if (g_loaded_image_base)
+                il2cpp_query_report(reinterpret_cast<uint64_t>(g_loaded_image_base), binary.c_str(), f + 1);
+        }
         fakeui::defaults_flush(false);
+        if (f + 1 == 300 || f + 1 == 600) ui_audit_block("run loop", f + 1);   // LOADER_UI_AUDIT
         double ms = (now_s() - a) * 1e3;
         if (ms > worst) worst = ms;
         if (f < 3 || (f + 1) % 60 == 0)

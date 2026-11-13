@@ -93,6 +93,7 @@ struct RClass {
     RClass* meta = nullptr;          // class -> its metaclass
     RClass* instance = nullptr;      // metaclass -> its class
     bool is_meta = false, native = false, zombie = false;
+    bool swift = false;                          // class data carried Swift's FAST_IS_SWIFT_* bits
     uint32_t inst_size = 8;
     std::unordered_map<SEL, MethodEntry*> methods;
     std::vector<uintptr_t> protocols;             // guest protocol_t addresses
@@ -706,37 +707,55 @@ static inline uintptr_t rd(uintptr_t a) { return *reinterpret_cast<uintptr_t*>(a
 static inline uint32_t rd32(uintptr_t a) { return *reinterpret_cast<uint32_t*>(a); }
 static inline int32_t rdi32(uintptr_t a) { return *reinterpret_cast<int32_t*>(a); }
 
+static const char* safe_class_name(uintptr_t p);
+
 static void read_method_list_locked(uintptr_t list, RClass* into) {
-    if (!list) return;
+    if (!list || (list & 7) || !in_image(reinterpret_cast<const void*>(list))) return;
     uint32_t ent = rd32(list), cnt = rd32(list + 4);
     bool rel = ent & 0x80000000u;
     uint32_t esz = rel ? 12 : (ent & 0xfffc);
     if (!rel && esz < 24) esz = 24;
+    if (cnt > 4096) return;   // not a method list: the word came from another layout
     for (uint32_t i = 0; i < cnt; ++i) {
         uintptr_t e = list + 8 + i * esz;
-        const char* name;
-        const char* types;
-        IMP imp;
+        const char* name = rel ? reinterpret_cast<const char*>(e + rdi32(e))
+                               : reinterpret_cast<const char*>(rd(e));
+        // Only follow entries whose selector really is a string in the image: a Swift class descriptor has no ObjC
+        // method list behind ro+32, and the word there points at something that is not one.
+        if (!safe_class_name(reinterpret_cast<uintptr_t>(name))) continue;
+        const char* types = rel ? reinterpret_cast<const char*>(e + 4 + rdi32(e + 4))
+                                : reinterpret_cast<const char*>(rd(e + 8));
+        IMP imp = rel ? reinterpret_cast<IMP>(e + 8 + rdi32(e + 8))
+                      : reinterpret_cast<IMP>(rd(e + 16));
+        if (!imp) continue;
         if (rel) {
-            name = reinterpret_cast<const char*>(rd(e + rdi32(e)));
-            types = reinterpret_cast<const char*>(e + 4 + rdi32(e + 4));
-            imp = reinterpret_cast<IMP>(e + 8 + rdi32(e + 8));
+            add_method_locked(into, sel(name), imp, types);
         } else {
-            SEL canon = sel(reinterpret_cast<const char*>(rd(e)));
+            SEL canon = sel(name);
             *reinterpret_cast<uintptr_t*>(e) = reinterpret_cast<uintptr_t>(canon);   // uniqued, as libobjc does
-            name = canon;
-            types = reinterpret_cast<const char*>(rd(e + 8));
-            imp = reinterpret_cast<IMP>(rd(e + 16));
+            add_method_locked(into, canon, imp, types);
         }
-        if (!name || !imp) continue;
-        add_method_locked(into, sel(name), imp, types);
     }
 }
 
 static void read_protocols(uintptr_t list, RClass* into) {
-    if (!list) return;
+    if (!list || (list & 7) || !in_image(reinterpret_cast<const void*>(list))) return;
     uint64_t n = rd(list);
+    if (n > 1024) return;
     for (uint64_t i = 0; i < n; ++i) into->protocols.push_back(rd(list + 8 + 8 * i));
+}
+
+// A class_ro_t name is only taken when it really is a string inside the image: Swift class metadata shares the
+// class_t layout but its rodata has no ObjC name field, so the word at +24 is some other field of the descriptor.
+static const char* safe_class_name(uintptr_t p) {
+    if (!p || (p & 7) || !in_image(reinterpret_cast<const void*>(p))) return nullptr;
+    const char* s = reinterpret_cast<const char*>(p);
+    for (size_t i = 0; i < 256; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (!c) return i ? s : nullptr;
+        if (c < 0x20 || c == 0x7f) return nullptr;  // not a class name: the pointer came from another layout
+    }
+    return nullptr;
 }
 
 static RClass* register_guest_class_locked(uintptr_t cls) {
@@ -747,14 +766,30 @@ static RClass* register_guest_class_locked(uintptr_t cls) {
         auto* r = new RClass();
         r->cls = c;
         r->is_meta = is_meta;
-        uintptr_t ro = rd(c + 32) & kPtrMask;
-        r->ro = ro;
-        r->inst_size = rd32(ro + 8);
-        if (r->inst_size < 8) r->inst_size = 8;
-        const char* nm = reinterpret_cast<const char*>(rd(ro + 24));
-        r->name = nm ? nm : "?";
-        read_method_list_locked(rd(ro + 32), r);
-        read_protocols(rd(ro + 40), r);
+        // Bits 0..1 of class data are FAST_IS_SWIFT_LEGACY / FAST_IS_SWIFT_STABLE; a Swift class has no ObjC
+        // class_ro_t behind the pointer, only Swift's own class descriptor.
+        const uintptr_t data = rd(c + 32);
+        const bool swift = (data & 3) != 0;
+        uintptr_t ro = data & kPtrMask;
+        r->swift = swift;
+        r->inst_size = 8;
+        const char* nm = nullptr;
+        if (ro && (ro & 7) == 0 && in_image(reinterpret_cast<const void*>(ro))) {
+            r->ro = ro;
+            const uint32_t sz = rd32(ro + 8);
+            if (sz >= 8 && sz < 0x100000) r->inst_size = sz;
+            nm = safe_class_name(rd(ro + 24));
+        }
+        if (nm) {
+            r->name = nm;
+            read_method_list_locked(rd(ro + 32), r);
+            read_protocols(rd(ro + 40), r);
+        } else {
+            char buf[48];
+            std::snprintf(buf, sizeof buf, "%s@%llx", swift ? "swift" : "class",
+                          static_cast<unsigned long long>(c));
+            r->name = buf;
+        }
         by_addr()[c] = r;
         reinterpret_cast<class_t*>(c)->cache = reinterpret_cast<uintptr_t>(r);
         return r;
@@ -796,13 +831,16 @@ void boot_guest(const ImageInfo& im) {
         *slot = reinterpret_cast<uintptr_t>(sel(reinterpret_cast<const char*>(*slot)));
     }
     std::vector<RClass*> guest;
+    size_t n_swift = 0;
     for (uintptr_t p = im.classlist; p < im.classlist + im.classlist_size; p += 8) {
         uintptr_t c = rd(p) & ~7ull;
         if (!c) continue;
         RClass* r = register_guest_class_locked(c);
+        if (r->swift) ++n_swift;
         guest.push_back(r);
         guest.push_back(r->meta);
     }
+    if (!guest.empty()) log("%zu guest classes, %zu with Swift metadata", guest.size() / 2, n_swift);
     for (RClass* r : guest) link_super_locked(r);
     size_t ncat = 0;
     auto attach = [&](uintptr_t list, uintptr_t size, bool nonlazy) {
