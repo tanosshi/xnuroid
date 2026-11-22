@@ -221,6 +221,8 @@ extern "C" void app_host_touch(int pid, int phase, float nx, float ny) {
 }
 
 static id hit_test(id view, CGPoint p_window);
+static void table_sweep(id v, int depth);       // app_uikit.cpp: rows of every table that was reloaded
+static void table_touch_ended(id touched);
 
 static void deliver(const std::vector<id>& touches, const char* sel_name, id event) {
     // group by view, one message per view (UIKit sends each view only the touches that belong to it)
@@ -238,6 +240,7 @@ static void deliver(const std::vector<id>& touches, const char* sel_name, id eve
 }
 
 static void recognizers_on_end(id touch);
+static id window_at(CGPoint p);
 
 static void deliver_host_touches() {
     std::vector<HostTouch> batch;
@@ -262,9 +265,10 @@ static void deliver_host_touches() {
             auto* te = ext_get<TouchExt>(touch);
             te->loc = te->prev = p;
             te->began = t;
-            te->window = retain(g_key_window);
-            id v = hit_test(g_key_window, p);
-            te->view = retain(v ? v : g_key_window);
+            id win = window_at(p);
+            te->window = retain(win);
+            id v = win ? hit_test(win, p) : nullptr;
+            te->view = retain(v ? v : win);
             if (h.phase != 0) { te->phase = 0; }
         }
         auto* te = ext_get<TouchExt>(touch);
@@ -280,7 +284,7 @@ static void deliver_host_touches() {
         const char* sel_name = te->phase == 0 ? "touchesBegan:withEvent:" : te->phase == 1 ? "touchesMoved:withEvent:" : te->phase == 3 ? "touchesEnded:withEvent:" : "touchesCancelled:withEvent:";
         void* pool = pool_push();
         deliver({touch}, sel_name, event);
-        if (te->phase == 3) recognizers_on_end(touch);
+        if (te->phase == 3) { recognizers_on_end(touch); table_touch_ended(te->view); }
         pool_pop(pool);
         if (te->phase >= 3) {
             release(touch);
@@ -306,6 +310,20 @@ static CGPoint origin_in_window(id view) {
 }
 static CGPoint convert_to_view(id view, CGPoint p) { CGPoint o = origin_in_window(view); return {p.x - o.x, p.y - o.y}; }
 static CGPoint convert_from_view(id view, CGPoint p) { CGPoint o = origin_in_window(view); return {p.x + o.x, p.y + o.y}; }
+
+// Touches belong to the window under the finger, not to the key window: an SDK (an ad network, an analytics overlay)
+// can install a tiny key window above the app's own, and the app's window still has to receive the touches.
+static id window_at(CGPoint p) {
+    id best = nullptr;
+    for (id w : g_windows) {
+        WindowExt* e = wx(w);
+        if (!e || e->hidden || e->alpha < 0.01) continue;
+        CGRect f = view_frame(e);
+        if (p.x < f.origin.x || p.y < f.origin.y || p.x >= f.origin.x + f.size.width || p.y >= f.origin.y + f.size.height) continue;
+        if (!best || e->level >= wx(best)->level) best = w;
+    }
+    return best ? best : g_key_window;
+}
 
 static id hit_test(id view, CGPoint pw) {
     ViewExt* e = vx(view);
@@ -474,31 +492,40 @@ void ui_log_tree(id v, int depth) {
 }  // namespace
 
 void ui_present() {
-    if (!g_key_window) return;
-    if (getenv("LOADER_UI_TREE")) ui_log_tree(g_key_window, 0);
+    for (id w : g_windows) table_sweep(w, 0);
+    if (getenv("LOADER_UI_TREE")) for (id w : g_windows) ui_log_tree(w, 0);
     ANativeWindow* win = host_window ? host_window() : nullptr;
     const char* dump = getenv("LOADER_UI_DUMP");
-    if (!win && !dump) return;
-    WindowExt* we = wx(g_key_window);
-    if (!we || !we->root) return;
+    // The screen shows every visible window in order, not only the key one: an SDK can put a small key window over
+    // the app's own (an ad network does), and the app's UI still has to be composed underneath it.
+    std::vector<id> wins;
+    for (id w : g_windows) {
+        ViewExt* e = vx(w);
+        if (e && !e->hidden && e->alpha >= 0.01) wins.push_back(w);
+    }
+    if (wins.empty() || (!win && !dump)) return;
     const Screen& s = screen();
     static id composed_for = nullptr;
+    static size_t composed_count = 0;
     static int tw = 0, th = 0;
     static unsigned tex = 0;
     static std::vector<uint8_t> px;
-    if (composed_for != g_key_window || tw != s.px_w || th != s.px_h) {
+    if (composed_for != wins.back() || composed_count != wins.size() || tw != s.px_w || th != s.px_h) {
         if (tw != s.px_w || th != s.px_h) { tw = s.px_w; th = s.px_h; px.assign(static_cast<size_t>(tw) * th * 4, 0); }
         for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // opaque black background
         // WindowExt::root is the root view controller; the view tree hangs off the window itself.
-        ui_paint(g_key_window, px, tw, th, s.content_x, s.content_y, s.content_w / s.w_pt, 0);
+        for (id w : wins) ui_paint(w, px, tw, th, s.content_x, s.content_y, s.content_w / s.w_pt, 0);
         size_t lit = 0;
         for (size_t i = 0; i < px.size(); i += 4) if (px[i] || px[i + 1] || px[i + 2]) ++lit;
-        log("ui compositor: painted %zu px of %d x %d, content %.0fx%.0f at %.0f,%.0f", lit, tw, th,
-            s.content_w, s.content_h, s.content_x, s.content_y);
-        id root_view = we->root ? send(we->root, "view") : nullptr;
-        log("ui compositor: root %s view %s", class_name(class_of(we->root)),
+        log("ui compositor: painted %zu px of %d x %d over %zu windows, content %.0fx%.0f at %.0f,%.0f", lit, tw, th,
+            wins.size(), s.content_w, s.content_h, s.content_x, s.content_y);
+        WindowExt* top = wx(wins.back());
+        id root_view = top && top->root ? send(top->root, "view") : nullptr;
+        log("ui compositor: top %s root %s view %s", class_name(class_of(wins.back())),
+            top && top->root ? class_name(class_of(top->root)) : "nil",
             root_view ? class_name(class_of(root_view)) : "nil");
-        composed_for = g_key_window;
+        composed_for = wins.back();
+        composed_count = wins.size();
         if (win) {
             if (!gles::ensure_context()) return;
             if (!tex) {
@@ -717,6 +744,28 @@ static void set_root(id w, id vc) {
 }
 
 static void frame_hook() { deliver_host_touches(); ui_present(); }
+
+// LOADER_APP_TAP="x,y@0.5;x,y@2" drives an app that runs headless: each entry is a tap at that guest point, that many
+// seconds after launch. There is no finger and no window to touch, and this is how an app's screens get exercised.
+static void install_headless_taps() {
+    const char* spec = getenv("LOADER_APP_TAP");
+    if (!spec) return;
+    const Screen& s = screen();
+    std::string all(spec);
+    for (size_t i = 0; i < all.size();) {
+        size_t end = all.find(';', i);
+        std::string item = all.substr(i, end == std::string::npos ? std::string::npos : end - i);
+        double x = 0, y = 0, at = 0.5;
+        if (sscanf(item.c_str(), " %lf , %lf @ %lf", &x, &y, &at) >= 2) {
+            float nx = static_cast<float>(x / s.w_pt), ny = static_cast<float>(y / s.h_pt);
+            log("headless tap %.0f,%.0f after %.2fs", x, y, at);
+            timer_add(at, 0, [nx, ny] { app_host_touch(7, 0, nx, ny); });
+            timer_add(at + 0.06, 0, [nx, ny] { app_host_touch(7, 3, nx, ny); });
+        }
+        if (end == std::string::npos) break;
+        i = end + 1;
+    }
+}
 
 // ---- Swift entry points ---------------------------------------------------------------------------------------
 // A UIKit app written in Swift reaches UIKit through the Swift overlay, so its main() calls the mangled
@@ -945,10 +994,19 @@ void connect_scene() {
     if (!dc) { log("scene: delegate %s (%s) not found", dotted.c_str(), objc_name.c_str()); return; }
     g_scene_delegate = send(send_cls(dc, "alloc"), "init");
     log("scene: %s delegate %s", dotted.c_str(), class_name(class_of(g_scene_delegate)));
-    if (responds(g_scene_delegate, sel("scene:willConnectToSession:options:")))
-        send<void>(g_scene_delegate, "scene:willConnectToSession:options:", g_scene, g_scene_session, options);
-    else
-        log("scene: delegate lacks scene:willConnectToSession:options:");
+    SEL will_connect = sel("scene:willConnectToSession:options:");
+    IMP will_connect_imp = method_imp(g_scene_delegate, will_connect);
+    if (will_connect_imp && in_image(reinterpret_cast<const void*>(will_connect_imp))) {
+        log("scene: willConnect enter (imp=%p)", reinterpret_cast<void*>(will_connect_imp));
+        reinterpret_cast<void (*)(id, SEL, id, id, id)>(will_connect_imp)(g_scene_delegate, will_connect, g_scene,
+                                                                        g_scene_session, options);
+        log("scene: willConnect returned");
+    } else if (will_connect_imp) {
+        log("scene: willConnect imp %p is outside the image (base %p); not calling",
+            reinterpret_cast<void*>(will_connect_imp), reinterpret_cast<void*>(image_base()));
+    } else {
+        log("scene: delegate has no willConnect IMP");
+    }
     if (responds(g_scene_delegate, sel("sceneWillEnterForeground:")))
         send<void>(g_scene_delegate, "sceneWillEnterForeground:", g_scene);
     if (responds(g_scene_delegate, sel("sceneDidBecomeActive:")))
@@ -965,6 +1023,7 @@ extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id del
     (void)argc; (void)argv;
     mark_main_thread();
     set_frame_hook(frame_hook);
+    install_headless_taps();
     screen();
     // The 32-bit loader enters here straight from the guest's main(), so the host runtime may not be up yet.
     if (!class_named("NSObject")) {
@@ -1305,6 +1364,76 @@ static void set_prop(id view, const char* key, id v) {
     def(CLS, SET, +[](id self, SEL, id v) { set_prop(self, GET, v); });
 #define PROP_NOP_LONG(CLS, SET) def(CLS, SET, +[](id, SEL, long) {});
 
+// ---------------------------------------------------------------------------------------------------------------
+// UITableView rows
+// ---------------------------------------------------------------------------------------------------------------
+// A table's content comes from its data source. A list that built no cells would leave an app's screens blank and
+// untappable, so the rows are materialised as the table's subviews and rebuilt whenever the table is reloaded.
+static void table_reload(id tv) {
+    id ds = prop(tv, "dataSource");
+    if (id old = prop(tv, "#cells")) for (id c : arr_items(old)) remove_from_superview(c);
+    id cells = send_cls(class_named("NSMutableArray"), "array");
+    id paths = send_cls(class_named("NSMutableArray"), "array");
+    double width = vx(tv)->bounds.size.width;
+    double y = vx(tv)->bounds.origin.y;
+    double rowh = 44;
+    if (id n = prop(tv, "#rowh")) rowh = num_dval(n);
+    long sections = 1;
+    if (ds && responds(ds, sel("numberOfSectionsInTableView:"))) sections = send<long>(ds, "numberOfSectionsInTableView:", tv);
+    for (long s = 0; s < sections; ++s) {
+        if (ds && responds(ds, sel("tableView:viewForHeaderInSection:"))) {
+            id h = send(ds, "tableView:viewForHeaderInSection:", num_i(s));
+            if (h) {
+                double hh = 28;
+                if (responds(ds, sel("tableView:heightForHeaderInSection:"))) hh = send<double>(ds, "tableView:heightForHeaderInSection:", num_i(s));
+                view_set_frame(h, {{0, y}, {width, hh}});
+                if (vx(h)->superview != tv) add_subview(tv, h, -1);
+                y += hh;
+            }
+        }
+        long rows = ds && responds(ds, sel("tableView:numberOfRowsInSection:")) ? send<long>(ds, "tableView:numberOfRowsInSection:", num_i(s)) : 0;
+        for (long r = 0; r < rows; ++r) {
+            id ip = send_cls(class_named("NSIndexPath"), "indexPathForRow:inSection:", r, s);
+            double h = rowh;
+            if (ds && responds(ds, sel("tableView:heightForRowAtIndexPath:"))) h = send<double>(ds, "tableView:heightForRowAtIndexPath:", ip);
+            id cell = ds && responds(ds, sel("tableView:cellForRowAtIndexPath:")) ? send(ds, "tableView:cellForRowAtIndexPath:", ip) : nullptr;
+            if (!cell) continue;
+            view_set_frame(cell, {{0, y}, {width, h}});
+            if (vx(cell)->superview != tv) add_subview(tv, cell, -1);
+            send<void>(cells, "addObject:", cell);
+            send<void>(paths, "addObject:", ip);
+            y += h;
+        }
+    }
+    set_prop(tv, "#cells", cells);
+    set_prop(tv, "#paths", paths);
+    set_prop(tv, "#dirty", nullptr);
+}
+static void table_mark_dirty(id tv) { set_prop(tv, "#dirty", num_i(1)); }
+static void table_sweep(id v, int depth) {
+    if (!v || depth > 32) return;
+    if (is_kind(v, "UITableView") && prop(v, "#dirty")) table_reload(v);
+    std::vector<id> kids = vx(v) ? vx(v)->subviews : std::vector<id>();   // reloading added subviews
+    for (id k : kids) table_sweep(k, depth + 1);
+}
+// A tap on a row selects it, which is how most screens of a list-driven app open.
+static void table_touch_ended(id touched) {
+    for (id v = touched; v; v = vx(v) ? vx(v)->superview : nullptr) {
+        id table = vx(v)->superview;
+        if (!table || !is_kind(table, "UITableView")) continue;
+        auto cells = arr_items(prop(table, "#cells"));
+        auto paths = arr_items(prop(table, "#paths"));
+        for (size_t i = 0; i < cells.size() && i < paths.size(); ++i) {
+            if (cells[i] != v) continue;
+            id del = prop(table, "delegate");
+            if (!del) del = prop(table, "dataSource");
+            if (del && responds(del, sel("tableView:didSelectRowAtIndexPath:")))
+                send<void>(del, "tableView:didSelectRowAtIndexPath:", table, paths[i]);
+            return;
+        }
+    }
+}
+
 static void define_controls() {
     Class CTL = def_class("UIControl", "UIView");
     C_UIControl = CTL;
@@ -1433,11 +1562,16 @@ static void define_controls() {
 
     Class TBV = def_class("UITableView", "UIScrollView");
     def(TBV, "initWithFrame:style:", +[](id self, SEL, CGRect r, long) -> id { return send(self, "initWithFrame:", r); });
-    PROP_OBJ(TBV, "dataSource", "setDataSource:")
-    for (const char* s : {"setRowHeight:", "setSeparatorStyle:", "setSeparatorColor:", "setAllowsSelection:", "setSectionHeaderHeight:", "setSectionFooterHeight:",
+    def(TBV, "dataSource", +[](id self, SEL) -> id { return prop(self, "dataSource"); });
+    def(TBV, "setDataSource:", +[](id self, SEL, id v) { set_prop(self, "dataSource", v); table_mark_dirty(self); });
+    def(TBV, "rowHeight", +[](id self, SEL) -> double { id n = prop(self, "#rowh"); return n ? num_dval(n) : 44; });
+    def(TBV, "setRowHeight:", +[](id self, SEL, double h) { set_prop(self, "#rowh", num_d(h)); table_mark_dirty(self); });
+    for (const char* s : {"setSeparatorStyle:", "setSeparatorColor:", "setAllowsSelection:", "setSectionHeaderHeight:", "setSectionFooterHeight:",
                           "setEstimatedRowHeight:", "setBackgroundView:", "setTableHeaderView:", "setTableFooterView:", "setEditing:"})
         def(TBV, s, +[](id, SEL, long) {});
-    for (const char* s : {"reloadData", "beginUpdates", "endUpdates"}) def(TBV, s, +[](id, SEL) {});
+    for (const char* s : {"beginUpdates", "endUpdates"}) def(TBV, s, +[](id, SEL) {});
+    def(TBV, "reloadData", +[](id self, SEL) { table_mark_dirty(self); });
+    PROP_OBJ(TBV, "delegate", "setDelegate:")
     def(TBV, "dequeueReusableCellWithIdentifier:", +[](id, SEL, id) -> id { return nullptr; });
     def(TBV, "visibleCells", +[](id, SEL) -> id { return arr({}); });
     def(TBV, "indexPathForSelectedRow", +[](id, SEL) -> id { return nullptr; });
@@ -1950,7 +2084,22 @@ static void define_window_vc_app() {
     def(TBC, "setViewControllers:", +[](id self, SEL, id vcs) { for (id v : arr_items(vcs)) cx(self)->children.push_back(retain(v)); });
     def(TBC, "setViewControllers:animated:", +[](id self, SEL, id vcs, bool) { for (id v : arr_items(vcs)) cx(self)->children.push_back(retain(v)); });
     def(TBC, "viewControllers", +[](id self, SEL) -> id { return arr(cx(self)->children); });
-    def(TBC, "setSelectedIndex:", +[](id self, SEL, NSUInteger i) { cx(self)->selected = i; });
+    // Selecting a tab puts that child's view on screen and runs the appearance callbacks of the one it replaces.
+    def(TBC, "setSelectedIndex:", +[](id self, SEL, NSUInteger i) {
+        auto* e = cx(self);
+        if (i >= e->children.size() || i == e->selected) return;
+        id old = e->children[e->selected];
+        id pv = send(self, "view");
+        e->selected = i;
+        if (old && old != e->children[i]) {
+            view_will_appear(old, false);
+            if (id ov = cx(old)->view) remove_from_superview(ov);
+        }
+        id nw = e->children[i];
+        id nv = nw ? cx(nw)->view : nullptr;
+        if (pv && nv && vx(nv)->superview != pv) { const Screen& s = screen(); view_set_frame(nv, {{0, 0}, {s.w_pt, s.h_pt}}); add_subview(pv, nv, -1); }
+        view_will_appear(nw, true);
+    });
     def(TBC, "selectedIndex", +[](id self, SEL) -> NSUInteger { return cx(self)->selected; });
     def(TBC, "selectedViewController", +[](id self, SEL) -> id {
         auto& ch = cx(self)->children;
@@ -1959,7 +2108,8 @@ static void define_window_vc_app() {
     });
     def(TBC, "setSelectedViewController:", +[](id self, SEL, id vc) {
         auto& ch = cx(self)->children;
-        for (size_t i = 0; i < ch.size(); ++i) if (ch[i] == vc) cx(self)->selected = i;
+        for (size_t i = 0; i < ch.size(); ++i)
+            if (ch[i] == vc) { send<void>(self, "setSelectedIndex:", i); return; }
     });
     def(TBC, "setDelegate:", +[](id, SEL, id) {});
     def_class("UIActivityViewController", "UIViewController");

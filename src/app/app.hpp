@@ -64,6 +64,7 @@ bool is_kind(id obj, const char* class_name);
 IMP lookup(id obj, SEL s);                       // never null; misses return a nil-returning stub
 IMP lookup_noforward(id obj, SEL s);             // null when the receiver does not implement s
 bool responds(id obj, SEL s);
+IMP method_imp(id obj, SEL s);
 IMP nil_imp();
 uint32_t instance_size(Class c);
 

@@ -208,7 +208,12 @@ static void* low_alloc(size_t n) {
             p = MAP_FAILED;
             g_low_hint += chunk;
         }
-        if (p == MAP_FAILED) return calloc(1, n);
+        if (p == MAP_FAILED) {
+            // Nobody can use a block above 4 GB: a 32-bit guest storing this pointer would keep only the low half.
+            void* fallback = calloc(1, n);
+            fprintf(stderr, "[app] low arena exhausted (%zu bytes): fallback at %p\n", n, fallback);
+            return fallback;
+        }
         // 32-bit guest code may touch these objects directly, so the interpreter has to treat the block as guest memory.
         if (armv7bridge::add_region)
             armv7bridge::add_region(reinterpret_cast<uintptr_t>(p), reinterpret_cast<uintptr_t>(p) + chunk);
@@ -396,6 +401,9 @@ id alloc_extra(Class c, size_t extra) {
     h->magic = kObjMagic;
     h->rc.store(1, std::memory_order_relaxed);
     id o = reinterpret_cast<id>(mem + sizeof(Header));
+    if (reinterpret_cast<uintptr_t>(o) > 0xFFFFFFFFull)
+        fprintf(stderr, "[app] alloc for %s landed above 4 GB (%p)\n", r ? r->name.c_str() : "?",
+                static_cast<void*>(o));
     o->isa = c;
     if (r) {
         std::lock_guard<std::recursive_mutex> l(g_rt);
@@ -739,6 +747,15 @@ IMP lookup_noforward(id obj, SEL s) {
 
 bool responds(id obj, SEL s) { return lookup_noforward(obj, s) != nullptr; }
 
+// The IMP registered in the class's own method list, bypassing the dispatch cache. Used where a stale cache entry would
+// otherwise hide a guest method (for example right after a class's methods are parsed).
+IMP method_imp(id obj, SEL s) {
+    RClass* r = rc_of_class(obj ? obj->isa : 0);
+    if (!r) return nullptr;
+    auto it = r->methods.find(s);
+    return it == r->methods.end() ? nullptr : reinterpret_cast<IMP>(it->second);
+}
+
 IMP lookup_super(Class from, SEL s) {
     RClass* r = rc_of_class(from);
     if (!r || !r->super) return nullptr;
@@ -884,6 +901,11 @@ static RClass* register_guest_class_locked(uintptr_t cls) {
         if (nm) {
             r->name = nm;
             read_method_list_locked(rd(ro + 32), r);
+            if (trace_enabled("swift") &&
+                (r->name.find("SceneDelegate") != std::string::npos || r->name.find("AppDelegate") != std::string::npos)) {
+                log("%s methods (%zu):", r->name.c_str(), r->methods.size());
+                for (const auto& m : r->methods) log("  %s -> %p", m.first, reinterpret_cast<void*>(m.second));
+            }
             read_protocols(rd(ro + 40), r);
         } else {
             char buf[48];

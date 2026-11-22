@@ -176,8 +176,20 @@ replaced by real implementations once an arm64 Swift runtime is available.
   view tree and white frame are unchanged. The next wall inside the delegate is Swift/ObjC metadata and SwiftUI, not
   the scene plumbing.
 
-## 11. Status log
+## 11. Why the scene delegate cannot run yet (2026-11-22)
 
+`_TtC20andyworks_calculator13SceneDelegate` exposes 7 methods at boot, but the relative method list entry for
+`scene:willConnectToSession:options:` has an **IMP offset of 0**: the implementation is not a static thunk in the binary.
+The entry's list header is valid (`0x8000000c`, 13 entries), and `AppDelegate`'s entries do carry nonzero IMPs (which is
+why those run), so this is specific to methods whose implementation Swift synthesises from metadata at load time.
+
+Calling the entry's computed address jumps into data (SIGSEGV at an unmapped address). The loader now refuses an IMP
+outside the image and logs it instead of crashing. Until a Swift runtime materialises those implementations, no code
+in the scene delegate can execute, and the window/hosting controller it would create cannot exist.
+
+## 12. Status log
+
+- 2026-11-22: SceneDelegate method entries carry no static IMP (0) — Swift runtime must synthesise them. Guard added.
 - 2026-11-14: Scene lifecycle implemented; SceneDelegate executes; no window/UI created; frame stays white.
 - 2026-11-14: Launch path completes (delegate, viewDidLoad, appearance) with the concurrency placeholders; view tree has
   no SwiftUI host; white frame. No GUI yet.
