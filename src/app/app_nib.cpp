@@ -159,6 +159,318 @@ id resolve(Archive* ar, id value) {
     return o;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// NIBArchive: the container modern Xcode emits for compiled storyboards/nibs (iOS 6+). It is not a keyed archive:
+// five flat tables (objects, keys, values, class names) with varint-coded references. A storyboard whose entry nib
+// is in this format could not be instantiated at all before, which is what a modern UIKit app needs at launch.
+// Layout (validated against the bundle's Main.storyboardc): header at 10..49, then the tables in the order
+// objects(18/22), keys(26/30), values(34/38), class names(42/46).
+
+struct NArchive {
+    struct Val { uint32_t key = 0; uint8_t type = 9; int64_t i = 0; double f = 0; std::string bytes; uint32_t ref = 0; };
+    struct Obj { uint32_t cls = 0, vstart = 0, vcount = 0; };
+    struct Cls { std::string name; int32_t fallback = -1; };
+    std::vector<std::string> keys;
+    std::vector<Val> vals;
+    std::vector<Obj> objs;
+    std::vector<Cls> classes;
+
+    const Val* find(uint32_t obj, const char* key) const {
+        if (obj >= objs.size()) return nullptr;
+        const Obj& o = objs[obj];
+        for (uint32_t i = 0; i < o.vcount; ++i) {
+            size_t at = o.vstart + i;
+            if (at >= vals.size()) break;
+            if (vals[at].key < keys.size() && keys[vals[at].key] == key) return &vals[at];
+        }
+        return nullptr;
+    }
+};
+
+static bool nib_archive_parse(const std::string& data, NArchive& a) {
+    if (data.size() < 50 || std::memcmp(data.data(), "NIBArchive", 10) != 0) return false;
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(data.data());
+    const size_t n = data.size();
+    auto u32 = [&](size_t o) -> uint32_t { uint32_t v = 0; if (o + 4 <= n) std::memcpy(&v, d + o, 4); return v; };
+    auto varint = [&](size_t& p) -> uint64_t {
+        uint64_t r = 0;
+        int shift = 0;
+        while (p < n) {
+            uint8_t b = d[p++];
+            r |= static_cast<uint64_t>(b & 0x7f) << shift;
+            shift += 7;
+            if (b & 0x80) return r;
+        }
+        return r;
+    };
+    const uint32_t obj_count = u32(18), obj_off = u32(22);
+    const uint32_t key_count = u32(26), key_off = u32(30);
+    const uint32_t val_count = u32(34), val_off = u32(38);
+    const uint32_t cls_count = u32(42), cls_off = u32(46);
+    if (obj_off >= n || key_off >= n || val_off >= n || cls_off >= n) return false;
+
+    size_t p = obj_off;
+    for (uint32_t i = 0; i < obj_count; ++i) {
+        NArchive::Obj o;
+        o.cls = static_cast<uint32_t>(varint(p));
+        o.vstart = static_cast<uint32_t>(varint(p));
+        o.vcount = static_cast<uint32_t>(varint(p));
+        a.objs.push_back(o);
+    }
+    p = key_off;
+    for (uint32_t i = 0; i < key_count; ++i) {
+        size_t len = static_cast<size_t>(varint(p));
+        if (p + len > n) return false;
+        a.keys.emplace_back(reinterpret_cast<const char*>(d + p), len);
+        p += len;
+    }
+    p = val_off;
+    for (uint32_t i = 0; i < val_count; ++i) {
+        NArchive::Val v;
+        v.key = static_cast<uint32_t>(varint(p));
+        if (p >= n) return false;
+        v.type = d[p++];
+        switch (v.type) {
+            case 0: if (p + 1 > n) return false; v.i = *reinterpret_cast<const int8_t*>(d + p); p += 1; break;
+            case 1: { if (p + 2 > n) return false; int16_t s16; std::memcpy(&s16, d + p, 2); v.i = s16; p += 2; break; }
+            case 2: { if (p + 4 > n) return false; int32_t s32; std::memcpy(&s32, d + p, 4); v.i = s32; p += 4; break; }
+            case 3: if (p + 8 > n) return false; std::memcpy(&v.i, d + p, 8); p += 8; break;
+            case 4: v.i = 1; break;
+            case 5: v.i = 0; break;
+            case 6: { if (p + 4 > n) return false; float f32; std::memcpy(&f32, d + p, 4); v.f = f32; p += 4; break; }
+            case 7: if (p + 8 > n) return false; std::memcpy(&v.f, d + p, 8); p += 8; break;
+            case 8: {
+                size_t len = static_cast<size_t>(varint(p));
+                if (p + len > n) return false;
+                v.bytes.assign(reinterpret_cast<const char*>(d + p), len);
+                p += len;
+                break;
+            }
+            case 9: break;                                   // nil
+            case 10: if (p + 4 > n) return false; std::memcpy(&v.ref, d + p, 4); p += 4; break;
+            default: return false;
+        }
+        a.vals.push_back(std::move(v));
+    }
+    p = cls_off;
+    for (uint32_t i = 0; i < cls_count; ++i) {
+        NArchive::Cls c;
+        size_t len = static_cast<size_t>(varint(p));
+        uint64_t extra = varint(p);
+        for (uint64_t k = 0; k < extra; ++k) {
+            if (p + 4 > n) return false;
+            int32_t e; std::memcpy(&e, d + p, 4); p += 4;
+            if (k == 0) c.fallback = e;
+        }
+        if (p + len > n) return false;
+        c.name.assign(reinterpret_cast<const char*>(d + p), len);
+        while (!c.name.empty() && c.name.back() == '\0') c.name.pop_back();
+        p += len;
+        a.classes.push_back(std::move(c));
+    }
+    return true;
+}
+
+static CGRect nib_rect_from_bytes(const std::string& b, bool point) {
+    CGRect r{{0, 0}, {0, 0}};
+    // NIBArchive struct payload: one 0x07 type byte, then the CGFloats packed immediately after it (no alignment
+    // padding). Verified against the bundle: UIBounds = 0x07 + 4 doubles (414x896), UICenter = 0x07 + 2 doubles.
+    const size_t need = 1 + (point ? 16 : 32);
+    if (b.size() < need) return r;
+    double v[4] = {0, 0, 0, 0};
+    std::memcpy(v, b.data() + 1, point ? 16 : 32);
+    if (point) { r.origin.x = v[0]; r.origin.y = v[1]; }
+    else { r.origin.x = v[0]; r.origin.y = v[1]; r.size.width = v[2]; r.size.height = v[3]; }
+    return r;
+}
+
+id load_nib(const std::string& name, id owner, const std::string& extra_dir);
+
+// Instantiates one archive. References are object indices, so class names that are themselves archived NSStrings are
+// resolved recursively. A Swift class that the runtime cannot name falls back to the archive's UIOriginalClassName
+// ("UIViewController", "UINavigationController"), which keeps the storyboard's UIKit geometry usable.
+static id nib_archive_instantiate(NArchive& a, id owner, const std::string& path) {
+    std::vector<id> memo(a.objs.size(), nullptr);
+    std::vector<uint8_t> busy(a.objs.size(), 0);
+    std::vector<id> created;
+
+    std::function<std::string(uint32_t)> string_at = [&](uint32_t idx) -> std::string {
+        if (idx >= a.objs.size()) return "";
+        const NArchive::Val* b = a.find(idx, "NS.bytes");
+        if (!b) return "";
+        return b->bytes;
+    };
+
+    std::function<id(uint32_t)> inst = [&](uint32_t idx) -> id {
+        if (idx >= a.objs.size()) return nullptr;
+        if (memo[idx]) return memo[idx];
+        if (busy[idx]) return nullptr;   // reference cycle through a class name
+        busy[idx] = 1;
+        const NArchive::Obj& o = a.objs[idx];
+        std::string cn = o.cls < a.classes.size() ? a.classes[o.cls].name : "";
+        auto ref_string = [&](const char* key) -> std::string {
+            const NArchive::Val* v = a.find(idx, key);
+            if (!v || v->type != 10) return "";
+            return string_at(v->ref);
+        };
+        if (cn == "NSString" || cn == "NSMutableString") {
+            id s = str(string_at(idx));
+            memo[idx] = s;
+            busy[idx] = 0;
+            return s;
+        }
+        if (cn == "NSArray" || cn == "NSMutableArray") {
+            std::vector<id> items;
+            const NArchive::Obj& ao = a.objs[idx];
+            for (uint32_t k = 0; k < ao.vcount; ++k) {
+                size_t at = ao.vstart + k;
+                if (at >= a.vals.size()) break;
+                if (a.vals[at].type == 10) { id x = inst(a.vals[at].ref); if (x) items.push_back(x); }
+            }
+            id list = arr(items);
+            memo[idx] = list;
+            busy[idx] = 0;
+            return list;
+        }
+        if (cn == "NSDictionary" || cn == "NSMutableDictionary") {
+            id dd = autorelease(dict_new(false));
+            memo[idx] = dd;
+            busy[idx] = 0;
+            return dd;
+        }
+        if (cn == "UIColor" || cn == "NSColor") {
+            double r = 1, g = 1, b = 1, al = 1;
+            if (const NArchive::Val* w = a.find(idx, "UIWhite")) { r = g = b = w->f; }
+            if (const NArchive::Val* av = a.find(idx, "UIAlpha")) al = av->f;
+            id color = make_color(r, g, b, al);
+            memo[idx] = color;
+            busy[idx] = 0;
+            return color;
+        }
+        if (cn == "UIProxyObject") {
+            std::string ident = ref_string("UIProxiedObjectIdentifier");
+            id p = ident == "IBFilesOwner" ? owner : nullptr;
+            memo[idx] = p;
+            return p;
+        }
+        if (cn == "UIClassSwapper" || cn == "UICustomObject") {
+            std::string named = ref_string("UIClassName");
+            std::string original = ref_string("UIOriginalClassName");
+            Class c = 0;
+            if (!named.empty()) c = class_named(named.c_str());
+            if (!c && !original.empty()) c = class_named(original.c_str());
+            if (!c && o.cls < a.classes.size() && a.classes[o.cls].fallback >= 0) {
+                size_t fb = static_cast<size_t>(a.classes[o.cls].fallback);
+                if (fb < a.classes.size()) c = class_named(a.classes[fb].name.c_str());
+            }
+            if (!c) { log("nibarchive %s: no class for %s (original %s)", path.c_str(), named.c_str(), original.c_str()); busy[idx] = 0; return nullptr; }
+            if (!named.empty() && named != class_name(c)) log("nibarchive: %s degraded to %s", named.c_str(), class_name(c));
+            cn = class_name(c);
+        }
+        Class c = class_named(cn.c_str());
+        if (!c && o.cls < a.classes.size() && a.classes[o.cls].fallback >= 0) {
+            size_t fb = static_cast<size_t>(a.classes[o.cls].fallback);
+            if (fb < a.classes.size()) c = class_named(a.classes[fb].name.c_str());
+        }
+        if (!c) { log("nibarchive %s: unknown class %s", path.c_str(), cn.c_str()); busy[idx] = 0; return nullptr; }
+        id obj = send(cls_obj(c), "alloc");
+        memo[idx] = obj;
+        if (obj) {
+            if (responds(obj, sel("initWithCoder:"))) { /* no decoder for this container: plain init below */ }
+            if (responds(obj, sel("init"))) obj = send(obj, "init");
+            memo[idx] = obj;
+            created.push_back(obj);
+        }
+        busy[idx] = 0;
+        return obj;
+    };
+
+    for (uint32_t i = 0; i < a.objs.size(); ++i) inst(i);
+
+    // Apply the values that affect what the first frame looks like. Everything else (layout guides, bar metrics,
+    // trait storage) is left at its default; the geometry keys are the ones the storyboard actually carries.
+    for (uint32_t i = 0; i < a.objs.size(); ++i) {
+        id o = memo[i];
+        if (!o || !has_header(o)) continue;
+        const NArchive::Obj& oo = a.objs[i];
+        for (uint32_t k = 0; k < oo.vcount; ++k) {
+            size_t at = oo.vstart + k;
+            if (at >= a.vals.size()) break;
+            const NArchive::Val& v = a.vals[at];
+            std::string key = v.key < a.keys.size() ? a.keys[v.key] : "";
+            if ((key == "UIBounds" || key == "UIFrame") && v.type == 8) {
+                if (responds(o, sel("setFrame:"))) send<void>(o, "setFrame:", nib_rect_from_bytes(v.bytes, false));
+            } else if (key == "UICenter" && v.type == 8) {
+                if (responds(o, sel("setCenter:"))) send<void>(o, "setCenter:", nib_rect_from_bytes(v.bytes, true).origin);
+            } else if (key == "UIBackgroundColor" && v.type == 10) {
+                id color = memo[v.ref];
+                if (color && responds(o, sel("setBackgroundColor:"))) send<void>(o, "setBackgroundColor:", color);
+            } else if (key == "UIViewControllers" || key == "UIChildViewControllers") {
+                id list = v.type == 10 ? memo[v.ref] : nullptr;
+                if (list && responds(o, sel("setViewControllers:"))) send<void>(o, "setViewControllers:", list);
+            }
+        }
+    }
+
+    // Connections: the storyboard wires outlets and actions through archived connection objects, exactly like the
+    // keyed-archive path does. Without this a controller never receives its "view" outlet.
+    auto ref_of = [&](uint32_t idx, const char* key) -> uint32_t {
+        const NArchive::Val* v = a.find(idx, key);
+        return (v && v->type == 10) ? v->ref : 0xffffffffu;
+    };
+    for (uint32_t i = 0; i < a.objs.size(); ++i) {
+        // The connection object itself has no UIKit class, so it is never instantiated; what matters is its source
+        // and destination, which are ordinary archived objects.
+        std::string cn = a.objs[i].cls < a.classes.size() ? a.classes[a.objs[i].cls].name : "";
+        if (cn != "UIRuntimeOutletConnection" && cn != "UIRuntimeEventConnection") continue;
+        uint32_t sr = ref_of(i, "UISource"), dr = ref_of(i, "UIDestination"), lr = ref_of(i, "UILabel");
+        id dst = dr < memo.size() ? memo[dr] : nullptr;
+        std::string label = lr < a.objs.size() ? string_at(lr) : "";
+        if (sr >= memo.size() || !memo[sr] || label.empty()) continue;
+        id src = memo[sr];
+        if (cn == "UIRuntimeOutletConnection") {
+            std::string setter = "set" + std::string(1, static_cast<char>(toupper(label[0]))) + label.substr(1) + ":";
+            log("nibarchive outlet %s.%s", class_name(class_of(src)), label.c_str());
+            if (responds(src, sel(setter.c_str()))) send<void>(src, setter.c_str(), dst);
+            else send<void>(src, "setValue:forKey:", dst, str(label));
+        } else {
+            const NArchive::Val* ev = a.find(i, "UIEventMask");
+            NSUInteger mask = ev ? static_cast<NSUInteger>(ev->i) : 0;
+            send<void>(src, "addTarget:action:forControlEvents:", dst, sel(label.c_str()), mask);
+        }
+    }
+
+    // A view controller archives the name of the nib that holds its view (UINibName). Load it now so the controller
+    // has a real view by the time the window takes its first frame; the nothing-else case leaves -view to lazy-load.
+    for (uint32_t i = 0; i < a.objs.size(); ++i) {
+        id o = memo[i];
+        if (!o || !responds(o, sel("viewIfLoaded"))) continue;
+        const NArchive::Val* nv = a.find(i, "UINibName");
+        if (!nv || nv->type != 10 || send(o, "viewIfLoaded")) continue;
+        std::string vn = string_at(nv->ref);
+        if (vn.empty()) continue;
+        size_t slash = path.rfind('/');
+        std::string dir = slash == std::string::npos ? std::string() : path.substr(0, slash);
+        log("nibarchive: loading view nib %s for %s", vn.c_str(), class_name(class_of(o)));
+        load_nib(vn, o, dir);
+    }
+
+    id tops = nullptr;
+    for (size_t i = 0; i < a.vals.size(); ++i) {
+        const NArchive::Val& v = a.vals[i];
+        if (v.type != 10 || v.key >= a.keys.size() || a.keys[v.key] != "UINibTopLevelObjectsKey") continue;
+        id list = memo[v.ref];
+        if (list) tops = arr(arr_items(list));
+    }
+    if (!tops) {
+        std::vector<id> all;
+        for (id o : created) if (o) all.push_back(o);
+        tops = arr(all);
+    }
+    log("nibarchive %s: %zu objects", path.c_str(), a.objs.size());
+    return tops;
+}
+
 std::string find_nib(const std::string& name, const std::string& extra_dir) {
     std::vector<std::string> dirs;
     if (!extra_dir.empty()) dirs.push_back(extra_dir);
@@ -190,6 +502,11 @@ id load_nib(const std::string& name, id owner, const std::string& extra_dir) {
     if (path.empty()) { log("nib %s not found", name.c_str()); return nullptr; }
     std::string data;
     if (!read_file(path, data)) return nullptr;
+    if (data.size() >= 50 && std::memcmp(data.data(), "NIBArchive", 10) == 0) {
+        NArchive a;
+        if (!nib_archive_parse(data, a)) { log("nib %s: damaged NIBArchive", path.c_str()); return nullptr; }
+        return nib_archive_instantiate(a, owner, path);
+    }
     auto* ar = new Archive();
     ar->root = plist_parse(reinterpret_cast<const uint8_t*>(data.data()), data.size(), false);
     ar->objects = dict_get(ar->root, "$objects");

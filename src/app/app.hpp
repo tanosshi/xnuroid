@@ -16,8 +16,11 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "../loader/armv7_bridge.hpp"
 
 struct AppObj { uintptr_t isa; };
 typedef AppObj* id;
@@ -51,6 +54,9 @@ Class class_of(id obj);                          // isa (instances) / metaclass 
 Class superclass_of(Class c);
 const char* class_name(Class c);
 bool is_class_object(id obj);
+// Guest classes are registered under their image address too: objects of such a class carry that address as their
+// isa, because Swift-generated code compares `self.isa` with its own metadata pointer.
+void set_guest_identity(Class host, uint32_t guest);
 bool is_meta(Class c);
 bool is_subclass(Class c, Class of);
 bool is_kind(id obj, Class of);
@@ -92,11 +98,37 @@ Class metaclass_of(Class c);
 
 // message sends from native code (receiver nil -> zero value). SEL is const char*, so the selector may be a
 // string literal or an already-interned selector; sel() canonicalizes either.
+template <class T> inline uint64_t arg_bits(T v) {
+    if constexpr (std::is_pointer_v<T>) return reinterpret_cast<uint64_t>(v);
+    else if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) return static_cast<uint64_t>(v);
+    else return 0;
+}
+template <class R> inline R from_bits(uint64_t v) {
+    if constexpr (std::is_pointer_v<R>) return reinterpret_cast<R>(v);
+    else if constexpr (std::is_integral_v<R> || std::is_enum_v<R>) return static_cast<R>(v);
+    else if constexpr (std::is_floating_point_v<R>) return static_cast<R>(v);
+    else return R();
+}
+
+// Messages whose IMP is 32-bit guest code go through the armv7 interpreter instead of a native call. Arguments are
+// limited to two register-sized values (self and _cmd occupy the first two guest registers).
 template <class R = id, class... A>
 inline R send(id obj, const char* name, A... a) {
     if (!obj) return R();
     SEL s = sel(name);
-    return reinterpret_cast<R (*)(id, SEL, A...)>(lookup(obj, s))(obj, s, a...);
+    IMP imp = lookup(obj, s);
+    if (armv7bridge::is_imp && armv7bridge::send && armv7bridge::is_imp(reinterpret_cast<uint64_t>(imp))) {
+        if constexpr (sizeof...(A) <= 2 && ((sizeof(A) <= 8 && (std::is_arithmetic_v<A> || std::is_pointer_v<A>)) && ...)) {
+            uint64_t bits[2] = {0, 0};
+            int i = 0;
+            ((bits[i++] = arg_bits(a)), ...);
+            return from_bits<R>(armv7bridge::send(reinterpret_cast<uint64_t>(imp), reinterpret_cast<uint64_t>(obj),
+                                                  reinterpret_cast<uint64_t>(s), bits, static_cast<int>(sizeof...(A))));
+        } else {
+            return R();
+        }
+    }
+    return reinterpret_cast<R (*)(id, SEL, A...)>(imp)(obj, s, a...);
 }
 template <class R = id, class... A>
 inline R send_cls(Class c, const char* name, A... a) { return send<R, A...>(reinterpret_cast<id>(c), name, a...); }
@@ -257,6 +289,7 @@ void tlv_setup(const ImageInfo& info);           // app_darwin.cpp
 void prepare();                                   // register native classes + C symbols (idempotent)
 void* resolve_symbol(const std::string& name);    // null if app mode does not provide it
 void boot(const ImageInfo& info);                 // after binds: register classes, attach categories, +load
+void swift_set_command_line(int argc, char** argv);   // what the guest's CommandLine.argc/unsafeArgv answer
 [[noreturn]] void run_main(void* entry, int argc, char** argv);
 std::string bundle_executable(const std::string& bundle);   // CFBundleExecutable from Info.plist, "" if none
 }  // namespace app

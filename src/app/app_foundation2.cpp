@@ -675,12 +675,15 @@ static void init_kvc() {
 // ---------------------------------------------------------------------------------------------------------------
 static Class C_NSNotification, C_NSNotificationCenter;
 struct NoteExt : Ext { id name = nullptr, object = nullptr, info = nullptr; ~NoteExt() override { release(name); release(object); release(info); } };
-struct Observer { id observer; SEL sel; id name; id object; id block; uint64_t serial; };
+// Every NSNotificationCenter keeps its own observers. Frameworks rely on that: a proxy center re-posts a
+// notification it received on one center, and delivering that back to the same center would loop forever.
+struct Observer { id observer; SEL sel; id name; id object; id block; uint64_t serial; id center; };
 static std::mutex g_nc_mu;
 static std::vector<Observer>* g_observers;
 static std::set<id>* g_observer_set;
 static uint64_t g_obs_serial = 0;
 static id g_center;
+void post_notification(id center, id note);   // delivers only to the observers registered on that center
 
 static id note_new(id name, id object, id info) {
     id n = alloc(C_NSNotification);
@@ -690,7 +693,7 @@ static id note_new(id name, id object, id info) {
     e->info = retain(info);
     return autorelease(n);
 }
-static void nc_remove(id observer, id name, id object, bool all) {
+static void nc_remove(id center, id observer, id name, id object, bool all) {
     // released after unlocking: a release can deallocate, and every dealloc runs nc_dealloc_hook, which locks g_nc_mu
     std::vector<id> blocks, names;
     {
@@ -698,7 +701,8 @@ static void nc_remove(id observer, id name, id object, bool all) {
         if (!g_observers) return;
         auto& v = *g_observers;
         for (auto it = v.begin(); it != v.end();) {
-            if (it->observer == observer && (all || ((!name || obj_equal(it->name, name)) && (!object || it->object == object)))) {
+            if (it->observer == observer && (!center || it->center == center) &&
+                (all || ((!name || obj_equal(it->name, name)) && (!object || it->object == object)))) {
                 names.push_back(it->name);
                 if (it->block) blocks.push_back(it->block);
                 it = v.erase(it);
@@ -718,18 +722,25 @@ static void nc_dealloc_hook(id o) {
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observer_set || !g_observer_set->count(o)) return;
     }
-    nc_remove(o, nullptr, nullptr, true);
+    nc_remove(nullptr, o, nullptr, nullptr, true);
 }
-void post_notification(id note) {
+void post_notification(id note) { post_notification(g_center, note); }
+void post_notification(id center, id note) {
     auto* e = ext_get<NoteExt>(note);
     std::vector<Observer> hits;
     {
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observers) return;
         for (auto& o : *g_observers)
-            if ((!o.name || obj_equal(o.name, e->name)) && (!o.object || o.object == e->object)) hits.push_back(o);
+            if (o.center == center && (!o.name || obj_equal(o.name, e->name)) && (!o.object || o.object == e->object)) hits.push_back(o);
     }
-    if (trace_enabled("note")) log("notification %s -> %zu observers", utf8(e->name).c_str(), hits.size());
+    if (trace_enabled("note")) {
+        log("notification %s -> %zu observers", utf8(e->name).c_str(), hits.size());
+        for (auto& o : hits) {
+            if (o.block) log("  observer block invoke=%p", reinterpret_cast<void*>(block_invoke_ptr(o.block)));
+            else log("  observer %s %s", class_name(class_of(o.observer)), o.sel ? o.sel : "(nil)");
+        }
+    }
     for (auto& o : hits) {
         {   // skip observers removed by an earlier one in this pass
             std::lock_guard<std::mutex> l(g_nc_mu);
@@ -760,27 +771,27 @@ static void init_notifications() {
     g_center = alloc(C);
     add_dealloc_hook(nc_dealloc_hook);
     defc(C, "defaultCenter", +[](id, SEL) -> id { return g_center; });
-    def(C, "addObserver:selector:name:object:", +[](id, SEL, id obs, SEL s, id name, id object) {
+    def(C, "addObserver:selector:name:object:", +[](id self, SEL, id obs, SEL s, id name, id object) {
         if (!obs) return;
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observers) { g_observers = new std::vector<Observer>(); g_observer_set = new std::set<id>(); }
-        g_observers->push_back({obs, s, name ? (is_string(name) ? str16_new(u16(name)) : retain(name)) : nullptr, object, nullptr, ++g_obs_serial});
+        g_observers->push_back({obs, s, name ? (is_string(name) ? str16_new(u16(name)) : retain(name)) : nullptr, object, nullptr, ++g_obs_serial, self});
         g_observer_set->insert(obs);
     });
-    def(C, "addObserverForName:object:queue:usingBlock:", +[](id, SEL, id name, id object, id, id block) -> id {
+    def(C, "addObserverForName:object:queue:usingBlock:", +[](id self, SEL, id name, id object, id, id block) -> id {
         id token = autorelease(alloc(class_named("NSObject")));
         retain(token);
         std::lock_guard<std::mutex> l(g_nc_mu);
         if (!g_observers) { g_observers = new std::vector<Observer>(); g_observer_set = new std::set<id>(); }
-        g_observers->push_back({token, nullptr, name ? str16_new(u16(name)) : nullptr, object, block_copy(block), ++g_obs_serial});
+        g_observers->push_back({token, nullptr, name ? str16_new(u16(name)) : nullptr, object, block_copy(block), ++g_obs_serial, self});
         g_observer_set->insert(token);
         return token;
     });
-    def(C, "removeObserver:", +[](id, SEL, id obs) { nc_remove(obs, nullptr, nullptr, true); });
-    def(C, "removeObserver:name:object:", +[](id, SEL, id obs, id name, id object) { nc_remove(obs, name, object, !name && !object); });
-    def(C, "postNotification:", +[](id, SEL, id n) { post_notification(n); });
-    def(C, "postNotificationName:object:", +[](id, SEL, id name, id object) { post_notification(note_new(name, object, nullptr)); });
-    def(C, "postNotificationName:object:userInfo:", +[](id, SEL, id name, id object, id info) { post_notification(note_new(name, object, info)); });
+    def(C, "removeObserver:", +[](id self, SEL, id obs) { nc_remove(self, obs, nullptr, nullptr, true); });
+    def(C, "removeObserver:name:object:", +[](id self, SEL, id obs, id name, id object) { nc_remove(self, obs, name, object, !name && !object); });
+    def(C, "postNotification:", +[](id self, SEL, id n) { post_notification(self, n); });
+    def(C, "postNotificationName:object:", +[](id self, SEL, id name, id object) { post_notification(self, note_new(name, object, nullptr)); });
+    def(C, "postNotificationName:object:userInfo:", +[](id self, SEL, id name, id object, id info) { post_notification(self, note_new(name, object, info)); });
 }
 
 // ---------------------------------------------------------------------------------------------------------------

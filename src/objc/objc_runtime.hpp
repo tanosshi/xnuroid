@@ -233,6 +233,18 @@ inline GClass* guest_class_for_object(uint64_t obj, bool* is_class_object = null
     return nullptr;
 }
 
+// A 32-bit guest class registered by name only: host UIKit can resolve and allocate it, while method dispatch falls
+// through to the fake-object layer until a guest IMP bridge exists.
+inline void register_placeholder(const std::string& name, uint64_t addr) {
+    std::lock_guard<std::mutex> l(g_mu);
+    if (g_by_name.count(name)) return;
+    auto* c = new GClass();
+    c->addr = addr;
+    c->name = name;
+    g_by_addr[addr] = c;
+    g_by_name[name] = c;
+}
+
 inline GClass* find_class_by_name(const char* name) {
     std::lock_guard<std::mutex> l(g_mu);
     auto it = g_by_name.find(name);

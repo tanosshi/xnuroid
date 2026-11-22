@@ -2210,6 +2210,14 @@ static void shim_objc_stub(CallFrame& frame, void* ctx) {
 static void start_pc_profile(unsigned interval_ms, unsigned samples);   // defined with the watchdog, used by the app run loop
 #include "fake_uikit.hpp"
 
+// 32-bit apps reach UIKit through the same host startup as arm64. The delegate name arrives as a guest NSString
+// built by the armv7 loader; turn it into the host string object UIApplicationMain expects.
+extern "C" int app_UIApplicationMain_cstr(int argc, char** argv, const char* delegate_name);
+extern "C" int xnuroid_armv7_ui_main(int argc, char** argv, const char* delegate_name) {
+    printf("[armv7] host UIApplicationMain, delegate class \"%s\"\n", delegate_name ? delegate_name : "");
+    return app_UIApplicationMain_cstr(argc, argv, delegate_name);
+}
+
 static void shim_objc_msgSend(CallFrame& frame, void*) {
     ++g_guest_msgs;
     void* receiver = reinterpret_cast<void*>(frame.x[0]);
@@ -3708,8 +3716,17 @@ extern "C" int loader_main(int argc, char** argv) {
     }
     g_poison_continue = getenv("LOADER_POISON_STRICT") == nullptr;
     g_trace_unwind = getenv("LOADER_EXCEPTION_TEST") != nullptr || getenv("LOADER_TRACE_UNWIND") != nullptr;
+    // A fault that comes from stack exhaustion cannot be reported on the exhausted stack, so the handler gets its
+    // own: without this the process dies silently and the crash report never appears.
+    static uint8_t g_alt_signal_stack[64 * 1024];
+    {
+        stack_t ss{};
+        ss.ss_sp = g_alt_signal_stack;
+        ss.ss_size = sizeof g_alt_signal_stack;
+        sigaltstack(&ss, nullptr);
+    }
     struct sigaction sa{};
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sa.sa_sigaction = segv_handler;
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
@@ -4869,5 +4886,9 @@ extern "C" int loader_main(int argc, char** argv) {
 }
 
 #ifndef LOADER_LIBRARY
-int main(int argc, char** argv) { return loader_main(argc, argv); }
+int main(int argc, char** argv) {
+    // stdout is a file/pipe when run over adb; line buffering keeps the log current if the guest aborts.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    return loader_main(argc, argv);
+}
 #endif

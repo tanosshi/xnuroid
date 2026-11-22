@@ -5,6 +5,9 @@
 
 #include <android/native_window.h>
 
+#include "gles_backend.hpp"
+#include <GLES3/gl32.h>
+
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -149,7 +152,8 @@ struct VCExt : Ext {
     id presenting = nullptr, parent = nullptr;   // weak
     std::vector<id> children;
     std::unordered_map<std::string, id> props;
-    bool loading = false;
+    bool loading = false, did_load = false;
+    NSUInteger selected = 0;   // UITabBarController: index of the child on screen
     ~VCExt() override {
         if (view) if (ViewExt* e = ext_as<ViewExt>(view)) e->controller = nullptr;
         release(view); release(presented); release(title); release(nib_name); release(storyboard);
@@ -315,8 +319,25 @@ static id hit_test(id view, CGPoint pw) {
     return view;
 }
 
-static void view_will_appear(id vc, bool appear) {
+static void add_subview(id parent, id child, long index);
+
+// A container controller (a tab bar, a navigation stack) owns the child that is on screen: that child's view has to be
+// in the container's view before either of them hears about appearing, exactly as UIKit arranges it.
+static void view_will_appear(id vc, bool appear, int depth = 0) {
     if (!vc) return;
+    VCExt* e = cx(vc);
+    if (appear && e && !e->children.empty() && depth < 4) {
+        id child = responds(vc, sel("selectedViewController")) ? send(vc, "selectedViewController") : nullptr;
+        if (!child) child = e->children.front();
+        id pv = send(vc, "view");
+        id cv = child ? send(child, "view") : nullptr;
+        if (pv && cv) {
+            const Screen& s = screen();
+            view_set_frame(cv, {{0, 0}, {s.w_pt, s.h_pt}});
+            if (vx(cv)->superview != pv) add_subview(pv, cv, -1);
+        }
+        if (child && child != vc) view_will_appear(child, appear, depth + 1);
+    }
     send<void>(vc, appear ? "viewWillAppear:" : "viewWillDisappear:", 0);
     send<void>(vc, appear ? "viewDidAppear:" : "viewDidDisappear:", 0);
 }
@@ -398,6 +419,114 @@ bool color_components(id c, double rgba[4]) {
     return true;
 }
 id make_color(double r, double g, double b, double a) { return color(r, g, b, a); }
+
+// ---- software compositor ---------------------------------------------------------------------------------------
+// Views carry frames, background colours and a tree, but nothing turned them into pixels: an app that draws through
+// UIKit instead of GL (a storyboard app) was left with an empty window. Walk the key window's tree into an RGBA
+// buffer and present it through the GL backend. Only backgrounds are painted; text and images belong to the guest's
+// drawing code, which is not available here.
+namespace {
+
+void ui_fill(std::vector<uint8_t>& px, int w, int h, double x, double y, double rw, double rh, const ColorExt& c) {
+    if (rw <= 0 || rh <= 0 || c.a <= 0.004) return;
+    int x0 = std::max(0, static_cast<int>(std::floor(x))), y0 = std::max(0, static_cast<int>(std::floor(y)));
+    int x1 = std::min(w, static_cast<int>(std::ceil(x + rw))), y1 = std::min(h, static_cast<int>(std::ceil(y + rh)));
+    const int r = static_cast<int>(c.r * 255), g = static_cast<int>(c.g * 255), b = static_cast<int>(c.b * 255);
+    const int a = static_cast<int>(c.a * 255);
+    for (int yy = y0; yy < y1; ++yy) {
+        uint8_t* row = px.data() + static_cast<size_t>(yy) * w * 4;
+        for (int xx = x0; xx < x1; ++xx) {
+            uint8_t* p = row + static_cast<size_t>(xx) * 4;
+            p[0] = static_cast<uint8_t>((p[0] * (255 - a) + r * a) / 255);
+            p[1] = static_cast<uint8_t>((p[1] * (255 - a) + g * a) / 255);
+            p[2] = static_cast<uint8_t>((p[2] * (255 - a) + b * a) / 255);
+            p[3] = 255;
+        }
+    }
+}
+
+void ui_paint(id v, std::vector<uint8_t>& px, int w, int h, double ox, double oy, double scale, int depth) {
+    ViewExt* e = ext_as<ViewExt>(v);
+    if (!e || e->hidden || e->alpha <= 0.004 || depth > 32) return;
+    CGRect f = view_frame(e);
+    const double x = ox + f.origin.x * scale, y = oy + f.origin.y * scale;
+    const double vw = f.size.width * scale, vh = f.size.height * scale;
+    if (e->background) {
+        if (ColorExt* c = ext_as<ColorExt>(e->background)) ui_fill(px, w, h, x, y, vw, vh, *c);
+    }
+    for (id s : e->subviews) ui_paint(s, px, w, h, x, y, scale, depth + 1);
+}
+
+void ui_log_tree(id v, int depth) {
+    ViewExt* e = ext_as<ViewExt>(v);
+    if (!e || depth > 24) return;
+    CGRect f = view_frame(e);
+    std::string pad(static_cast<size_t>(depth) * 2, ' ');
+    char bg[64] = "nil";
+    if (ColorExt* c = e->background ? ext_as<ColorExt>(e->background) : nullptr)
+        std::snprintf(bg, sizeof bg, "%.2f,%.2f,%.2f,%.2f", c->r, c->g, c->b, c->a);
+    log("tree %s%s frame=(%.0f,%.0f %.0fx%.0f) bg=%s hidden=%d alpha=%.2f subviews=%zu", pad.c_str(),
+        class_name(class_of(v)), f.origin.x, f.origin.y, f.size.width, f.size.height, bg, e->hidden ? 1 : 0, e->alpha,
+        e->subviews.size());
+    for (id s : e->subviews) ui_log_tree(s, depth + 1);
+}
+
+}  // namespace
+
+void ui_present() {
+    if (!g_key_window) return;
+    if (getenv("LOADER_UI_TREE")) ui_log_tree(g_key_window, 0);
+    ANativeWindow* win = host_window ? host_window() : nullptr;
+    const char* dump = getenv("LOADER_UI_DUMP");
+    if (!win && !dump) return;
+    WindowExt* we = wx(g_key_window);
+    if (!we || !we->root) return;
+    const Screen& s = screen();
+    static id composed_for = nullptr;
+    static int tw = 0, th = 0;
+    static unsigned tex = 0;
+    static std::vector<uint8_t> px;
+    if (composed_for != g_key_window || tw != s.px_w || th != s.px_h) {
+        if (tw != s.px_w || th != s.px_h) { tw = s.px_w; th = s.px_h; px.assign(static_cast<size_t>(tw) * th * 4, 0); }
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // opaque black background
+        // WindowExt::root is the root view controller; the view tree hangs off the window itself.
+        ui_paint(g_key_window, px, tw, th, s.content_x, s.content_y, s.content_w / s.w_pt, 0);
+        size_t lit = 0;
+        for (size_t i = 0; i < px.size(); i += 4) if (px[i] || px[i + 1] || px[i + 2]) ++lit;
+        log("ui compositor: painted %zu px of %d x %d, content %.0fx%.0f at %.0f,%.0f", lit, tw, th,
+            s.content_w, s.content_h, s.content_x, s.content_y);
+        id root_view = we->root ? send(we->root, "view") : nullptr;
+        log("ui compositor: root %s view %s", class_name(class_of(we->root)),
+            root_view ? class_name(class_of(root_view)) : "nil");
+        composed_for = g_key_window;
+        if (win) {
+            if (!gles::ensure_context()) return;
+            if (!tex) {
+                glGenTextures(1, &tex);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        }
+    }
+    if (!win) {
+        static bool wrote = false;
+        if (wrote) return;
+        wrote = true;
+        FILE* f = fopen(dump, "wb");
+        if (!f) { log("ui dump: cannot open %s", dump); return; }
+        fprintf(f, "P6\n%d %d\n255\n", tw, th);
+        for (int i = 0; i < tw * th; ++i) fwrite(px.data() + static_cast<size_t>(i) * 4, 1, 3, f);
+        fclose(f);
+        log("ui dump: wrote %s (%dx%d)", dump, tw, th);
+        return;
+    }
+    gles::present_texture(tex, tw, th);
+}
 struct FontExt : Ext { std::string name = "Helvetica"; double size = 12; bool bold = false; };
 static id font(const std::string& name, double size, bool bold) {
     id f = alloc(C_UIFont);
@@ -587,21 +716,271 @@ static void set_root(id w, id vc) {
     release(old);
 }
 
-static void frame_hook() { deliver_host_touches(); }
+static void frame_hook() { deliver_host_touches(); ui_present(); }
+
+// ---- Swift entry points ---------------------------------------------------------------------------------------
+// A UIKit app written in Swift reaches UIKit through the Swift overlay, so its main() calls the mangled
+// UIApplicationMain below instead of the C symbol. The overlay is a thin wrapper: the app passes nil for both class
+// names and lets Info.plist (UIMainStoryboardFile / UISceneStoryboardFile) name the UI, which is what
+// app_UIApplicationMain already does. The two String? arguments arrive in (x2,x3) and (x4,x5) and are ignored.
+static int g_swift_argc = 1;
+static char** g_swift_argv = nullptr;
+
+void swift_set_command_line(int argc, char** argv) {
+    g_swift_argc = argc;
+    g_swift_argv = argv;
+}
+
+extern "C" int32_t app_swift_commandline_argc() { return g_swift_argc; }
+extern "C" void* app_swift_commandline_unsafe_argv() { return g_swift_argv; }
+
+// swift_getObjCClassFromMetadata: for a class metadata record the metadata pointer *is* the class object. Value-type
+// metadata would need a boxed class, but the entry path only asks about classes (the app delegate / app type).
+extern "C" void* app_swift_get_objc_class_from_metadata(void* metadata) { return metadata; }
+
+// The generated Swift main() names its app delegate as an NSString and bridges it to String for the fourth
+// UIApplicationMain argument. The overlay shim below reads the delegate from Info.plist instead, so the bridged
+// value never needs to be a real Swift String; returning the canonical empty String keeps the call site alive.
+struct SwiftStringValue { uint64_t count_and_flags, object; };
+static std::string g_swift_delegate_name;
+extern "C" SwiftStringValue app_swift_string_from_nsstring(id s) {
+    if (s) {
+        // The one bridge on the launch path carries the app delegate's class name; keep it, because the overlay
+        // shim below cannot receive the Swift String itself.
+        g_swift_delegate_name = utf8(s);
+        log("Swift String bridge: %s", g_swift_delegate_name.c_str());
+    }
+    return SwiftStringValue{0, 0};
+}
+
+extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id delegate_name);
+
+extern "C" int app_swift_UIApplicationMain(int argc, char** argv, uint64_t, uint64_t, uint64_t, uint64_t) {
+    log("Swift UIKit overlay UIApplicationMain(%d)", argc);
+    id delegate_name = g_swift_delegate_name.empty() ? nullptr : str(g_swift_delegate_name);
+    return app_UIApplicationMain(argc, argv, nullptr, delegate_name);
+}
+
+// 32-bit guest classes: define them in the host runtime and route their IMPs back into the armv7 interpreter. The
+// loader announces them during dyld processing, before any host class exists, so they are queued and defined when
+// UIApplicationMain starts.
+namespace {
+struct PendingGuestClass {
+    std::string name, super;
+    uint32_t size = 8;
+    uint32_t guest = 0;   // image class_t address
+    std::vector<std::pair<std::string, uint64_t>> methods;
+};
+std::vector<PendingGuestClass> g_pending_classes;
+
+void flush_guest_classes() {
+    for (const PendingGuestClass& pc : g_pending_classes) {
+        const char* sup = class_named(pc.super.c_str()) ? pc.super.c_str() : "NSObject";
+        Class c = def_class(pc.name.c_str(), sup, pc.size);
+        set_guest_identity(c, pc.guest);
+        for (const auto& m : pc.methods) def(c, m.first.c_str(), reinterpret_cast<IMP>(static_cast<uintptr_t>(m.second)));
+        fprintf(stderr, "[armv7] guest class registered: %s : %s (%zu methods)\n", pc.name.c_str(), sup,
+                pc.methods.size());
+    }
+    g_pending_classes.clear();
+}
+}  // namespace
+
+extern "C" void app_armv7_register_class(const char* name, const char* super_name, uint32_t instance_size,
+                                         uint32_t guest_class, const char* const* sels, const uint64_t* imps,
+                                         int count) {
+    g_pending_classes.push_back(PendingGuestClass{});
+    PendingGuestClass& pc = g_pending_classes.back();
+    pc.name = name;
+    pc.super = super_name && *super_name ? super_name : "NSObject";
+    pc.size = instance_size;
+    pc.guest = guest_class;
+    for (int i = 0; i < count; ++i) pc.methods.emplace_back(sels[i], imps[i]);
+}
+// armv7 uses 32-bit CGFloat, so struct results are converted from the host's double-precision ones.
+extern "C" void app_armv7_host_send_stret(uint64_t receiver, uint64_t selector, uint64_t buffer) {
+    id obj = reinterpret_cast<id>(static_cast<uintptr_t>(receiver));
+    const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(selector));
+    void* out = reinterpret_cast<void*>(static_cast<uintptr_t>(buffer));
+    if (!out) return;
+    if (!obj || !name) {
+        std::memset(out, 0, 32);
+        return;
+    }
+    const std::string sel(name);
+    if (sel == "frame" || sel == "bounds") {
+        const CGRect r = send<CGRect>(obj, name);
+        const float f[4] = {static_cast<float>(r.origin.x), static_cast<float>(r.origin.y),
+                            static_cast<float>(r.size.width), static_cast<float>(r.size.height)};
+        std::memcpy(out, f, sizeof f);
+    } else if (sel == "center" || sel == "contentOffset") {
+        const CGPoint p = send<CGPoint>(obj, name);
+        const float f[2] = {static_cast<float>(p.x), static_cast<float>(p.y)};
+        std::memcpy(out, f, sizeof f);
+    } else if (sel == "contentSize") {
+        const CGSize s = send<CGSize>(obj, name);
+        const float f[2] = {static_cast<float>(s.width), static_cast<float>(s.height)};
+        std::memcpy(out, f, sizeof f);
+    } else if (sel == "transform") {
+        const CGAffineTransform t = send<CGAffineTransform>(obj, name);
+        const float f[6] = {static_cast<float>(t.a),  static_cast<float>(t.b),  static_cast<float>(t.c),
+                            static_cast<float>(t.d),  static_cast<float>(t.tx), static_cast<float>(t.ty)};
+        std::memcpy(out, f, sizeof f);
+    } else {
+        std::memset(out, 0, 32);
+    }
+}
+
+extern "C" uint64_t app_armv7_host_send(uint64_t receiver, uint64_t selector, const uint64_t* args, int nargs) {
+    id obj = reinterpret_cast<id>(static_cast<uintptr_t>(receiver));
+    const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(selector));
+    if (!obj || !name || !*name) return 0;
+    auto a0 = reinterpret_cast<void*>(static_cast<uintptr_t>(args ? args[0] : 0));
+    auto a1 = reinterpret_cast<void*>(static_cast<uintptr_t>(args ? args[1] : 0));
+    id r = nargs >= 2 ? send<id>(obj, name, a0, a1) : (nargs == 1 ? send<id>(obj, name, a0) : send<id>(obj, name));
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r));
+}
+
+// A CGRect argument arrives as four 32-bit floats: two words in r2/r3, two on the stack.
+extern "C" uint64_t app_armv7_host_send_rect(uint64_t receiver, uint64_t selector, uint64_t w0, uint64_t w1,
+                                             uint64_t w2, uint64_t w3) {
+    id obj = reinterpret_cast<id>(static_cast<uintptr_t>(receiver));
+    const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(selector));
+    if (!obj || !name) return 0;
+    const uint64_t words[4] = {w0, w1, w2, w3};
+    float f[4];
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t bits = static_cast<uint32_t>(words[i]);
+        std::memcpy(&f[i], &bits, 4);
+    }
+    const CGRect rect{{f[0], f[1]}, {f[2], f[3]}};
+    id r = send<id>(obj, name, rect);
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r));
+}
+
+extern "C" uint64_t app_armv7_class_object(const char* name) {
+    if (!name || !*name) return 0;
+    return static_cast<uint64_t>(class_named(name));
+}
+
+static struct Armv7BridgeInit {
+    Armv7BridgeInit() {
+        armv7bridge::register_class = &app_armv7_register_class;
+        armv7bridge::host_send = &app_armv7_host_send;
+        armv7bridge::host_send_stret = &app_armv7_host_send_stret;
+        armv7bridge::host_send_rect = &app_armv7_host_send_rect;
+        armv7bridge::class_object = &app_armv7_class_object;
+    }
+} g_armv7_bridge_init;
+
+// Entry for the 32-bit loader, which can only hand over a C string for the delegate name.
+// The 32-bit loader reaches this before the host Objective-C classes exist, so a plain string is carried in a global
+// instead of a temporary NSString object.
+static std::string g_armv7_delegate_name;
+
+// UIScene lifecycle. Apps built for iOS 13+ put their window and root view setup in a scene delegate; without this the
+// delegate never runs and the app shows only whatever the storyboard contains.
+namespace {
+Class C_UIScene, C_UIWindowScene, C_UISceneSession, C_UISceneConfiguration, C_UISceneConnectionOptions;
+id g_scene, g_scene_session, g_scene_delegate;
+
+Class ensure_scene_class(const char* name, const char* super) {
+    if (Class c = class_named(name)) return c;
+    return def_class(name, super);
+}
+
+void define_scene_classes() {
+    if (C_UIWindowScene) return;
+    C_UISceneConfiguration = ensure_scene_class("UISceneConfiguration", "NSObject");
+    def(C_UISceneConfiguration, "name", +[](id, SEL) -> id { return str("Default Configuration"); });
+    def(C_UISceneConfiguration, "role", +[](id, SEL) -> id { return str("UIWindowSceneSessionRoleApplication"); });
+    C_UISceneSession = ensure_scene_class("UISceneSession", "NSObject");
+    def(C_UISceneSession, "configuration", +[](id, SEL) -> id {
+        static id cfg;
+        if (!cfg) cfg = send(send_cls(C_UISceneConfiguration, "alloc"), "init");
+        return cfg;
+    });
+    def(C_UISceneSession, "role", +[](id, SEL) -> id { return str("UIWindowSceneSessionRoleApplication"); });
+    def(C_UISceneSession, "persistentIdentifier", +[](id, SEL) -> id { return str("default"); });
+    C_UISceneConnectionOptions = ensure_scene_class("UISceneConnectionOptions", "NSObject");
+    C_UIScene = ensure_scene_class("UIScene", "NSObject");
+    def(C_UIScene, "session", +[](id, SEL) -> id { return g_scene_session; });
+    def(C_UIScene, "delegate", +[](id, SEL) -> id { return g_scene_delegate; });
+    // UISceneActivationState: 0 unattached, 1 foregroundInactive, 2 foregroundActive, 3 background.
+    def(C_UIScene, "activationState", +[](id, SEL) -> long { return 2; });
+    C_UIWindowScene = ensure_scene_class("UIWindowScene", "UIScene");
+    def(C_UIWindowScene, "keyWindow", +[](id, SEL) -> id { return g_key_window; });
+    def(C_UIWindowScene, "windows", +[](id, SEL) -> id { return nullptr; });
+    def(C_UIWindowScene, "coordinateSpace", +[](id, SEL) -> id { return nullptr; });
+}
+
+// "module.Class" (Info.plist) -> "_TtC<len>module<len>Class" (the runtime's name for it).
+std::string swift_class_name(const std::string& dotted) {
+    const size_t dot = dotted.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= dotted.size()) return dotted;
+    const std::string mod = dotted.substr(0, dot), cls = dotted.substr(dot + 1);
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "_TtC%zu%s%zu%s", mod.size(), mod.c_str(), cls.size(), cls.c_str());
+    return buf;
+}
+
+void connect_scene() {
+    id manifest = dict_get(info_dictionary(), "UIApplicationSceneManifest");
+    if (!manifest) return;
+    id cfgs = dict_get(manifest, "UISceneConfigurations");
+    id arr = cfgs ? dict_get(cfgs, "UIWindowSceneSessionRoleApplication") : nullptr;
+    if (!arr || send<long>(arr, "count") <= 0) return;
+    id cfg = send(arr, "objectAtIndex:", 0L);
+    const std::string dotted = utf8(dict_get(cfg, "UISceneDelegateClassName"));
+    define_scene_classes();
+    g_scene = send(send_cls(C_UIWindowScene, "alloc"), "init");
+    g_scene_session = send(send_cls(C_UISceneSession, "alloc"), "init");
+    id options = send(send_cls(C_UISceneConnectionOptions, "alloc"), "init");
+    if (dotted.empty()) {
+        log("scene: no delegate class configured");
+        return;
+    }
+    const std::string objc_name = swift_class_name(dotted);
+    Class dc = class_named(objc_name.c_str());
+    if (!dc) { log("scene: delegate %s (%s) not found", dotted.c_str(), objc_name.c_str()); return; }
+    g_scene_delegate = send(send_cls(dc, "alloc"), "init");
+    log("scene: %s delegate %s", dotted.c_str(), class_name(class_of(g_scene_delegate)));
+    if (responds(g_scene_delegate, sel("scene:willConnectToSession:options:")))
+        send<void>(g_scene_delegate, "scene:willConnectToSession:options:", g_scene, g_scene_session, options);
+    else
+        log("scene: delegate lacks scene:willConnectToSession:options:");
+    if (responds(g_scene_delegate, sel("sceneWillEnterForeground:")))
+        send<void>(g_scene_delegate, "sceneWillEnterForeground:", g_scene);
+    if (responds(g_scene_delegate, sel("sceneDidBecomeActive:")))
+        send<void>(g_scene_delegate, "sceneDidBecomeActive:", g_scene);
+}
+}  // namespace
+
+extern "C" int app_UIApplicationMain_cstr(int argc, char** argv, const char* delegate_name) {
+    g_armv7_delegate_name = delegate_name ? delegate_name : "";
+    return app_UIApplicationMain(argc, argv, nullptr, nullptr);
+}
 
 extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id delegate_name) {
     (void)argc; (void)argv;
     mark_main_thread();
     set_frame_hook(frame_hook);
     screen();
+    // The 32-bit loader enters here straight from the guest's main(), so the host runtime may not be up yet.
+    if (!class_named("NSObject")) {
+        init_runtime_classes();
+        init_uikit();
+    }
+    flush_guest_classes();
     Class pc = principal ? class_named(utf8(principal).c_str()) : 0;
     if (!pc) { id p = dict_get(info_dictionary(), "NSPrincipalClass"); if (p) pc = class_named(utf8(p).c_str()); }
     if (!pc) pc = C_UIApplication;
     g_app = send(send_cls(pc, "alloc"), "init");
-    log("UIApplicationMain: application %s, delegate %s", class_name(pc), delegate_name ? utf8(delegate_name).c_str() : "(from nib)");
-    if (delegate_name) {
-        Class dc = class_named(utf8(delegate_name).c_str());
-        if (!dc) log("delegate class %s not found", utf8(delegate_name).c_str());
+    const std::string dname = delegate_name ? utf8(delegate_name) : g_armv7_delegate_name;
+    log("UIApplicationMain: application %s, delegate %s", class_name(pc), dname.empty() ? "(from nib)" : dname.c_str());
+    if (!dname.empty()) {
+        Class dc = class_named(dname.c_str());
+        if (!dc) log("delegate class %s not found", dname.c_str());
         else {
             id d = send(send_cls(dc, "alloc"), "init");
             send<void>(g_app, "setDelegate:", d);
@@ -617,6 +996,9 @@ extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id del
         const Screen& s = screen();
         window = send(send_cls(C_UIWindow, "alloc"), "initWithFrame:", CGRect{{0, 0}, {s.w_pt, s.h_pt}});
         if (vc) send<void>(window, "setRootViewController:", vc);
+        // A storyboard/scene app leaves -window to its delegate; when the delegate cannot be reached this window is
+        // the only one that exists, so show it rather than leaving an invisible hierarchy behind.
+        if (!g_key_window) send<void>(window, "makeKeyAndVisible");
         if (responds(delegate, sel("setWindow:"))) send<void>(delegate, "setWindow:", window);
         else send<void>(delegate, "setValue:forKey:", window, str("window"));
         release(window);
@@ -638,6 +1020,7 @@ extern "C" int app_UIApplicationMain(int argc, char** argv, id principal, id del
     else if (responds(delegate, sel("applicationDidFinishLaunching:")))
         send<void>(delegate, "applicationDidFinishLaunching:", g_app);
     post_note("UIApplicationDidFinishLaunchingNotification", g_app, nullptr);
+    connect_scene();
     id w = responds(delegate, sel("window")) ? send(delegate, "window") : nullptr;
     if (w && !g_key_window) send<void>(w, "makeKeyAndVisible");
     if (responds(delegate, sel("applicationDidBecomeActive:"))) send<void>(delegate, "applicationDidBecomeActive:", g_app);
@@ -1333,6 +1716,12 @@ static void define_document_picker() {
 static void define_window_vc_app() {
     C_UIWindow = def_class("UIWindow", "UIView");
     Class W = C_UIWindow;
+    def(W, "initWithWindowScene:", +[](id self, SEL, id scene) -> id {
+        const Screen& s = screen();
+        send<void>(self, "initWithFrame:", CGRect{{0, 0}, {s.w_pt, s.h_pt}});
+        log("UIWindow initWithWindowScene: %s", class_name(class_of(scene)));
+        return self;
+    });
     def(W, "makeKeyAndVisible", +[](id self, SEL) {
         window_make_key(self);
         vx(self)->hidden = false;
@@ -1376,6 +1765,7 @@ static void define_window_vc_app() {
                 release(v);
             }
             e->loading = false;
+            e->did_load = true;
             send<void>(self, "viewDidLoad");
         }
         return e->view;
@@ -1390,6 +1780,9 @@ static void define_window_vc_app() {
         e->view = retain(v);
         if (v) vx(v)->controller = self;
         release(old);
+        // A nib hands the controller its view directly; that is the same "view is loaded" moment -view lazy-loads,
+        // and UIKit sends viewDidLoad straight after it.
+        if (v && !e->loading && !e->did_load) { e->did_load = true; send<void>(self, "viewDidLoad"); }
     });
     def(VC, "loadView", +[](id self, SEL) {
         auto* e = cx(self);
@@ -1527,6 +1920,24 @@ static void define_window_vc_app() {
         while (ch.size() > 1) { id vc = ch.back(); ch.pop_back(); if (id v = cx(vc)->view) remove_from_superview(v); autorelease(vc); }
         return arr({});
     });
+    def(NC, "setViewControllers:", +[](id self, SEL, id vcs) {
+        auto& ch = cx(self)->children;
+        for (id old : ch) release(old);
+        ch.clear();
+        for (id v : arr_items(vcs)) { ch.push_back(retain(v)); cx(v)->parent = self; }
+        if (id v = cx(self)->view) {
+            if (!ch.empty()) { const Screen& s = screen(); id cv = send(ch.back(), "view"); view_set_frame(cv, {{0, 0}, {s.w_pt, s.h_pt}}); add_subview(v, cv); }
+        }
+    });
+    def(NC, "setViewControllers:animated:", +[](id self, SEL, id vcs, bool) {
+        auto& ch = cx(self)->children;
+        for (id old : ch) release(old);
+        ch.clear();
+        for (id v : arr_items(vcs)) { ch.push_back(retain(v)); cx(v)->parent = self; }
+        if (id v = cx(self)->view) {
+            if (!ch.empty()) { const Screen& s = screen(); id cv = send(ch.back(), "view"); view_set_frame(cv, {{0, 0}, {s.w_pt, s.h_pt}}); add_subview(v, cv); }
+        }
+    });
     def(NC, "viewControllers", +[](id self, SEL) -> id { return arr(cx(self)->children); });
     def(NC, "topViewController", +[](id self, SEL) -> id { auto& ch = cx(self)->children; return ch.empty() ? nullptr : ch.back(); });
     def(NC, "visibleViewController", +[](id self, SEL) -> id { auto& ch = cx(self)->children; return ch.empty() ? nullptr : ch.back(); });
@@ -1539,8 +1950,17 @@ static void define_window_vc_app() {
     def(TBC, "setViewControllers:", +[](id self, SEL, id vcs) { for (id v : arr_items(vcs)) cx(self)->children.push_back(retain(v)); });
     def(TBC, "setViewControllers:animated:", +[](id self, SEL, id vcs, bool) { for (id v : arr_items(vcs)) cx(self)->children.push_back(retain(v)); });
     def(TBC, "viewControllers", +[](id self, SEL) -> id { return arr(cx(self)->children); });
-    def(TBC, "setSelectedIndex:", +[](id, SEL, NSUInteger) {});
-    def(TBC, "selectedIndex", +[](id, SEL) -> NSUInteger { return 0; });
+    def(TBC, "setSelectedIndex:", +[](id self, SEL, NSUInteger i) { cx(self)->selected = i; });
+    def(TBC, "selectedIndex", +[](id self, SEL) -> NSUInteger { return cx(self)->selected; });
+    def(TBC, "selectedViewController", +[](id self, SEL) -> id {
+        auto& ch = cx(self)->children;
+        NSUInteger i = cx(self)->selected;
+        return ch.empty() ? nullptr : ch[i < ch.size() ? i : 0];
+    });
+    def(TBC, "setSelectedViewController:", +[](id self, SEL, id vc) {
+        auto& ch = cx(self)->children;
+        for (size_t i = 0; i < ch.size(); ++i) if (ch[i] == vc) cx(self)->selected = i;
+    });
     def(TBC, "setDelegate:", +[](id, SEL, id) {});
     def_class("UIActivityViewController", "UIViewController");
     def_class("UIImagePickerController", "UINavigationController");
@@ -2046,6 +2466,12 @@ static id* new_const_string(const char* s) {
 
 void register_uikit_symbols(std::unordered_map<std::string, void*>& m) {
     m["_UIApplicationMain"] = reinterpret_cast<void*>(&app_UIApplicationMain);
+    // Swift entries: the UIKit overlay's UIApplicationMain and the stdlib CommandLine getters its main() reads first.
+    m["_$s5UIKit17UIApplicationMainys5Int32VAD_SpySpys4Int8VGGSgSSSgAJtF"] = reinterpret_cast<void*>(&app_swift_UIApplicationMain);
+    m["_$ss11CommandLineO4argcs5Int32VvgZ"] = reinterpret_cast<void*>(&app_swift_commandline_argc);
+    m["_$ss11CommandLineO10unsafeArgvSpySpys4Int8VGSgGvgZ"] = reinterpret_cast<void*>(&app_swift_commandline_unsafe_argv);
+    m["_swift_getObjCClassFromMetadata"] = reinterpret_cast<void*>(&app_swift_get_objc_class_from_metadata);
+    m["_$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ"] = reinterpret_cast<void*>(&app_swift_string_from_nsstring);
     m["_CACurrentMediaTime"] = reinterpret_cast<void*>(&app_CACurrentMediaTime);
     // notification names and other NSString constants exported by UIKit/QuartzCore
     for (const char* n : {"UIApplicationDidBecomeActiveNotification", "UIApplicationDidChangeStatusBarOrientationNotification",

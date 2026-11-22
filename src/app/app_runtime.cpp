@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -117,10 +118,42 @@ static RClass* g_zombie = nullptr;
 static std::unordered_map<uintptr_t, RClass*>& by_addr() { if (!g_by_addr) g_by_addr = new std::unordered_map<uintptr_t, RClass*>(); return *g_by_addr; }
 static std::unordered_map<std::string, RClass*>& by_name() { if (!g_by_name) g_by_name = new std::unordered_map<std::string, RClass*>(); return *g_by_name; }
 
+static RClass* rc_of_class(Class c);
+
+// Guest classes registered by the 32-bit loader: image class_t address -> host class, and the reverse, so a fresh
+// instance can carry the guest metadata pointer as its isa.
+static std::unordered_map<uintptr_t, uint32_t>* g_guest_of_host;
+static std::unordered_map<uintptr_t, uint32_t>& guest_of_host() {
+    if (!g_guest_of_host) g_guest_of_host = new std::unordered_map<uintptr_t, uint32_t>();
+    return *g_guest_of_host;
+}
+static std::atomic<uintptr_t> g_alias_lo{1}, g_alias_hi{0};
+
+void set_guest_identity(Class host, uint32_t guest) {
+    RClass* r = rc_of_class(host);
+    if (!r || !guest) return;
+    std::lock_guard<std::recursive_mutex> l(g_rt);
+    guest_of_host()[reinterpret_cast<uintptr_t>(r)] = guest;
+    by_addr()[guest] = r;
+    by_addr()[guest + 2] = r;   // Swift metadata sits at class_t + 2
+    const uintptr_t a = guest;
+    if (a < g_alias_lo.load()) g_alias_lo.store(a);
+    if (a + 2 > g_alias_hi.load()) g_alias_hi.store(a + 2);
+}
+
+static inline uintptr_t rd(uintptr_t a);   // defined with the class-image readers below; class_named's tracing uses it
+
 static RClass* rc_of_class(Class c) {
     // Reject null, misaligned and low (tagged-pointer / small-integer) values before dereferencing: a class
     // pointer is always 8-byte aligned and well above the first page.
     if (c < 0x1000 || (c & 7)) return nullptr;
+    // A guest class_t lives in the interpreter's image, so its bytes must not be read as one of our class structs.
+    const uintptr_t a = reinterpret_cast<uintptr_t>(c);
+    if (a >= g_alias_lo.load(std::memory_order_relaxed) && a <= g_alias_hi.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::recursive_mutex> l(g_rt);
+        auto it = by_addr().find(a);
+        return it == by_addr().end() ? nullptr : it->second;
+    }
     auto* ct = reinterpret_cast<class_t*>(c);
     auto* rc = reinterpret_cast<RClass*>(ct->cache);
     if (rc && reinterpret_cast<uintptr_t>(rc) >= 0x1000 && (reinterpret_cast<uintptr_t>(rc) & 7) == 0 && rc->magic == kClassMagic && rc->cls == c) return rc;
@@ -149,9 +182,50 @@ bool is_kind(id o, const char* n) { Class c = class_named(n); return c && is_kin
 uint32_t instance_size(Class c) { RClass* r = rc_of_class(c); return r ? r->inst_size : 8; }
 IMP nil_imp() { return reinterpret_cast<IMP>(&app_nil_imp); }
 
+// Host objects and classes have to live below 4 GB: 32-bit guest code stores their addresses in 32-bit registers and
+// ivars, so any object that crosses into guest code must survive the truncation. The blocks are never returned to the
+// OS; a session allocates a few MB at most.
+static std::mutex g_low_mu;
+static uint8_t* g_low_cur = nullptr;
+static size_t g_low_left = 0;
+static uintptr_t g_low_hint = 0x50000000u;
+
+static void* low_alloc(size_t n) {
+    if (!n) n = 1;
+    n = (n + 15) & ~static_cast<size_t>(15);
+    std::lock_guard<std::mutex> l(g_low_mu);
+    if (n > g_low_left) {
+        const size_t chunk = n > (1u << 20) ? n : (1u << 20);
+        void* p = MAP_FAILED;
+        while (g_low_hint + chunk <= 0x70000000u) {
+            p = mmap(reinterpret_cast<void*>(g_low_hint), chunk, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p == MAP_FAILED)   // kernels without MAP_FIXED_NOREPLACE: the address is only a hint
+                p = mmap(reinterpret_cast<void*>(g_low_hint), chunk, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p != MAP_FAILED && reinterpret_cast<uintptr_t>(p) < 0x100000000ull) break;
+            if (p != MAP_FAILED) munmap(p, chunk);
+            p = MAP_FAILED;
+            g_low_hint += chunk;
+        }
+        if (p == MAP_FAILED) return calloc(1, n);
+        // 32-bit guest code may touch these objects directly, so the interpreter has to treat the block as guest memory.
+        if (armv7bridge::add_region)
+            armv7bridge::add_region(reinterpret_cast<uintptr_t>(p), reinterpret_cast<uintptr_t>(p) + chunk);
+        g_low_hint = reinterpret_cast<uintptr_t>(p) + chunk;
+        g_low_cur = static_cast<uint8_t*>(p);
+        g_low_left = chunk;
+    }
+    void* r = g_low_cur;
+    g_low_cur += n;
+    g_low_left -= n;
+    std::memset(r, 0, n);
+    return r;
+}
+
 static class_t* new_class_struct(const char* name, uint32_t size) {
     // classes get a header too (immortal), so has_header()/retain treat them uniformly
-    auto* mem = static_cast<uint8_t*>(calloc(1, 16 + sizeof(class_t) + sizeof(class_ro_t)));
+    auto* mem = static_cast<uint8_t*>(low_alloc(16 + sizeof(class_t) + sizeof(class_ro_t)));
     *reinterpret_cast<uint32_t*>(mem) = 0x0b1ec7ed;
     reinterpret_cast<std::atomic<int32_t>*>(mem + 4)->store(1 << 30);
     auto* ct = reinterpret_cast<class_t*>(mem + 16);
@@ -317,12 +391,17 @@ id alloc_extra(Class c, size_t extra) {
     RClass* r = rc_of_class(c);
     size_t size = r ? r->inst_size : 8;
     if (size < 8) size = 8;
-    auto* mem = static_cast<uint8_t*>(calloc(1, sizeof(Header) + size + extra));
+    auto* mem = static_cast<uint8_t*>(low_alloc(sizeof(Header) + size + extra));
     auto* h = reinterpret_cast<Header*>(mem);
     h->magic = kObjMagic;
     h->rc.store(1, std::memory_order_relaxed);
     id o = reinterpret_cast<id>(mem + sizeof(Header));
     o->isa = c;
+    if (r) {
+        std::lock_guard<std::recursive_mutex> l(g_rt);
+        auto it = guest_of_host().find(reinterpret_cast<uintptr_t>(r));
+        if (it != guest_of_host().end()) o->isa = reinterpret_cast<Class>(static_cast<uintptr_t>(it->second));
+    }
     if (r && !r->is_meta) {
         cxx_structors(r);
         SEL s = sel(".cxx_construct");
@@ -459,7 +538,9 @@ void dealloc_object(id o) {
     }
     if (g_no_free) return;
     h->magic = 0xdeadbeef;
-    free(h);
+    // Instances come from the low arena (low_alloc), which is mmap'd, not malloc'd: handing those blocks to free()
+    // aborts in the allocator. Only pointers outside that arena belong to the heap.
+    if (reinterpret_cast<uintptr_t>(h) >= 0x70000000ull || reinterpret_cast<uintptr_t>(h) < 0x40000000ull) free(h);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -718,11 +799,30 @@ static void read_method_list_locked(uintptr_t list, RClass* into) {
     if (cnt > 4096) return;   // not a method list: the word came from another layout
     for (uint32_t i = 0; i < cnt; ++i) {
         uintptr_t e = list + 8 + i * esz;
-        const char* name = rel ? reinterpret_cast<const char*>(e + rdi32(e))
-                               : reinterpret_cast<const char*>(rd(e));
+        // The name field is either the selector string itself (classic lists) or a selector *slot* holding a pointer
+        // to it (Swift's relative lists): resolve the slot when the bytes there are not a string.
+        uintptr_t namep = rel ? e + rdi32(e) : rd(e);
+        // A selector is ASCII; a selector slot's pointer bytes are not (0x8d, 0x00, ...), and accepting those as a
+        // name would register a garbage method and hide the real one.
+        auto selector_name = [](const char* s) -> const char* {
+            if (!s || !*s) return nullptr;
+            for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p; ++p)
+                if (*p < 0x20 || *p > 0x7e) return nullptr;
+            return s;
+        };
+        const char* name = selector_name(safe_class_name(namep));
+        if (!name && namep && (namep & 7) == 0 && in_image(reinterpret_cast<const void*>(namep))) {
+            uintptr_t slot = rd(namep);
+            if (!in_image(reinterpret_cast<const void*>(slot))) {
+                // chained-fixup rebase that the loader did not apply on this pass: bits 0..35 are the target offset
+                const uintptr_t decoded = image_base() + (slot & 0xfffffffffull);
+                if (in_image(reinterpret_cast<const void*>(decoded))) slot = decoded;
+            }
+            if (in_image(reinterpret_cast<const void*>(slot))) name = selector_name(safe_class_name(slot));
+        }
         // Only follow entries whose selector really is a string in the image: a Swift class descriptor has no ObjC
         // method list behind ro+32, and the word there points at something that is not one.
-        if (!safe_class_name(reinterpret_cast<uintptr_t>(name))) continue;
+        if (!name) continue;
         const char* types = rel ? reinterpret_cast<const char*>(e + 4 + rdi32(e + 4))
                                 : reinterpret_cast<const char*>(rd(e + 8));
         IMP imp = rel ? reinterpret_cast<IMP>(e + 8 + rdi32(e + 8))
@@ -747,8 +847,9 @@ static void read_protocols(uintptr_t list, RClass* into) {
 
 // A class_ro_t name is only taken when it really is a string inside the image: Swift class metadata shares the
 // class_t layout but its rodata has no ObjC name field, so the word at +24 is some other field of the descriptor.
+// A name is a plain C string, not a struct: __objc_classname packs its bytes, so the pointer is often unaligned.
 static const char* safe_class_name(uintptr_t p) {
-    if (!p || (p & 7) || !in_image(reinterpret_cast<const void*>(p))) return nullptr;
+    if (!p || !in_image(reinterpret_cast<const void*>(p))) return nullptr;
     const char* s = reinterpret_cast<const char*>(p);
     for (size_t i = 0; i < 256; ++i) {
         const unsigned char c = static_cast<unsigned char>(s[i]);
@@ -1492,6 +1593,23 @@ static id rt_opt_self(id o) {
     return reinterpret_cast<id>(reinterpret_cast<uintptr_t>(o) & 0x00007ffffffffff8ULL);
 }
 
+// Swift runtime entry points. An Objective-C app imports these when it links a Swift static library (this one bundles
+// FBAudienceNetwork's FBAdFont); no Swift code of its own runs, so the ABI answers are the Objective-C identities:
+// an Objective-C class is its own type metadata.
+static void swift_once(intptr_t* token, void (*function)(void*), void* context) {
+    if (!token || !function) return;
+    if (__atomic_load_n(token, __ATOMIC_ACQUIRE)) return;
+    static std::mutex mu;   // the guest has a handful of Swift globals: serialize them, then run the initializer once
+    std::lock_guard<std::mutex> l(mu);
+    if (__atomic_load_n(token, __ATOMIC_RELAXED)) return;
+    function(context);
+    __atomic_store_n(token, 1, __ATOMIC_RELEASE);
+}
+static void* swift_get_object_type(id o) {
+    return reinterpret_cast<void*>(o ? class_of(o) : 0);
+}
+static void* swift_objc_class_metadata(void* metadata) { return metadata; }
+
 }  // extern "C"
 
 namespace app {
@@ -1504,6 +1622,13 @@ void register_runtime_symbols(std::unordered_map<std::string, void*>& m) {
     r("_objc_retain", &rt_retain);
     r("_objc_release", &rt_release);
     r("_objc_opt_self", &rt_opt_self);
+    // Swift ABI: the app's only Swift code is inside a static library, reached through these four entry points.
+    r("_swift_once", &swift_once);
+    r("_swift_getObjectType", &swift_get_object_type);
+    r("_swift_getObjCClassMetadata", &swift_objc_class_metadata);
+    r("_swift_getInitializedObjCClass", &swift_objc_class_metadata);
+    static uint64_t swift_bowv[2] = {0, 0};   // a stdlib global the linked library references but never reads
+    r("_$sBOWV", swift_bowv);
     // Compiler-emitted aliases: _objc_retain_xN / _objc_release_xN take one argument like the base entry points.
     for (int i = 1; i <= 28; ++i) {
         std::string ret = "_objc_retain_x" + std::to_string(i);

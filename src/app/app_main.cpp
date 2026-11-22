@@ -97,6 +97,12 @@ void register_foundation_symbols(std::unordered_map<std::string, void*>& m) {
                           "NSWeekCalendarUnit", "NSCurrentLocaleDidChangeNotification"})
         m[std::string("_") + n] = nsstr_const(n);
     // KVO change dictionary keys have short values of their own, which observers look up
+    // The empty-collection singletons an @[] / @{} literal loads: the slot the guest reads has to hold a real object.
+    static id ns_array0 = nullptr, ns_dict0 = nullptr;
+    if (!ns_array0) ns_array0 = retain(arr_new({}, true));
+    if (!ns_dict0) ns_dict0 = retain(dict_new(false));
+    m["___NSArray0__"] = &ns_array0;
+    m["___NSDictionary0__"] = &ns_dict0;
     m["_NSKeyValueChangeKindKey"] = nsstr_const("kind");
     m["_NSKeyValueChangeNewKey"] = nsstr_const("new");
     m["_NSKeyValueChangeOldKey"] = nsstr_const("old");
@@ -153,6 +159,20 @@ void* resolve_symbol(const std::string& name) {
     // symbol; point it at the real constant-string class so messages to literals dispatch.
     if (name == "___CFConstantStringClassReference") return reinterpret_cast<void*>(class_named("__NSCFConstantString"));
     if (name == "_OBJC_EHTYPE_$_NSException" || name == "_OBJC_EHTYPE_id") { static uint64_t t[8] = {0}; return t; }
+    // Swift concurrency objects the delegate touches during launch. Until an arm64 Swift runtime is side-loaded these
+    // answer with stable empty records; every symbol reached this way is recorded in the plan's runtime-surface list.
+    if (name == "_$sScMMa") {
+        static void* (*accessor)() = +[]() -> void* { static uint64_t meta[64]; return meta; };
+        return reinterpret_cast<void*>(accessor);
+    }
+    if (name == "_$sScM6sharedScMvgZ") {
+        static void* (*getter)() = +[]() -> void* { static uint64_t actor[32]; return actor; };
+        return reinterpret_cast<void*>(getter);
+    }
+    if (name == "_$sScA15unownedExecutorScevgTj") {
+        static void* (*executor)() = +[]() -> void* { static uint64_t ex[32]; return ex; };
+        return reinterpret_cast<void*>(executor);
+    }
     // dynamically looked-up GL entry points (the game resolves some through dlsym/NSAddressOfSymbol)
     if (name.rfind("_gl", 0) == 0 || name.rfind("_egl", 0) == 0) {
         if (void* p = gl_resolve(name.c_str() + 1)) return p;
@@ -213,6 +233,7 @@ void boot(const ImageInfo& info) {
 
 [[noreturn]] void run_main(void* entry, int argc, char** argv) {
     log("calling guest main() at %p", entry);
+    swift_set_command_line(argc, argv);
     run_loads();
     auto main_fn = reinterpret_cast<int (*)(int, char**)>(entry);
     int rc = main_fn(argc, argv);
